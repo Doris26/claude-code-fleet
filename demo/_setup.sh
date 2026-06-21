@@ -1,7 +1,14 @@
 # Sandbox for the claude-code-fleet demo GIF. Sourced by demo/demo.tape; run from the repo root.
-# Builds a throwaway repo under /tmp with a worker commit that CITES a (fabricated) backtest result,
-# then drops you into it with a clean prompt. All setup output is suppressed so the recording is clean.
+# (1) spins up a few stand-in worker sessions on an ISOLATED tmux socket (-L fleet) so the demo
+#     never touches your real tmux; (2) builds a throwaway repo under /tmp with a worker commit that
+#     CITES a fabricated backtest result. All setup output is suppressed so the recording is clean.
 {
+  # (1) a fleet of worker sessions (placeholders for `claude` panes — isolated socket, no quota used)
+  tmux -L fleet kill-server 2>/dev/null
+  for w in dag-momentum dag-meanrev dag-carry; do
+    tmux -L fleet new-session -d -s "$w" 'sleep 99999'
+  done
+  # (2) a worker's repo + a commit that cites a (fabricated) backtest result
   rm -rf /tmp/ccf-demo /tmp/ccf-bin
   mkdir -p /tmp/ccf-demo/strategies/btc-momo /tmp/ccf-bin
   cp plugins/generic/verify-claim /tmp/ccf-bin/ && chmod +x /tmp/ccf-bin/verify-claim
