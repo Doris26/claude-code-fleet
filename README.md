@@ -2,6 +2,12 @@
 
 **Run a fleet of Claude Code agents — without babysitting them.**
 
+<p align="center">
+  <img src="demo/claude-code-fleet-demo.gif" alt="claude-code-fleet catching a worker that cited an unverifiable backtest result" width="860">
+</p>
+
+<p align="center"><sub><em>The anti-fabrication review in action — a worker claims Sharpe 2.10; the supervisor pulls out the cited backtest-id and flags it as UNVERIFIED. Plug in a backend and a fabricated result FAILs review. No human in the loop.</em></sub></p>
+
 Think [OpenClaw](https://github.com/openclaw/openclaw) / [Hermes](https://hermes-agent.ai), **but
 lite.** Where those are full multi-agent *runtimes*, claude-code-fleet is the thin **supervisor**
 you bolt onto the Claude Code CLI you already run. You start a few `claude` sessions in tmux on a
