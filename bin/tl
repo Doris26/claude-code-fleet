@@ -1,0 +1,8 @@
+#!/bin/bash
+# tl: list tmux sessions
+out=$(tmux ls 2>/dev/null || true)
+if [ -z "$out" ]; then
+    echo "(no tmux sessions)"
+else
+    echo "$out"
+fi

@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""verify-claim (quant-qc plugin) — resolve QuantConnect backtest-ids cited in a commit against the QC read-backtest API.
+
+meta-grill CRITICAL #1 (top fix): nothing verified that a claimed bt-id actually resolves to a real
+QC backtest, and cc-monitor's run-proof was a bare 32-hex regex — so a worker could fabricate a
+bt-id + Sharpe and pass every review layer. This resolves each NEW 32-hex bt-id added in a commit's
+diff against QC `backtests/read`, and (when the diff also states a Sharpe near that bt-id) checks the
+QC-reported Sharpe matches within tolerance.
+
+Usage:  verify-claim <sha> [--repo <path>]
+Output: one JSON object {verdict: PASS|FAIL|SKIP, checked: N, issues: [...]}
+  PASS  — every added bt-id resolves on QC (and any adjacent claimed Sharpe matches), or none cited.
+  FAIL  — a cited bt-id 404s on QC (fabricated/typo), or its QC Sharpe differs > tol from the diff.
+  SKIP  — no QC creds available (can't verify; caller decides how to treat).
+
+Prior incident this guards: a strategy was cited with a Sharpe that did not match its real backtest.
+"""
+import base64, hashlib, json, os, re, ssl, subprocess, sys, time, urllib.request
+
+REPO = os.environ.get("CC_REPO") or os.path.expanduser("~/your-repo")
+SR_TOL = 0.05   # QC Sharpe must match a diff-claimed Sharpe within this
+args = sys.argv[1:]
+sha = None
+i = 0
+while i < len(args):
+    if args[i] == "--repo": REPO = args[i+1]; i += 2
+    else: sha = args[i]; i += 1
+if not sha:
+    print(json.dumps({"verdict": "SKIP", "note": "no sha"})); sys.exit(0)
+
+USER_ID = os.environ.get("QC_USER_ID"); TOKEN = os.environ.get("QC_API_TOKEN")
+if not USER_ID or not TOKEN:
+    print(json.dumps({"verdict": "SKIP", "note": "no QC creds in env"})); sys.exit(0)
+
+BASE = "https://www.quantconnect.com/api/v2"
+_SSL = ssl.create_default_context(); _SSL.check_hostname = False; _SSL.verify_mode = ssl.CERT_NONE
+
+def api(ep, data=None, retries=3):
+    for a in range(retries):
+        try:
+            ts = str(int(time.time()))
+            h = hashlib.sha256(f"{TOKEN}:{ts}".encode()).hexdigest()
+            cred = base64.b64encode(f"{USER_ID}:{h}".encode()).decode()
+            body = json.dumps(data).encode() if data is not None else None
+            req = urllib.request.Request(f"{BASE}/{ep}", data=body,
+                headers={"Authorization": f"Basic {cred}", "Timestamp": ts, "Content-Type": "application/json"},
+                method="POST" if data is not None else "GET")
+            op = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=_SSL))
+            with op.open(req, timeout=60) as r:
+                return json.loads(r.read())
+        except Exception:
+            if a < retries - 1: time.sleep(3)
+    return None
+
+# Added lines of the commit diff (only NEW bt-id claims, not context).
+try:
+    diff = subprocess.run(["git", "-C", REPO, "show", "--format=", sha], capture_output=True, text=True, timeout=30).stdout
+except Exception:
+    print(json.dumps({"verdict": "SKIP", "note": "git show failed"})); sys.exit(0)
+added_lines = [l[1:] for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++")]
+added = "\n".join(added_lines)
+
+# bt-ids = 32-hex tokens. FALSE-FAIL guard (self-audit #2): a bare 32-hex regex also matches QC
+# organization-id / projectId / object-store / hash / sha values → a non-bt-id 32-hex string 404s
+# and produces a FALSE FAIL. So scan PER LINE: skip any line whose key is one of those non-bt fields,
+# and prefer bt-ids that co-occur with a backtests/read context or a Sharpe/CAGR token.
+_HEX32 = re.compile(r"\b[0-9a-f]{32}\b")
+_NONBT_KEY = re.compile(r"(organization[-_]?id|projectId|project|object[-_]?store|objectStore|\bhash\b|\bsha\b)", re.I)
+_BT_CTX = re.compile(r"backtest|bt[-_ ]?id|sharpe|cagr|maxdd|psr|sortino|deploy", re.I)
+btids = set(); btids_ctx = set()
+# FIX (proximity-aware): remember which added-line(s) each bt-id was cited on, so the cross-check
+# below can FORGIVE a stated Sharpe ONLY when a SKIP-class (cross-account/cannot-verify) bt-id is
+# co-located on that SAME line ("bt abc… SR 0.95"), instead of a flat per-skip budget that a
+# fabricated Sharpe ANYWHERE in the diff could launder.
+btid_lines = {}   # bt-id -> set of added_lines text it appeared on
+for ln in added_lines:
+    hexes = _HEX32.findall(ln)
+    if not hexes:
+        continue
+    if _NONBT_KEY.search(ln):
+        continue   # org-id / projectId / object-store / hash / sha line — not a bt-id citation
+    for h in hexes:
+        btids.add(h)
+        btid_lines.setdefault(h, set()).add(ln)
+        if _BT_CTX.search(ln):
+            btids_ctx.add(h)
+# Prefer the context-anchored bt-ids when any exist (a config dump may still leak a stray 32-hex
+# on a non-keyed line); fall back to all non-keyed 32-hex tokens if none co-occur with bt context.
+if btids_ctx:
+    btids = btids_ctx
+# self-audit #1 FIX: the old separator class `[ =:#]*` excluded the double-quote, so the dominant
+# JSON form `"pid": NNN` (config.json / results) matched NOTHING → the whole verifier was inert
+# (0 real QC verifications). Widen the class to allow quotes/whitespace AND require a real separator
+# so `"pid": N`, `pid=N`, `pid: N`, `pid #N`, `pid N` all match while `cloud-id`-style keys don't.
+pids = re.findall(r"(?:pid|projectId|project)[\"'\s]*[ =:#]+[\"'\s]*([0-9]{6,9})", added, re.I)
+# FIX 1(c): does the diff STATE a perf number (Sharpe / Sortino / PSR / CAGR / MaxDD / return)?
+# Used below to close the no-pid escape: a stated perf number with ZERO resolvable bt-id anchor
+# (no pid AND no sibling config.json cloud-id) must FAIL, not free-pass SKIP — an unverifiable
+# perf claim with no anchor to QC at all is exactly the fabrication this control exists to catch.
+# FIX C (2026-06-19): broaden to ABBREVIATIONS (SR / Calmar / IR / Sortino / information ratio) so an
+# abbreviation-only perf headline with no bt-id no longer skips the no-anchor FAIL. Short abbreviations
+# (SR/IR) are \b-anchored so a stray word ("FIRST", "USRT") can't match; an adjacent NUMBER is still
+# required by the suffix so a bare "IR" word with no value does not false-positive.
+_PERF_CLAIM = re.compile(r"(sharpe|sortino|psr|cagr|max[ _-]?dd|maxdrawdown|return|calmar|information[ _-]?ratio|\bSR\b|\bIR\b)[\"'\s=:#]*-?[0-9]+\.?[0-9]*%?", re.I)
+has_perf_claim = bool(_PERF_CLAIM.search(added))
+
+# grill #2 (better-fix): when the diff cites a bt-id but NO explicit pid, fall back to the
+# `cloud-id` in a sibling config.json of any strategy dir touched by this commit. This lets an
+# honest bt-id citation resolve (PASS/FAIL) instead of always landing in cannot-verify SKIP.
+# (Defined BEFORE the no-bt-id gate so FIX 1(c) can probe for a config.json anchor.)
+def _config_cloud_ids():
+    out = []
+    try:
+        touched = subprocess.run(["git", "-C", REPO, "show", "--name-only", "--format=", sha],
+                                 capture_output=True, text=True, timeout=30).stdout.splitlines()
+    except Exception:
+        touched = []
+    seen_dirs = set()
+    for f in touched:
+        f = f.strip()
+        if not f:
+            continue
+        d = os.path.dirname(os.path.join(REPO, f))
+        # walk up to the config.json that sits in (or above) the touched file's dir
+        for _ in range(4):
+            if d in seen_dirs:
+                break
+            seen_dirs.add(d)
+            cfg = os.path.join(d, "config.json")
+            if os.path.isfile(cfg):
+                try:
+                    cid = json.load(open(cfg)).get("cloud-id")
+                    if cid and re.fullmatch(r"[0-9]{6,9}", str(cid)):
+                        out.append(str(cid))
+                except Exception:
+                    pass
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+    return out
+
+if not btids:
+    # FIX 1(c): no bt-id anchor at all. If the diff ALSO states a perf number AND there is no
+    # resolvable pid/cloud-id anchor either, that perf claim is wholly unverifiable → FAIL (was a
+    # free-pass SKIP). With no perf claim, an absent bt-id is genuinely nothing-to-verify → SKIP.
+    if has_perf_claim and not pids and not _config_cloud_ids():
+        print(json.dumps({"verdict": "FAIL", "checked": 0, "issues": [
+            "diff states a Sharpe/CAGR/MaxDD perf number but cites NO resolvable bt-id anchor "
+            "(no bt-id, no projectId, no sibling config.json cloud-id) — unverifiable perf claim"]},
+            ensure_ascii=False)); sys.exit(0)
+    print(json.dumps({"verdict": "SKIP", "checked": 0, "note": "no bt-id cited in added lines"})); sys.exit(0)
+
+issues = []; skips = []; checked = 0
+resolved_qc_sharpes = []   # FIX (proximity-evasion): collect EVERY resolved bt-id's real QC Sharpe
+skip_class_btids = set()   # FIX (proximity-aware): bt-ids that ended SKIP-class (cross-account /
+                           # cannot-verify / cited-without-pid) — used to build the set of added lines
+                           # on which a stated Sharpe may be FORGIVEN (co-located with an unresolved bt).
+# Try each bt-id against each candidate pid (QC needs both). Resolve = at least one pid works.
+# pids from the diff first; then sibling config.json cloud-id as a fallback (de-duped).
+cand_pids = list(dict.fromkeys(pids + (_config_cloud_ids() if not pids else [])))
+# FIX 1(a/b): an UNRESOLVED bt-id has THREE distinct causes that must NOT all collapse to the
+# same hard "fabricated" FAIL (the qc_cross_account_phantom_pid signature was being mis-FAILed):
+#   - cross-account / permission / does-not-exist error → UNVERIFIABLE_CROSS_ACCT (SKIP, manual-verify owed)
+#   - the pid IS ours (projects/read success) but backtests/read says "Backtest not found" → true FABRICATION (FAIL)
+#   - cited with no resolvable pid at all → cannot-verify (SKIP, existing behavior)
+_PERM_RE = re.compile(r"permission|do not have|does not exist or you do not have|you do not have access", re.I)
+_NOTFOUND_RE = re.compile(r"backtest not found|no backtest|not found", re.I)
+def _err_text(resp):
+    if not isinstance(resp, dict): return ""
+    e = resp.get("errors")
+    if isinstance(e, (list, tuple)): return " ".join(str(x) for x in e)
+    return str(e or "")
+for bt in list(btids)[:20]:   # FIX 2: cap raised 6→20 — the old [:6] dropped every bt-id past the 6th from resolution AND (with the :217 guard) silently disabled the whole stated-vs-real cross-check on ~29% of PERF_CARD commits that cite >6 bt-ids. Still capped so we don't hammer QC.
+    checked += 1
+    resolved = None
+    cross_acct = False          # saw a permission/does-not-exist error on some pid
+    our_acct_notfound = False   # the pid is OURS (projects/read ok) yet bt 'Backtest not found'
+    for pid in (cand_pids or [None]):
+        if pid is None: break
+        r = api(f"backtests/read?projectId={pid}&backtestId={bt}")
+        if r and r.get("success") and r.get("backtest"):
+            resolved = r["backtest"]; break
+        # not resolved on this pid — classify WHY (FIX 1a/b)
+        errtxt = _err_text(r)
+        if _PERM_RE.search(errtxt):
+            cross_acct = True   # honest cross-account / unreadable pid — never call this fabrication
+            continue
+        # confirm the pid is on OUR account before calling a bt 'Backtest not found' a fabrication
+        pr = api(f"projects/read?projectId={pid}")
+        if pr and pr.get("success") and (pr.get("projects") or pr.get("project")):
+            if _NOTFOUND_RE.search(errtxt) or (r is not None and not _err_text(r).strip()):
+                our_acct_notfound = True   # OUR project, but the cited bt-id is absent → true fabrication
+        elif pr is not None and _PERM_RE.search(_err_text(pr)):
+            cross_acct = True   # projects/read itself says no-permission → cross-account pid
+    if resolved is None:
+        if our_acct_notfound:
+            # FIX 1(b): the ONLY hard FAIL for an unresolved bt-id — pid is provably ours, bt absent.
+            issues.append(f"bt-id {bt[:12]}… NOT found on QC under OUR project (pids {cand_pids}) — fabricated/typo/stale")
+        elif cross_acct:
+            # FIX 1(a): cross-account / unreadable pid — SKIP-class 'manual-verify owed', NOT fabrication.
+            skips.append(f"bt-id {bt[:12]}… on a pid we cannot read (permission/cross-account) — UNVERIFIABLE_CROSS_ACCT: manual-verify owed")
+            skip_class_btids.add(bt)
+        elif cand_pids:
+            # had pids but none resolved and no classifiable error (network/None) — cannot-verify, SKIP.
+            skips.append(f"bt-id {bt[:12]}… did not resolve across pids {cand_pids} (no readable error) — cannot-verify")
+            skip_class_btids.add(bt)
+        elif has_perf_claim and not cand_pids:
+            # FIX 1: a fabricated bt-id co-located with a Sharpe (so it enters `btids` and dodges the
+            # round-4 no-anchor gate) with NO resolvable pid anchor at all — no projectId in the diff
+            # AND no sibling config.json cloud-id — used to land here as a SKIP → free PASS. That is the
+            # exact fabrication this control exists to catch: a perf number + a bt-id with nothing
+            # tying it to QC. → FAIL. (The genuine cross-account/permission cases above stay SKIP; only
+            # this no-anchor-at-all-with-a-perf-claim case is promoted.)
+            issues.append(f"bt-id {bt[:12]}… cited alongside a perf number but NO resolvable pid anchor "
+                          f"(no projectId in the diff, no sibling config.json cloud-id) — cite the projectId or retract")
+        else:
+            # self-audit #4 FIX: a bt-id cited with NO resolvable pid is "cannot-verify", NOT a fabrication
+            # — it must NOT carry the same hard-FAIL penalty as a real 404 / Sharpe-mismatch (that
+            # false-FAILed honest table-citations and drove the repoke spiral). Demote to a SKIP signal.
+            # (No perf claim attached → genuinely nothing-to-verify, stays SKIP.)
+            skips.append(f"bt-id {bt[:12]}… cited with NO projectId in the diff — cannot-verify: cited without pid")
+            skip_class_btids.add(bt)
+        continue
+    # Collect this resolved bt-id's REAL QC Sharpe for the global cross-check below.
+    stat = (resolved.get("statistics") or {}) if isinstance(resolved, dict) else {}
+    qc_sr = None
+    for k, v in stat.items():
+        if "sharpe" in k.lower():
+            try: qc_sr = float(str(v).replace("%", "")); break
+            except Exception: pass
+    if qc_sr is not None:
+        resolved_qc_sharpes.append(qc_sr)
+
+# FIX (proximity-evasion): the OLD per-bt cross-check required the stated Sharpe to sit within 120
+# chars of the bt-id's first 8 hex — a real bt-id + a FAKE Sharpe placed >120 chars away (trivial in
+# a normal PERF_CARD table row) matched nothing → free PASS. DECOUPLE from text proximity: compare
+# every Sharpe stated ANYWHERE in the added lines against EVERY resolved bt-id's real QC Sharpe. A
+# stated Sharpe matching no resolved bt-id's QC Sharpe (within CROSS_TOL) → FAIL. Only runs when at
+# least one bt-id resolved (else there's nothing to compare and the resolve/SKIP logic owns it).
+# Only numbers LABELED Sharpe/SR are compared (a CAGR/MaxDD number near "Sharpe" is not mistaken).
+CROSS_TOL = 0.03
+# FIX 2: the OLD `len(btids) <= 6` guard turned the WHOLE anti-fabrication cross-check OFF (silent
+# PASS, no note) whenever >6 bt-ids were cited (~29% of real PERF_CARD commits). Raise the cap to 20
+# to match the resolve cap, AND when MORE than 20 bt-ids are cited still RUN the cross-check against
+# the (up-to-20) that resolved — never silently OFF — adding a skips[]-class note + forgiving the
+# unchecked-truncated bt-ids so a stated Sharpe that belongs to a beyond-cap bt-id is not false-FAILed.
+if resolved_qc_sharpes:
+    # FIX (PROXIMITY-AWARE): the PRIOR flat budget (`_exempt = _real_skips + n_overcap`) let a
+    # FABRICATED Sharpe stated ANYWHERE in the diff be laundered — every cross-account/cannot-verify
+    # bt-id raised the forgiveness count by 1 regardless of WHERE the Sharpe sat, so "honest bt SR
+    # 1.20 + a 2nd cross-acct bt + a fabricated Sharpe 2.50 on an unrelated line" had unmatched=[2.5],
+    # 1>1 False → no FAIL. (A prior `_exempt=n_overcap` attempt FALSE-FAILED legit MIXED citations.)
+    # CORRECT fix: a stated Sharpe is FORGIVEN only when a SKIP-class (cross-account/cannot-verify/
+    # unresolved) bt-id is co-located on the SAME added line as that Sharpe ("bt abc… SR 0.95"). A
+    # stated Sharpe NOT co-located with any unresolved bt-id is NOT forgiven → if it matches no
+    # resolved QC Sharpe, FAIL. Co-location with a RESOLVED bt-id does NOT forgive (that bt's real
+    # Sharpe is already in resolved_qc_sharpes, so an honest cite matches; a mismatch must FAIL).
+    # n_overcap (truncated-beyond-20) forgiveness is KEPT as a flat budget (those bt-ids were never
+    # fetched and have no line to pair against). `_real_skips` is DROPPED from the flat budget.
+    n_overcap = max(0, len(btids) - 20)   # bt-ids never resolved because they were past the [:20] cap
+    if n_overcap:
+        skips.append(f"(>20 bt-ids cited; cross-check covers only the first 20 resolved — "
+                     f"{n_overcap} truncated bt-id(s) unchecked)")
+    # The set of added lines on which at least one SKIP-class bt-id was cited → a Sharpe on such a
+    # line may belong to that unreadable bt-id, so it is forgiven (proximity, not a flat budget).
+    skip_lines = set()
+    for _bt in skip_class_btids:
+        skip_lines |= btid_lines.get(_bt, set())
+    # FIX C (2026-06-19): accept an INTEGER Sharpe (e.g. "Sharpe 2" / "SR 1") — the old pattern
+    # REQUIRED a decimal point, so an integer Sharpe next to a real bt-id was never cross-checked.
+    _SR_LABEL = re.compile(r"\b(?:sharpe|sr)\b[\s=:#\"']*?(-?[0-9]+(?:\.[0-9]+)?)", re.I)
+    # Scan PER LINE so each stated Sharpe keeps its line context for the co-location test.
+    unmatched = []           # stated Sharpes that match no resolved QC Sharpe AND are not co-located
+    n_forgiven_proximity = 0  # stated Sharpes forgiven because co-located with a SKIP-class bt-id
+    for _ln in added_lines:
+        for _x in _SR_LABEL.findall(_ln):
+            s = float(_x)
+            if any(abs(s - qc) <= CROSS_TOL for qc in resolved_qc_sharpes):
+                continue   # matches a resolved bt-id's real QC Sharpe — honest
+            if _ln in skip_lines:
+                n_forgiven_proximity += 1   # co-located with an unresolved bt-id on the same line
+                continue
+            unmatched.append(s)
+    # FAIL only on the EXCESS beyond the (over-cap-only) flat budget — proximity forgiveness was
+    # already consumed above. Truncated >20 bt-ids have no line context, so they keep a flat budget.
+    _exempt = n_overcap
+    if len(unmatched) > _exempt:
+        issues.append(
+            f"stated Sharpe(s) {unmatched} match NO resolved bt-id's QC Sharpe "
+            f"{[round(q,3) for q in resolved_qc_sharpes]} (Δ>{CROSS_TOL}) and are NOT co-located with "
+            f"any unresolved/cross-account bt-id; {len(unmatched)} non-co-located unmatched exceed the "
+            f"over-cap exemption={_exempt} ({n_forgiven_proximity} other stated Sharpe(s) forgiven by "
+            f"same-line proximity to a SKIP-class bt-id) — fabricated/mismatched perf claim")
+
+# self-audit #4 FIX: real fabrications (404 / Sharpe-mismatch) → FAIL; otherwise if every cited
+# bt-id was merely cannot-verify (cited without a resolvable pid) → SKIP (not FAIL); else PASS.
+if issues:
+    verdict = "FAIL"
+elif skips:
+    verdict = "SKIP"
+else:
+    verdict = "PASS"
+print(json.dumps({"verdict": verdict, "checked": checked, "issues": issues, "skips": skips}, ensure_ascii=False))

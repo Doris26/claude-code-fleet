@@ -1,0 +1,49 @@
+#!/bin/bash
+# ta: attach (or create) a tmux session running Claude
+# Usage:
+#   ta              -> session "main"
+#   ta work         -> session "work", auto-runs claude (ultracode auto-enabled)
+#   ta work -r ID   -> session "work", runs `claude -r ID` (ultracode auto-enabled)
+#   ta work --      -> session "work", plain shell (no auto-claude)
+#
+# Ultracode note: every Claude worker MUST run at ultracode (xhigh + dynamic
+# workflow orchestration). It is NOT persistable via settings.json (`effortLevel`
+# only accepts low/medium/high/xhigh/max — setting it to "ultracode" silently
+# falls back to "high"; `env.CLAUDE_CODE_EFFORT_LEVEL` is ignored). The only
+# enable path is the session-scoped slash command `/effort ultracode`, so this
+# script seeds it on every fresh launch. See your team's skills/rules docs.
+set -e
+
+NAME="${1:-main}"
+shift || true
+
+if tmux has-session -t "$NAME" 2>/dev/null; then
+    exec tmux attach -t "$NAME"
+fi
+
+if [ "${1:-}" = "--" ]; then
+    exec tmux new-session -s "$NAME"
+else
+    # Create detached so we can flip the session to ultracode before attaching.
+    tmux new-session -d -s "$NAME" "claude $*"
+    # Wait for the Claude TUI to finish rendering (banner / prompt up), max ~20s.
+    for _ in $(seq 1 20); do
+        tmux capture-pane -p -t "$NAME" 2>/dev/null | grep -qE "Claude Code v|Try \"|❯ " && break
+        sleep 1
+    done
+    # Enable ultracode (session-scoped), VERIFIED. Literal send + explicit Enter to avoid
+    # the long-paste race where the trailing newline is swallowed. Then read the footer back
+    # for "ultracode" and retry up to 3x — a single send+attach raced the TUI render and could
+    # leave the session silently on "high" (mirrors cc-recruit's verify-until-ultracode step).
+    eff_ok=0
+    for attempt in 1 2 3; do
+        tmux send-keys -t "$NAME" -l -- "/effort ultracode"
+        sleep 1
+        tmux send-keys -t "$NAME" Enter
+        sleep 3
+        if tmux capture-pane -p -t "$NAME" -S -20 2>/dev/null | grep -qi "ultracode"; then eff_ok=1; break; fi
+        sleep 2
+    done
+    [ "$eff_ok" = 1 ] || echo "ta: ⚠ ultracode not visible after 3 tries — re-run inside session: /effort ultracode" >&2
+    exec tmux attach -t "$NAME"
+fi

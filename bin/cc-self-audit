@@ -1,0 +1,29 @@
+#!/bin/bash
+# cc-self-audit: every-12h cc-manager mechanism grill.
+# Injects the self-audit prompt into the persistent `manager` tmux session.
+# Replaces the fragile session-only Claude-native cron with a launchd-driven
+# trigger that survives session restarts — co-located with cc-manager (cc-watch)
+# and auto-skill-capture as persistent management infra.
+set -u
+CC_HOME="${CC_HOME:-$(cd "$(dirname "$0")/.." && pwd)}"
+TS="$CC_HOME/bin/ts"
+PROMPT_FILE="$CC_HOME/bin/cc-self-audit.prompt"
+SESSION="manager"
+STAMP=$(date '+%Y-%m-%d %H:%M')
+
+if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    echo "[$STAMP] SKIP: tmux session '$SESSION' not found"
+    exit 0
+fi
+if [ ! -f "$PROMPT_FILE" ]; then
+    echo "[$STAMP] ERROR: prompt file missing: $PROMPT_FILE" >&2
+    exit 1
+fi
+
+# Clear any unsent draft so the grill prompt doesn't append to it.
+tmux send-keys -t "$SESSION" -- C-u
+sleep 0.4
+
+# Inject the single-line grill prompt via ts stdin form (settle+Enter handled by ts).
+printf '%s' "$(cat "$PROMPT_FILE")" | "$TS" "$SESSION" -
+echo "[$STAMP] self-audit grill injected -> $SESSION"

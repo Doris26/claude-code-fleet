@@ -1,0 +1,1978 @@
+#!/usr/bin/env python3
+"""cc-monitor — auto-detect deliverable completion + paid escalation.
+
+Designed to be called from cc-watch each cron cycle (or standalone).
+
+Two passes:
+1. **Deliverable completion**: for each in_progress task with a deliverable
+   path, check if file exists + has been modified in last N minutes.
+   If yes → ts the assignee asking to confirm + run `cc-task done <id>`.
+   This catches the "worker wrote file but I forgot to flip task status".
+
+2. **Paid escalation**: scan each watched session's pane for `[PAID]`
+   regex. If a NEW paid candidate appears (not yet in tasks.jsonl as
+   paid-review), append a `cc-task add --category paid-review` entry.
+   The operator reviews any paid spend before it is committed to.
+
+Usage:
+  cc-monitor                # run both passes
+  cc-monitor --deliverable  # only pass 1
+  cc-monitor --paid         # only pass 2
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+TASKS_FILE = Path.home() / ".cc-manager" / "tasks.jsonl"
+WATCH_LIST = Path.home() / ".cc-manager" / "watch.list"
+PAID_SEEN_FILE = Path.home() / ".cc-manager" / "paid_seen.json"
+DROPPED_SEEN_FILE = Path.home() / ".cc-manager" / "dropped_task_nudged.json"
+COMMIT_SEEN_FILE = Path.home() / ".cc-manager" / "commit_nudged.json"
+COMPLETION_SEEN_FILE = Path.home() / ".cc-manager" / "completion_block_seen.json"
+GOAL_STALE_SEEN_FILE = Path.home() / ".cc-manager" / "goal_stale_seen.json"
+RUN_PROOF_SEEN_FILE = Path.home() / ".cc-manager" / "run_proof_block_seen.json"
+IDLE_ON_BLOCKERS_SEEN_FILE = Path.home() / ".cc-manager" / "idle_on_blockers_seen.json"
+OPS_CRON_SEEN_FILE = Path.home() / ".cc-manager" / "ops_cron_seen.json"
+PAID_REVIEW_SLA_SEEN_FILE = Path.home() / ".cc-manager" / "paid_review_sla_seen.json"
+LANDING_REOPEN_SEEN_FILE = Path.home() / ".cc-manager" / "landing_reopen_seen.json"
+SESSION_HEALTH_SEEN_FILE = Path.home() / ".cc-manager" / "session_health_seen.json"
+DELIV_NUDGE_SEEN_FILE = Path.home() / ".cc-manager" / "deliv_nudge_seen.json"
+WORKERS_FILE = Path.home() / ".cc-manager" / "workers.json"
+REPO_ROOT = Path(os.environ.get("CC_REPO") or str(Path.home() / "your-repo"))
+LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
+OPS_CRON_PREFIX = "com.claude-code-fleet."
+TS = Path.home() / ".local" / "bin" / "ts"
+TP = Path.home() / ".local" / "bin" / "tp"
+CC_TASK = Path.home() / ".local" / "bin" / "cc-task"
+CC_NOTIFY = Path.home() / ".local" / "bin" / "cc-notify"
+
+
+def notify_user(topic: str, msg: str) -> None:
+    """self-audit #5: route an escalation to the LOCAL user-notify primitive (macOS notification +
+    durable escalations.log, per-topic dedup so it fires once). Best-effort: never raise into a pass.
+    Falls back to the in-repo path if the ~/.local/bin symlink isn't installed yet."""
+    exe = CC_NOTIFY if CC_NOTIFY.exists() else (REPO_ROOT / "bin" / "cc-manager" / "cc-notify")
+    if not exe.exists():
+        return
+    try:
+        subprocess.run([str(exe), topic, msg], check=False, capture_output=True, timeout=10)
+    except Exception:
+        pass
+
+
+def session_alive(name: str) -> bool:
+    """self-audit #6 (b): is there a LIVE tmux session for this worker? A status=active worker whose
+    pane has died must NOT be flagged (stale-deliverable / deadlock / repeated-nudge) — that's a false
+    flag on a worker that no longer exists (cc-watch's reconcile pass orphans it). Fail-OPEN (treat as
+    alive) on any tmux error so a tmux hiccup can't silently mute every flag."""
+    if not name:
+        return True
+    try:
+        r = subprocess.run(["tmux", "has-session", "-t", name], capture_output=True, timeout=8)
+        return r.returncode == 0
+    except Exception:
+        return True
+
+ACTIVE_STATUSES = {"assigned", "in_progress", "blocked"}
+# Outer gate: explicit [PAID] tag OR an untagged prose proposal — a "$NN/mo|/yr"
+# subscription cost, or a named paid vendor/feed. Workers often discuss cost in
+# prose without self-tagging "[PAID]" (e.g. "a data feed ($79/mo)"); relying
+# on the tag alone silently misses escalations the operator must review.
+# Inner filters below (free-skip + cost-marker requirement) drop incidental cash like "$100k".
+PAID_REGEX = re.compile(
+    r"(\[PAID\][^\n]{0,200}"
+    r"|\$\d[\d,]*\s*/\s*(?:mo|month|yr|year)[^\n]{0,120}"
+    r"|(?:subscription|订阅|月费|paid[ _-]?(?:tier|feed|data|API|subscription)"
+    r"|EODHD|Coinglass|Quandl|Bloomberg|Refinitiv|Polygon[ _-]?(?:options|paid)|Tradier[ _-]?paid)[^\n]{0,120})",
+    re.IGNORECASE)
+# Pane verdict — ANY completion language (used to FLAG for manager).
+PANE_VERDICT_REGEX = re.compile(r"DEAD.?END|comprehensively negative|verdict.{0,20}(DEAD|ALIVE|DELIVERED)|mandate (COMPLETE|delivered)|CLOSED|闭环了|交付完成")
+# Terminal verdict — strong, unambiguous "this task is DONE" language. Only these
+# trigger AUTO-FLIP (cc-task done). "ALIVE" alone is excluded: alive often means
+# "found signal, keep iterating", not "task finished".
+TERMINAL_VERDICT_REGEX = re.compile(r"DEAD.?END|comprehensively negative|mandate (COMPLETE|delivered)|CLOSED|闭环了|交付完成|verdict.{0,20}(DEAD|DELIVERED)")
+EXCLUDED_SCOPE_REGEX = re.compile(r"(crypto|coinglass|perp(etual)?[ _-]?(swap|future)|defi|stablecoin|bitcoin|ethereum)", re.IGNORECASE)
+# Premature-exhaustion / data-wall claims. Per the optional research-escalation
+# ladder: a worker must exhaust the cheaper deep-research tiers before declaring
+# a "wall" or reaching for paid data. Flag these so the manager nudges UP the
+# ladder instead of accepting the wall / approving paid data prematurely.
+EXHAUSTION_REGEX = re.compile(
+    r"(data[ _-]?wall|数据墙"
+    r"|free[ _-]?data (exhausted|枯竭)|免费数据枯竭|数据枯竭|方向枯竭|已枯竭"
+    r"|unreachable on free|not achievable on free|can.?t .{0,20} on free data"
+    r"|need(s)? paid[ _-]?data|要(上 )?paid[ _-]?data|得上 paid|只能上 paid|唯一.{0,6}paid"
+    r"|robust .{0,12}(data )?wall)",
+    re.IGNORECASE)
+# Mid-work spinner — mirrors cc-watch's mid-work guard (deliberately EXCLUDES
+# "esc to interrupt" / "N shells", which persist when bg shells idle → false-positive).
+MIDWORK_REGEX = re.compile(r"(✶|✻|✽) [A-Z][a-z]+ing|still thinking|[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]|[↑↓] [0-9]+(\.[0-9]+)?k tokens")
+SHIP_DRIFT_REGEX = re.compile(
+    r"(ship[ _-]?gate"                              # ship-gate (digit no longer required)
+    r"|ship[ _-]?verdict"                           # SHIP_VERDICT note
+    r"|canonical[ _-]?ship[ _-]?ready"
+    r"|gate[ _-]?sign[ _-]?-?off|gate[ _-]?\d[ _-]?sign"  # gate sign-off / gate 6 sign
+    r"|operator[ _-]?(approval|部署|deploy|promotion|note|推荐|签字|sign)"  # operator promotion-note etc.
+    r"|promotion[ _-]?note"
+    r"|promote[ _-]?to[ _-]?live"
+    r"|productioni[sz]ation|产品化|prod[ _-]?lock"  # productionization / prodlock candidates
+    r"|交付档案|推荐决策|部署决策|deployment[ _-]?decision"
+    r"|champion[ _-]?(lock|定版|final|sign))",       # champion-LOCK (not benign 'champion variant')
+    re.IGNORECASE)
+
+# Completion-integrity — markers that a task self-marked `completed` still has WORK
+# REMAINING (manager manages 做完没, NOT 做对没). DELIBERATELY EXCLUDES concluded-
+# negative verdicts (DEAD / ALIVE / rejected / DEAD-END = valid COMPLETE exploration
+# outcomes per explore-not-ship) and expected terminal gates ("pending operator" /
+# "operator-gated" — out-of-scope deploy approval, NOT our unfinished work). Markers are
+# deliberately NARROW — process-state language (re-audit owed, AUDIT/review-anchored
+# FAIL, scaffold-not-impl, unresolved blocker, denied-files-read, pending rework) — NOT
+# bare result-table tokens (❌ failed) or honest explore-not-ship caveats ("could not
+# confirm X, open question"), which are 做对 verdicts, not 做完 gaps. Paired with
+# single-file scoping in check_completed_integrity (dir/glob deliverables are skipped).
+INCOMPLETE_REGEX = re.compile(
+    r"(request(?:ing)?\s+re-?audit|re-?audit\s+trigger\b|needs?\s+re-?audit|re-?audit\s+(?:owed|pending|required|requested)"
+    r"|AUDIT\s+FAIL|OVERALL\s+VERDICT[^\n]{0,30}\bFAIL\b|review[^\n]{0,25}\bFAIL(?:ED|S)?\b"  # audit/review-anchored FAIL only (NOT bare ❌ in result tables)
+    r"|scaffold,?\s*not\s+an?\s+impl|genuinely\s+unfinished"
+    r"|denied\s+files/read"  # specific access-blocker only (dropped generic 'could not confirm/verify' — honest explore caveats)
+    r"|to\s+fix\s+before\s+re-?audit"
+    r"|unresolved\s+blocker|still\s+blocked\b|open\s+blocker"
+    r"|pending\s+(?:re-?audit|review|implementation|impl|DSR|fix|rework|verification)"
+    # Chinese mirror: a fleet that works in Chinese can have a worker
+    # self-`cc-task done` whose ledger's newest section carries a CN work-remains marker
+    # that evades the English-only set entirely (INPROGRESS/SHIP_DRIFT/EXCLUDED_SCOPE are all
+    # already bilingual — this was the lone monolingual reopen gate). NARROW + symmetric
+    # to the EN process-state markers; deliberately EXCLUDES bare 未完成 (collides with
+    # explore caveats like '未能完成 beat baseline' = a DEAD verdict, which is done-right).
+    r"|待\s*(?:返工|修复|重新审计|复审)"
+    r"|需(?:要)?\s*重新审计|重新审计\s*(?:未完成|未通过|待办|owed|pending|required)"
+    r"|(?:审计|复审)\s*(?:未通过|未过|失败)"
+    r"|仅(?:是)?\s*骨架|只是\s*骨架"
+    r"|(?:未解决的?|尚未解决的?)\s*blocker|blocker\s*(?:仍|尚)?\s*未解决|阻塞\s*(?:仍|尚)?未解决|仍(?:然)?\s*blocked)",
+    re.IGNORECASE)
+
+# AUTO-FLIP GUARD — live-work markers in the DELIVERABLE FILE that mean the task
+# is NOT finished even if the worker pane happens to carry a terminal verdict from
+# an EARLIER sub-section. A task was once false-flipped
+# because its metric ledger's newest section said "IN PROGRESS — still
+# computing" while the pane still showed a stale "verdict DEAD" from the v1 section.
+# Pane-terminal + deliverable-exists was NOT enough; the deliverable's own content
+# must also be free of in-flight language before we auto-close. If this matches,
+# downgrade auto-flip → manager-verify (never silently close). DELIBERATELY broad:
+# auto-flip is the only irreversible-ish action, so bias to NOT flipping on doubt.
+INPROGRESS_REGEX = re.compile(
+    r"(IN[ _-]?PROGRESS"
+    r"|still\s+(?:computing|running|in[ _-]progress|pending|iterating)"
+    r"|tier[ _-]?matrix[^\n]{0,40}(?:running|computing|pending)"
+    r"|matrix\s+(?:running|computing)|BT[s]?\s+(?:running|in[ _-]flight|queued|dispatched)"
+    r"|(?:verdict|结论)[^\n]{0,15}pending|pending\s+(?:verdict|BT|backtest|结论)"
+    r"|awaiting\s+(?:BT|backtest|result|verdict)"
+    r"|running\s+for\s+the\b|poll(?:ing)?\s+(?:to|until)\s+terminal"
+    r"|进行中|运行中|还在(?:算|跑|测|回测)|待回测|待跑|尚未完成|未完成|跑完再"
+    r"|TODO\b|TBD\b|to[ _-]be[ _-]determined)",
+    re.IGNORECASE)
+
+
+def materialize() -> dict:
+    """Replay event log into current state. Mini version of cc-task's."""
+    tasks = {}
+    if not TASKS_FILE.exists():
+        return tasks
+    for line in TASKS_FILE.read_text(errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        # Shape guard: one wrong-shape line ('"x"', a list, an
+        # object without id) crashed THIS pass and every sibling pass that calls
+        # materialize() — zero flips/nudges/reopens until hand-repaired. Skip it.
+        if not isinstance(e, dict) or "id" not in e:
+            continue
+        tid = e["id"]
+        if tid not in tasks:
+            tasks[tid] = {"id": tid, "description": e.get("description"), "assignee": e.get("assignee", ""),
+                          "deliverable": e.get("deliverable"), "category": e.get("category"),
+                          "status": "assigned", "created_at": None}
+        t = tasks[tid]
+        # First event (create) carries the task's birth ts → grace window for dropped-task detection.
+        if t.get("created_at") is None and e.get("ts"):
+            try:
+                t["created_at"] = datetime.fromisoformat(e["ts"])
+            except (ValueError, TypeError):
+                pass
+        ev = e.get("event")
+        # Ordered event trail: completion-integrity needs to
+        # distinguish the sanctioned override channel (block → unblock → done)
+        # from a worker re-`done`-ing straight over our block (evasion lane).
+        if ev:
+            t.setdefault("events", []).append(ev)
+        if ev == "done":
+            t["status"] = "completed"
+            t["verdict"] = e.get("verdict")
+        elif ev == "block":
+            t["status"] = "blocked"
+        elif ev == "unblock":
+            t["status"] = "in_progress"
+        elif ev == "cancel":
+            t["status"] = "cancelled"
+        elif ev == "start":
+            t["status"] = "in_progress"
+        elif ev == "reassign":
+            t["assignee"] = e.get("new_assignee", t["assignee"])
+        elif ev == "set_deliverable":
+            t["deliverable"] = e.get("deliverable", t["deliverable"])
+    return tasks
+
+
+def _deliv_path(deliv: str):
+    """Extract the filesystem path token from a deliverable spec that may carry a
+    trailing human annotation, e.g.
+      'docs/.../metric-ledger.md (col A + recompute)' → 'docs/.../metric-ledger.md'.
+    ~10% of deliverables carry such a '(...)' suffix; the annotation often contains a
+    '/' ('a/b'), so naive Path() parsing mis-splits and Path.parent points at a
+    nonexistent dir — which silently broke proof-detection and false-reopened a
+    legitimately-done landing task. Strips a redundant leading repo-name prefix.
+    Returns the cleaned path str, or None for a pure-prose deliverable
+    (no '/' and no file extension) so callers can treat it as 'no resolvable path'."""
+    if not deliv:
+        return None
+    s = deliv.strip()
+    head = re.split(r"\s+\(", s, maxsplit=1)[0].strip() or s
+    if head.startswith("your-repo/"):
+        head = head[len("your-repo/"):]
+    if "/" not in head and not re.search(r"\.\w{1,5}$", head):
+        return None  # pure-prose deliverable, no path to resolve
+    return head
+
+
+def resolve_deliverable(deliv: str):
+    """Resolve a deliverable spec to (exists, newest_mtime). Handles three forms:
+      - exact file path        → that file
+      - glob ('*' present)     → any matching file (modules/*_v2.md)
+      - directory              → exists + non-empty (your-repo/bin/refresh/)
+    Returns (exists: bool, mtime: datetime|None). mtime = newest matching file.
+    Earlier code required path.is_file(), so glob/dir
+    deliverables (most of them) were silently skipped → tasks never flipped."""
+    spec = _deliv_path(deliv)
+    if spec is None:
+        return (False, None)
+    base = Path(spec) if spec.startswith("/") else REPO_ROOT / spec
+    matches = []
+    if "*" in spec:
+        # glob relative to repo root (or absolute parent)
+        if spec.startswith("/"):
+            root = Path("/")
+            pattern = spec.lstrip("/")
+        else:
+            root = REPO_ROOT
+            pattern = spec
+        matches = [p for p in root.glob(pattern) if p.is_file()]
+    elif base.is_dir():
+        matches = [p for p in base.rglob("*") if p.is_file()]
+    elif base.is_file():
+        matches = [base]
+    if not matches:
+        return (False, None)
+    # TOCTOU guard: a file deleted between glob/rglob and stat()
+    # (worker mid-checkout) raised FileNotFoundError and aborted the whole pass.
+    mts = []
+    for m in matches:
+        try:
+            mts.append(m.stat().st_mtime)
+        except OSError:
+            pass
+    if not mts:
+        return (False, None)
+    return (True, datetime.fromtimestamp(max(mts)))
+
+
+def _classify_pane_verdict(pane: str):
+    """(any_verdict, terminal) from a worker pane's completion language. Two suppressors
+    must both pass before a verdict counts:
+      1. ECHO guard — the verdict sits in MY OWN nudge/STOP text echoed back
+         (STOP / 不要 / manager / per feedback), not the worker's own conclusion.
+      2. NEGATION guard — the verdict is NEGATED in the ~25 chars
+         immediately to its LEFT ('isn't comprehensively negative', '还没 CLOSED',
+         'not a dead-end'). A negated verdict is the worker saying it is NOT done, so it
+         must NOT trigger AUTO-FLIP (the only irreversible-ish action — bias to not
+         flipping on doubt). LEFT-only window is deliberate: a genuine dead-end conclusion
+         ('DEAD-END confirmed, 没有更多可做') carries negation words to the RIGHT of the
+         verdict — guarding the whole window would false-negative real verdicts.
+    PANE_VERDICT/TERMINAL regexes stay case-sensitive (uppercase DEAD-END/CLOSED only) —
+    that conservatism is intentional (lowercase = a softer mention, no auto-close).
+
+    CRITICAL fix: both guards used to run ONLY on the FIRST
+    PANE_VERDICT match, then `terminal` came from an UNGUARDED whole-pane search —
+    so a clean 'verdict: ALIVE, keep iterating' + the manager's own echoed GOAL
+    text ('write a DEAD-END card', '不要标 CLOSED') returned terminal=True and
+    auto-flipped a task the worker explicitly said is alive. Now BOTH regexes are
+    matched per-occurrence and each match must individually pass both guards;
+    a guarded-out first match no longer suppresses a genuine later verdict either."""
+    any_m = _guarded_verdict_match(PANE_VERDICT_REGEX, pane)
+    if any_m is None:
+        return (False, False)
+    term_m = _guarded_verdict_match(TERMINAL_VERDICT_REGEX, pane)
+    return (True, term_m is not None)
+
+
+def _guarded_verdict_match(regex, pane: str):
+    """First match of `regex` in pane that survives BOTH suppressor guards (echo +
+    left-negation), else None. Echo tokens: bare '别' matched
+    特别/分别/级别 and bare 'manager' lacked word-bounds — both suppressed GENUINE
+    worker verdicts in a Chinese-language fleet; now intent-anchored."""
+    for m in regex.finditer(pane):
+        vctx = pane[max(0, m.start()-50):m.end()+50]
+        if re.search(r"STOP|不要|别(?:标|说|急|提|关|跑|动|close|done|flip)|MEDIATE|per feedback|\bmanager\b",
+                     vctx, re.IGNORECASE):
+            continue  # echo of my own nudge/GOAL text, not the worker's verdict
+        left = pane[max(0, m.start()-25):m.start()]
+        if re.search(r"\b(not|isn'?t|aren'?t|wasn'?t|no longer|far from|nowhere near|"
+                     r"didn'?t|won'?t|hardly|barely|not yet)\b|非|不是|远未|尚未|还没",
+                     left, re.IGNORECASE):
+            continue  # negated → worker is NOT declaring done
+        return m
+    return None
+
+
+def check_deliverables():
+    """Pass 1: detect deliverable files exist for in_progress tasks.
+
+    Buckets:
+      nudged       — deliverable exists, mtime <90min → ts worker to confirm/flip
+      auto_flipped — deliverable exists AND worker pane shows a TERMINAL verdict
+                     → cc-task done automatically (the durable layer must close
+                     stale tasks even when the manager session is dead — SPOF fix)
+      stale        — deliverable exists >90min, no terminal verdict → flag manager
+      pane_verdict — non-terminal completion language (ALIVE etc.) → flag manager
+    """
+    tasks = materialize()
+    now = datetime.now()
+    nudged = []
+    stale = []
+    pane_verdict = []
+    auto_flipped = []
+    flip_failed = []
+    live_work_guard = []
+    pre_dated = []
+    nudge_stamps = _load_stamp_map(DELIV_NUDGE_SEEN_FILE)
+    stamps_dirty = False
+    for t in tasks.values():
+        if t["status"] not in ACTIVE_STATUSES:
+            continue
+        deliv = t.get("deliverable")
+        if not deliv:
+            continue
+        exists, mtime = resolve_deliverable(deliv)
+        if not exists:
+            continue
+        age = now - mtime
+        assignee = t["assignee"]
+        if not assignee or assignee in ("multi", "manager"):
+            continue
+        # self-audit #6 (b): if the assignee's tmux pane is GONE, do NOT flag stale / nudge — it's a
+        # false flag on a worker that no longer exists (cc-watch's reconcile orphans it). The pane is
+        # also unreadable so no verdict can be attributed; skip the whole task.
+        if not session_alive(assignee):
+            continue
+        # Scan the assignee's pane for completion-verdict language (echo + negation guarded).
+        terminal = False
+        any_verdict = False
+        pane = ""
+        try:
+            pane = subprocess.run([str(TP), assignee, "40"], capture_output=True, text=True, timeout=12).stdout
+            any_verdict, terminal = _classify_pane_verdict(pane)
+        except Exception:
+            pass
+        # AUTO-FLIP: deliverable exists + worker pane shows a terminal verdict.
+        # High-confidence dual-signal; reversible (cc-task is append-only, manager
+        # can re-add). Logged loudly so manager can audit/reverse.
+        # NEVER auto-flip a `blocked` task — it was deliberately blocked (a real
+        # blocker, or a completion-integrity reopen); flipping it to done on stale
+        # pane text would silently undo that block (a real prior incident).
+        if terminal and t["status"] != "blocked":
+            # FRESHNESS gate (mirrors check_dropped_tasks): a
+            # deliverable whose newest mtime PRE-DATES the task's creation is a
+            # pre-existing artifact (shared-ledger pattern — task B points at the
+            # ledger task A already wrote). The pane's terminal verdict belongs to the
+            # PREVIOUS task; flipping would close B before any work started.
+            created = t.get("created_at")
+            if created is not None and mtime is not None and mtime < created:
+                pre_dated.append((t["id"], assignee, deliv))
+                continue
+            # GUARD: even with a terminal pane verdict, do NOT auto-close if the
+            # deliverable file itself still carries in-flight markers (the pane
+            # verdict may belong to an earlier sub-section). Downgrade to a
+            # manager-verify flag instead of silently flipping.
+            # FAIL-CLOSED: dir/glob/unreadable deliverables return
+            # "" → content can't be attributed → manager-verify too, never silent flip
+            # (the guard used to fail-OPEN and vanish for exactly those specs).
+            try:
+                card_text = read_deliverable_text(deliv, single_file_only=True)
+            except Exception:
+                card_text = ""
+            if not card_text or INPROGRESS_REGEX.search(card_text):
+                live_work_guard.append((t["id"], assignee, deliv))
+                continue
+            verdict = (f"auto-flipped by cc-monitor: deliverable '{deliv}' exists "
+                       f"+ worker pane shows terminal verdict. Manager re-open if wrong.")
+            try:
+                r = subprocess.run([str(CC_TASK), "done", t["id"], "--verdict", verdict,
+                                    "--artifact", deliv], check=False, capture_output=True, timeout=30)
+                # Only report AUTO-FLIPPED if cc-task done actually SUCCEEDED. check=False
+                # means a non-zero exit does NOT raise — appending unconditionally would
+                # report a FAILED flip as success (silent false-close; re-reported every
+                # run if the failure is permanent).
+                if r.returncode == 0:
+                    auto_flipped.append((t["id"], assignee, deliv))
+                else:
+                    err = (r.stderr or b"").decode("utf-8", "replace").strip().replace("\n", " ")[:100]
+                    flip_failed.append((t["id"], assignee, err))
+            except subprocess.TimeoutExpired:
+                # cc-task appends the done event BEFORE its notify loop — a timeout
+                # here may mean the flip COMMITTED but went unreported (silent close,
+                # breaks the logged-loudly contract). Surface it; never swallow.
+                flip_failed.append((t["id"], assignee,
+                                    "cc-task done TIMED OUT — flip may have committed; verify cc-task list"))
+            except Exception as e:
+                flip_failed.append((t["id"], assignee, f"{type(e).__name__}: {e}"))
+            continue
+        # Not terminal → nudge (recent) or flag (stale / non-terminal verdict).
+        # Blocked tasks are the MANAGER's to resolve — never nudge the worker to
+        # "run cc-task done" (that's what re-completed a previously-blocked task).
+        if t["status"] == "blocked":
+            continue
+        if any_verdict:
+            pane_verdict.append((t["id"], assignee))
+        if age < timedelta(minutes=90):
+            # Anti-spam: this branch used to fire EVERY cycle for
+            # a worker iterating on its card (16 identical nudges over a 4h sweep) —
+            # per-task 60min cooldown + mid-work guard + only count rc==0 sends.
+            last = nudge_stamps.get(t["id"])
+            recently = False
+            if last:
+                try:
+                    recently = (now - datetime.fromisoformat(last)) < timedelta(minutes=60)
+                except (ValueError, TypeError):
+                    pass
+            if recently or (pane and MIDWORK_REGEX.search(pane[-1500:])):
+                continue
+            msg = f"deliverable {deliv} 已写({age.total_seconds()/60:.0f}min mtime)。完成了就跑 cc-task done {t['id']} --verdict <1-line> --artifact <commit/path>;还在 iterate 忽略。"
+            try:
+                r = subprocess.run([str(TS), assignee, msg], check=False, capture_output=True, timeout=10)
+                if r.returncode == 0:
+                    nudged.append((t["id"], assignee, deliv))
+                    nudge_stamps[t["id"]] = now.isoformat()
+                    stamps_dirty = True
+            except Exception:
+                pass
+        else:
+            stale.append((t["id"], assignee, deliv, int(age.total_seconds()/3600)))
+    if stamps_dirty:
+        _save_stamp_map(DELIV_NUDGE_SEEN_FILE, nudge_stamps)
+    if auto_flipped:
+        print(f"deliverable-detection: AUTO-FLIPPED {len(auto_flipped)} task(s) (deliverable + terminal pane verdict):")
+        for tid, a, d in auto_flipped:
+            print(f"  ✓ {tid} ({a}) → done: {d}")
+    if flip_failed:
+        print(f"deliverable-detection: ⚠ {len(flip_failed)} auto-flip(s) FAILED (cc-task done non-zero — task still ACTIVE, manager investigate):")
+        for tid, a, err in flip_failed:
+            print(f"  ✗ {tid} ({a}): cc-task done failed — {err}")
+    if live_work_guard:
+        print(f"deliverable-detection: {len(live_work_guard)} task(s) GUARDED from auto-flip (pane terminal BUT deliverable shows in-progress markers / content unattributable — manager verify, do NOT auto-close):")
+        for tid, a, d in live_work_guard:
+            print(f"  ⏸ {tid} ({a}): {d} — read the card, flip only if truly closed")
+    if pre_dated:
+        print(f"deliverable-detection: {len(pre_dated)} task(s) GUARDED from auto-flip (deliverable mtime PRE-DATES task creation — pane verdict likely belongs to a PREVIOUS task; manager verify):")
+        for tid, a, d in pre_dated:
+            print(f"  ⏸ {tid} ({a}): {d} — pre-existing artifact, do not close until touched post-assignment")
+    if nudged:
+        print(f"deliverable-detection: nudged {len(nudged)} task(s)")
+        for tid, a, d in nudged:
+            print(f"  {tid} → {a}: {d}")
+    if stale:
+        print(f"deliverable-detection: {len(stale)} STALE — deliverable exists >90min but task still active (manager verify+flip):")
+        for tid, a, d, hrs in stale:
+            print(f"  {tid} ({a}, {hrs}h old): {d}")
+    if pane_verdict:
+        print(f"deliverable-detection: {len(pane_verdict)} task(s) whose worker PANE shows non-terminal verdict (manager verify+flip):")
+        for tid, a in pane_verdict:
+            print(f"  {tid} ({a}): pane shows ALIVE/partial — read deliverable + cc-task done if truly closed")
+    if not (auto_flipped or flip_failed or live_work_guard or pre_dated or nudged or stale or pane_verdict):
+        print("deliverable-detection: no deliverables to nudge")
+
+
+def read_deliverable_text(deliv: str, single_file_only: bool = False) -> str:
+    """Return concatenated text of the deliverable (file, or all files in a dir/glob).
+    Mirrors resolve_deliverable's resolution. Caps per-file read to keep cheap.
+    single_file_only=True → ONLY read when the deliverable resolves to one concrete
+    file; bare dir/glob deliverables return "" (used by completion-integrity so one
+    stale caveat in an unrelated sub-card can't block a whole research-dir task).
+
+    Path resolution MUST go through _deliv_path (same as resolve_deliverable): a
+    deliverable with a trailing '(...)' annotation otherwise reports exists=True via
+    resolve_deliverable but read_deliverable_text returned '' (raw path un-cleaned) →
+    completion-integrity's `if not text: continue` SKIPPED it, and the auto-flip guard
+    fail-opened. A deliverable like 'ledger.md (re-audit pending)' evaded
+    the work-remains hard-block. Single source of path truth closes that inconsistency."""
+    spec = _deliv_path(deliv)
+    if spec is None:
+        return ""
+    base = Path(spec) if spec.startswith("/") else REPO_ROOT / spec
+    matches = []
+    if single_file_only:
+        matches = [base] if base.is_file() else []
+    elif "*" in spec:
+        if spec.startswith("/"):
+            root = Path("/"); pattern = spec.lstrip("/")
+        else:
+            root = REPO_ROOT; pattern = spec
+        matches = [p for p in root.glob(pattern) if p.is_file()]
+    elif base.is_dir():
+        matches = [p for p in base.rglob("*") if p.is_file() and p.suffix in (".md", ".txt", ".json")]
+    elif base.is_file():
+        matches = [base]
+    # Per-file read cap. Single-file scope (completion-integrity + auto-flip guard)
+    # reads ONE concrete card → cap high (1MB) so a work-remains / in-progress marker
+    # in the NEWEST section of a large append-only ledger (the metric ledger or an
+    # audit log, 95KB–401KB) is NOT truncated away. A
+    # marker at byte-offset 76336 was once invisible under the old 40000 cap → both checks
+    # false-negatived. Multi-file dir/glob path keeps 40000/file (×20) to bound cost.
+    per_file = 1_000_000 if single_file_only else 40000
+    out = []
+    for p in matches[:20]:
+        try:
+            out.append(p.read_text(errors="ignore")[:per_file])
+        except Exception:
+            pass
+    return "\n".join(out)
+
+
+def load_json_seen(path: Path) -> set:
+    if path.exists():
+        try:
+            return set(json.loads(path.read_text()).get("seen", []))
+        except Exception:
+            return set()
+    return set()
+
+
+def save_json_seen(path: Path, seen: set):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"seen": sorted(seen), "updated": datetime.now().isoformat()}, indent=2))
+
+
+def check_completed_integrity():
+    """Pass: HARD-BLOCK a task self-marked `completed` whose deliverable still carries
+    a WORK-REMAINS marker (re-audit owed, AUDIT FAIL/rework, scaffold/not-implemented,
+    buried unverified blocker, issues-to-fix). Such a task is NOT done → auto-reopen to
+    `blocked` (re-arms its cron gate) + loud alert. The manager's job is 做完没 not 做对没,
+    so concluded-negative verdicts (DEAD/ALIVE) and out-of-scope deploy gates (operator)
+    are NOT matched (see INCOMPLETE_REGEX). Seen-set exemption is for the SANCTIONED
+    override channel only (block → cc-task unblock → done, as the reopen alert
+    instructs): a bare block → done with no intervening unblock is a worker
+    re-completing without fixing — the exact evasion this pass exists to close
+    — and stays under re-check every cycle."""
+    seen = load_json_seen(COMPLETION_SEEN_FILE)
+    tasks = materialize()
+    reopened = []
+    reopen_failed = []
+    for t in tasks.values():
+        if t.get("status") != "completed":
+            continue
+        if t["id"] in seen:
+            # Honor the one-shot ONLY if the task went through unblock after our
+            # last block (manager's deliberate override). block → done directly =
+            # evasion → fall through and re-check the marker. No block event found
+            # (trimmed/rotated log) → fail-safe to old skip behavior.
+            evs = t.get("events", [])
+            li = max((i for i, ev in enumerate(evs) if ev == "block"), default=-1)
+            if li < 0 or "unblock" in evs[li + 1:]:
+                continue
+        deliv = t.get("deliverable")
+        if not deliv:
+            continue
+        exists, _ = resolve_deliverable(deliv)
+        if not exists:
+            continue
+        # single-file scope: a verdict/audit deliverable is a concrete file (the metric
+        # ledger, main.py, a verdict doc). Bare dir/glob research deliverables are skipped — one
+        # stale explore-not-ship caveat in an unrelated sub-card must not block the task.
+        text = read_deliverable_text(deliv, single_file_only=True)
+        if not text:
+            continue
+        m = INCOMPLETE_REGEX.search(text)
+        if not m:
+            continue
+        marker = m.group(0).replace("\n", " ").strip()
+        reason = (f"completion-integrity: '{deliv}' marked completed but deliverable still "
+                  f"carries WORK-REMAINS marker «{marker}» → NOT done. Auto-reopened to blocked. "
+                  f"Manager: finish/resolve the open item then cc-task done, or cc-task unblock to override.")
+        try:
+            r = subprocess.run([str(CC_TASK), "block", t["id"], reason],
+                               check=False, capture_output=True, timeout=10)
+            # Only report REOPENED + mark seen if cc-task block actually SUCCEEDED.
+            # check=False means non-zero exit does NOT raise — the old code appended
+            # + seen.add unconditionally, so a failed block was reported as ⛔ REOPENED
+            # (false success: task still `completed`) AND seen-advanced (never retried
+            # → reopen silently lost forever). Mirror of the auto-flip rc fix in
+            # check_deliverables; mirrored here.
+            if r.returncode == 0:
+                reopened.append((t["id"], t.get("assignee", ""), deliv, marker))
+                seen.add(t["id"])
+            else:
+                err = (r.stderr or b"").decode("utf-8", "replace").strip().replace("\n", " ")[:100]
+                reopen_failed.append((t["id"], t.get("assignee", ""), err))
+        except Exception as ex:
+            # A subprocess timeout/OSError previously vanished
+            # (bare pass) — no reopen, no report, task stayed 'completed' silently.
+            reopen_failed.append((t["id"], t.get("assignee", ""), f"exception: {type(ex).__name__}"))
+    save_json_seen(COMPLETION_SEEN_FILE, seen)
+    if reopened:
+        print(f"completion-integrity: ⛔ REOPENED {len(reopened)} 'completed' task(s) that are NOT done (work-remains marker → blocked):")
+        for tid, a, d, mk in reopened:
+            print(f"  ⛔ {tid} ({a}) → blocked: «{mk}» in {d}")
+    if reopen_failed:
+        print(f"completion-integrity: ⚠ {len(reopen_failed)} reopen(s) FAILED (cc-task block non-zero — task STILL marked completed, retries next run):")
+        for tid, a, err in reopen_failed:
+            print(f"  ✗ {tid} ({a}): cc-task block failed — {err}")
+    if not (reopened or reopen_failed):
+        print("completion-integrity: completed tasks clean (no work-remains markers)")
+
+
+def load_paid_seen() -> set:
+    if PAID_SEEN_FILE.exists():
+        try:
+            return set(json.loads(PAID_SEEN_FILE.read_text()).get("seen", []))
+        except Exception:
+            return set()
+    return set()
+
+
+def save_paid_seen(seen: set):
+    PAID_SEEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PAID_SEEN_FILE.write_text(json.dumps({"seen": sorted(seen), "updated": datetime.now().isoformat()}, indent=2))
+
+
+def _paid_tokens(text: str) -> set:
+    """Canonical dedup tokens for a paid proposal: vendor names + normalized $amounts.
+    Lets fragments of the SAME proposal ('$79/mo as pending', 'a vendor's pricing')
+    collide on a stable token instead of volatile snippet text."""
+    toks = set()
+    for v in re.findall(r"EODHD|Coinglass|Quandl|Bloomberg|Refinitiv|Polygon|Tradier|Benzinga|FMP|Nasdaq[ _-]?TotalView|OPRA", text, re.IGNORECASE):
+        toks.add(re.sub(r"[ _-]", "", v.lower()))
+    for amt in re.findall(r"\$\s?\d[\d,]*", text):
+        norm = amt.replace(" ", "").replace(",", "")
+        if re.fullmatch(r"\$0+", norm):
+            continue  # '$0' / '>$0' = rule-language ('any nonzero cost'), not a real price
+        toks.add(norm)
+    return toks
+
+
+def check_paid():
+    """Pass 2: scan worker panes for [PAID] occurrences."""
+    if not WATCH_LIST.exists():
+        return
+    sessions = [line.strip() for line in WATCH_LIST.read_text().splitlines()
+                if line.strip() and not line.startswith("#")]
+    seen = load_paid_seen()
+    # Pre-seed dedup from existing OPEN paid-review tasks so a proposal that's
+    # already tracked is never re-flagged — survives pane-fragment drift across
+    # scans + seen-file resets (fixes a duplicate-tasks-per-hour regression).
+    try:
+        for t in materialize().values():
+            d = t.get("description", "")
+            if t.get("status") in ("assigned", "in_progress", "blocked") and "[paid-review]" in d:
+                ms = re.search(r"\[paid-review\]\s*([a-z_]+)\s*:", d)
+                tsess = ms.group(1) if ms else None
+                if tsess:
+                    for tok in _paid_tokens(d):
+                        seen.add(f"{tsess}::{tok}")
+    except Exception:
+        pass
+    new_findings = []
+    for sess in sessions:
+        try:
+            out = subprocess.run([str(TP), sess, "120"], capture_output=True, text=True, timeout=15)
+            if out.returncode != 0:
+                continue
+            for m in PAID_REGEX.finditer(out.stdout):
+                snippet = m.group(0).strip()[:180]
+                # Skip false positives: free comparison OR TODO-annotation (no real cost marker)
+                if re.search(r"free|免费|no.?cost|EIA", snippet, re.IGNORECASE):
+                    continue
+                if re.search(r"\[PAID\]\s*(check|待确认|todo|\?)", snippet, re.IGNORECASE):
+                    continue  # '[PAID] check' = self-reminder, not a proposal
+                # Require a real cost marker to count as a genuine paid proposal
+                if not re.search(r"\$|subscription|/mo|/year|per.?call|月费|订阅|API.?key.?paid|EODHD|Coinglass|Quandl|Bloomberg|Refinitiv|Polygon.?(paid|options)|Tradier.?paid", snippet, re.IGNORECASE):
+                    continue
+                toks = _paid_tokens(snippet)
+                if toks:
+                    # vendor/amount-bearing: dedup on any shared token for this session
+                    if any(f"{sess}::{t}" in seen for t in toks):
+                        continue
+                    for t in toks:
+                        seen.add(f"{sess}::{t}")
+                else:
+                    # tokenless (generic 'subscription' chatter, no vendor/amount):
+                    # if this session already has ANY paid token tracked, it's chatter
+                    # about that proposal — skip; else flag once on a short text key.
+                    if any(k.startswith(f"{sess}::") for k in seen):
+                        continue
+                    key = f"{sess}:{snippet[:60]}"
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                new_findings.append((sess, snippet))
+        except Exception:
+            continue
+    # Collapse near-duplicates: one paid proposal can match multiple regex branches
+    # on different pane lines (e.g. "a data feed ($79/mo)…" + bare "a data
+    # feed"). Keep only maximal snippets per session (drop substrings) → 1 task.
+    collapsed = []
+    for sess, snip in new_findings:
+        norm = snip.lower().replace(" ", "")
+        subsumed = False
+        for j, (s2, snip2) in enumerate(collapsed):
+            if s2 != sess:
+                continue
+            n2 = snip2.lower().replace(" ", "")
+            if norm in n2:
+                subsumed = True
+                break
+            if n2 in norm:
+                collapsed[j] = (sess, snip)
+                subsumed = True
+                break
+        if not subsumed:
+            collapsed.append((sess, snip))
+    new_findings = collapsed
+    if new_findings:
+        for sess, snippet in new_findings:
+            desc = f"[paid-review] {sess}: {snippet}"
+            try:
+                subprocess.run([str(CC_TASK), "add", desc, "--assignee", "manager",
+                                "--category", "paid-review"], check=False, capture_output=True, timeout=10)
+            except Exception:
+                pass
+            # self-audit #5 (b): a NEW [PAID] block registered is an operator-review escalation
+            # — notify + log it, deduped per worker so it fires once.
+            notify_user(f"paid:{sess}", f"new [PAID] candidate from {sess}: {snippet[:120]}")
+        print(f"paid-detection: {len(new_findings)} new [PAID] candidate(s)")
+        for sess, snip in new_findings:
+            print(f"  [{sess}] {snip[:120]}")
+        save_paid_seen(seen)
+    else:
+        print("paid-detection: no new [PAID] mentions")
+
+
+def check_premature_exhaustion():
+    """Pass: scan worker panes for premature 'data exhausted / data wall / need paid
+    data' claims. Per the optional research-escalation ladder: a worker must
+    exhaust the cheaper deep-research tiers before declaring a wall or going paid. Flag
+    so the manager nudges it UP the ladder, never accepts the wall / approves paid
+    data while research tiers remain. Complements check_paid (which gates the $ decision)."""
+    if not WATCH_LIST.exists():
+        return
+    sessions = [line.strip() for line in WATCH_LIST.read_text().splitlines()
+                if line.strip() and not line.startswith("#")]
+    for sess in sessions:
+        try:
+            out = subprocess.run([str(TP), sess, "60"], capture_output=True, text=True, timeout=15)
+            if out.returncode != 0:
+                continue
+            m = EXHAUSTION_REGEX.search(out.stdout)
+            if not m:
+                continue
+            ctx = out.stdout[max(0, m.start() - 80):m.end() + 80]
+            # Skip false positives: worker is ALREADY escalating the ladder / has
+            # reached a higher DR tier (tier 2/3 → ladder genuinely progressing), OR
+            # this is the manager's own anti-wall nudge echoed in the pane.
+            if re.search(r"gemini[ _-]?dr|openai[ _-]?dr|chatgpt[ _-]?dr|升级 (gemini|openai|dr)"
+                         r"|escalat|别停|别说枯竭|先升级|不准.{0,8}枯竭|三档.{0,4}dr|paid.{0,8}最后手段"
+                         r"|最后手段.{0,8}paid",
+                         ctx, re.IGNORECASE):
+                continue
+            print(f"  [dr-ladder] {sess}: '{m.group(0)}' — PREMATURE exhaustion claim; "
+                  f"DR-escalate up the research ladder before any paid-data, do NOT accept the wall")
+            # self-audit #5 (a): a CONFIRMED premature-exhaustion claim is a real escalation —
+            # surface it to the user (notify + escalations.log), deduped per worker so it fires once.
+            notify_user(f"premature-exhaust:{sess}",
+                        f"{sess} claims '{m.group(0)}' — premature data-wall; DR-escalate before paid")
+        except Exception:
+            continue
+
+
+def check_ship_drift():
+    """Pass 3: scan worker panes for ship-paradigm keywords. Per the explore-not-ship rule.
+    EXEMPT: workers with an open category=landing task — for a USER-DESIGNATED landing
+    line, operator-approval / deploy / promote-to-live talk is the legitimate job, not
+    paradigm drift (exempting here keeps this pass from fighting check_landing_debt)."""
+    if not WATCH_LIST.exists():
+        return
+    exempt = open_landing_workers()
+    sessions = [line.strip() for line in WATCH_LIST.read_text().splitlines()
+                if line.strip() and not line.startswith("#")]
+    findings = []
+    for sess in sessions:
+        if sess in exempt:
+            continue
+        try:
+            out = subprocess.run([str(TP), sess, "60"], capture_output=True, text=True, timeout=15)
+            if out.returncode != 0:
+                continue
+            m = SHIP_DRIFT_REGEX.search(out.stdout)
+            if m:
+                # Skip echo false-positive: keyword in a STOP/exclusion/negation/removal context
+                # (my own anti-ship nudge, OR a worker REPORTING it stripped ship-framing — not drift).
+                ctx = out.stdout[max(0, m.start()-60):m.end()+60]
+                # NOTE: 'residual'/'negat' were once BARE → any ship-drift
+                # phrase with common domain words ('residual ...'/'negative ...')
+                # within 60 chars was silently skipped (real drift missed). Anchored
+                # to 'ship' so they still catch compliance-reporting ('negated the ship gate',
+                # 'addressed ship-residual') without neutering detection on normal domain text.
+                if re.search(r"STOP|不要|别|別|don.t|不算|not the goal|explore.?not.?ship|记 PERF|exploration 结论"
+                             r"|strip|remov|去掉|删除|addressed|ship[ _-]?residual|negat\w*[ _-]?(the[ _-]?)?ship"
+                             r"|NOT a ship|NO ship|no ship[ _-]?gate|没有 ship|不 ship|不是 ship|无 ship",
+                             ctx, re.IGNORECASE):
+                    continue
+                findings.append((sess, m.group(0)))
+        except Exception:
+            continue
+    if findings:
+        for sess, snippet in findings:
+            print(f"  [ship-drift] {sess}: '{snippet}' — GRILL paradigm drift")
+            try:
+                subprocess.run([str(TS), sess, f"GRILL: paradigm drift detected — '{snippet}' is ship-paradigm。Per the explore-not-ship rule,goal = 持续探索,不 ship。把 variant 当作探索结论(ALIVE/DEAD)记录就够,不要 'lock ship-ready' / 'ship gate' 框架。"],
+                               check=False, capture_output=True, timeout=10)
+            except Exception:
+                pass
+        print(f"ship-drift-detection: {len(findings)} worker(s) drifted, GRILL sent")
+    else:
+        print("ship-drift-detection: no drift")
+
+
+def check_repeated_nudge():
+    """Pass 4: detect cross-worker deadlock — same worker sent near-identical
+    nudge 3+ cycles in a row (e.g. 'ping worker_a for X' that never gets answered).
+    Flags for manager to mediate directly. Per an observed multi-cycle nudge loop."""
+    log = Path("/tmp/cc-manager.log")
+    if not log.exists():
+        return
+    # Window the SENT lines, NOT raw lines. cc-monitor logs ~14 '[monitor] …' lines per
+    # cycle into this same file, so a raw [-60:] window is dominated by monitor output
+    # (e.g. last 60 raw lines = 14 monitor + only 2 sent; last 200 raw = 7
+    # sent) → the detector could never accumulate 3 sent-lines from one worker and thus
+    # SILENTLY NEVER FIRED regardless of a real nudge-loop. Filter to sent-lines first,
+    # then keep the most recent N so monitor noise can't crowd out the signal.
+    from collections import defaultdict
+    sent_lines = [ln for ln in log.read_text().splitlines() if "] sent:" in ln][-50:]
+    sent = defaultdict(list)
+    for ln in sent_lines:
+        try:
+            sess = ln.split("[")[1].split("]")[0]
+            msg = ln.split("] sent:", 1)[1].strip()
+            sent[sess].append(msg)
+        except Exception:
+            continue
+    flagged = []
+    for sess, msgs in sent.items():
+        if len(msgs) < 3:
+            continue
+        # self-audit #6 (b): skip a worker whose tmux pane is GONE — a dead session can't be in a
+        # live deadlock, and the auto-GRILL below would ts into nothing (false flag on a worker that
+        # no longer exists; cc-watch's reconcile orphans it).
+        if not session_alive(sess):
+            continue
+        # Compare last 3 msgs: if they share a long common keyword signature → loop
+        last3 = msgs[-3:]
+        # crude similarity: shared 8-char tokens across all 3
+        def toks(m):
+            return set(w for w in re.split(r"[\s,，。()（）]", m) if len(w) >= 6)
+        common = toks(last3[0]) & toks(last3[1]) & toks(last3[2])
+        if len(common) >= 3:  # 3+ shared long tokens across 3 consecutive = likely same nudge
+            flagged.append((sess, sorted(common)[:5]))
+    if flagged:
+        for sess, common in flagged:
+            print(f"  [repeated-nudge] {sess}: stuck loop, shared tokens {common} — auto-GRILL + MANAGER MEDIATE")
+            # Auto-GRILL the stuck worker to break the loop faster (don't wait for hourly cron)
+            try:
+                subprocess.run([str(TS), sess, f"GRILL: 你连续 3+ cycle 重复同样的话(tokens {common[:3]})= 死循环。停。要么 self-decide 这个 blocker(per manager-decides-all 你有权),要么用一句话**明确**告诉 manager 你卡在什么具体决策上(不要再重复 status)。别空转。"],
+                               check=False, capture_output=True, timeout=10)
+            except Exception:
+                pass
+        print(f"repeated-nudge-detection: {len(flagged)} worker(s) deadlock — auto-GRILL sent + flagged")
+    else:
+        print("repeated-nudge-detection: no deadlock loops")
+
+
+CRYPTO_LANE_WORKERS = {"crypto_dr", "crypto_breadth", "data_pipe", "crypto_fix"}
+
+
+def check_excluded_scope():
+    """Pass 5: detect drift into an operator-EXCLUDED topic by workers not assigned to it.
+    (Example excluded topic here is configured via EXCLUDED_SCOPE_REGEX.)
+
+    The excluded topic is OPEN only to the dedicated lanes named in CRYPTO_LANE_WORKERS
+    (and any session whose name starts with that prefix). So this guard does NOT
+    blanket-ban the topic — it only fires on OTHER-lane workers drifting into it,
+    where it remains off-limits. Firing on the dedicated-lane workers was actively
+    harmful (it GRILLed them with 'STOP' every cycle → caused a scope hallucination)."""
+    if not WATCH_LIST.exists():
+        return
+    sessions = [l.strip() for l in WATCH_LIST.read_text().splitlines() if l.strip() and not l.startswith("#")]
+    findings = []
+    for sess in sessions:
+        if sess in CRYPTO_LANE_WORKERS or sess.startswith("crypto"):
+            continue  # the excluded topic IS their mandate — not drift
+            # startswith guard: dedicated-lane recruits are named with a shared prefix,
+            # so a new recruit missed by the static set still gets exempted (no bogus STOP)
+        try:
+            out = subprocess.run([str(TP), sess, "50"], capture_output=True, text=True, timeout=15)
+            if out.returncode != 0:
+                continue
+            m = EXCLUDED_SCOPE_REGEX.search(out.stdout)
+            if m:
+                ctx = out.stdout[max(0, m.start()-50):m.end()+50]
+                # Skip if keyword is in an exclusion/echo context (worker COMPLYING, not pursuing)
+                if re.search(r"STOP|排除|OUT.?of.?scope|不要|exclud|out of scope|don.t|別碰|别碰|skip|no crypto", ctx, re.IGNORECASE):
+                    continue
+                # Only fire if there is ACTION intent near the keyword (actually pursuing the topic)
+                if not re.search(r"request|build|implement|pursue|key|backtest|BT|pivot to|启动|搭建|接入|跑", ctx, re.IGNORECASE):
+                    continue
+                findings.append((sess, m.group(0)))
+        except Exception:
+            continue
+    if findings:
+        for sess, kw in findings:
+            print(f"  [excluded-scope] {sess}: '{kw}' — this topic is OUT of scope, GRILL")
+            try:
+                subprocess.run([str(TS), sess, f"STOP: '{kw}' 是 operator 排除的 scope(此 lane 不做)。回到你被分配的 lane / 等 manager 战略方向,不要碰这个排除 topic。"], check=False, capture_output=True, timeout=10)
+            except Exception:
+                pass
+        print(f"excluded-scope-detection: {len(findings)} worker(s) drifted to an excluded topic")
+    else:
+        print("excluded-scope-detection: no excluded-scope drift")
+
+
+def _load_stamp_map(path: Path) -> dict:
+    if path.exists():
+        try:
+            return json.loads(path.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_stamp_map(path: Path, m: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(m, indent=2))
+
+
+def check_dropped_tasks():
+    """Pass 6: re-surface DROPPED side-tasks — the mirror of deliverable-detection.
+
+    deliverable-detection (pass 1) only acts on tasks whose deliverable file EXISTS.
+    This catches the opposite failure: a task is assigned,
+    the worker writes a skeleton but never produces the deliverable, then pivots to a
+    higher-priority mandate. The side-task scrolls out of the pane → the 15-min brain
+    is pane-driven + task-blind → the task is silently dropped until the hourly audit.
+
+    Guards (don't derail mandate work — per the user's 'idle-guard + priority sense'):
+      - only assigned/in_progress (blocked = parked on purpose; done/cancel = closed)
+      - skip manager/multi assignees + tasks with no deliverable
+      - GRACE: skip tasks younger than GRACE_MIN (worker may simply not have started)
+      - skip if the deliverable already EXISTS (that is pass 1's job)
+      - IDLE-GUARD: skip if the assignee pane shows an active spinner (mid-work) —
+        surface at the next idle cycle instead of interrupting
+      - THROTTLE: re-nudge a given task at most once / COOLDOWN_MIN
+      - SOFT: the nudge lets the worker self-decide (produce it, or cancel if the task
+        was superseded). It is NOT a /goal, so it never overwrites the mandate goal.
+    """
+    GRACE_MIN = 30
+    COOLDOWN_MIN = 45
+    tasks = materialize()
+    now = datetime.now()
+    stamps = _load_stamp_map(DROPPED_SEEN_FILE)
+    flagged = []
+    for t in tasks.values():
+        if t["status"] not in ("assigned", "in_progress"):
+            continue
+        assignee = t["assignee"]
+        if not assignee or assignee in ("manager", "multi"):
+            continue
+        deliv = t.get("deliverable")
+        if not deliv:
+            continue
+        created = t.get("created_at")
+        age_min = (now - created).total_seconds() / 60 if created else 9999
+        if age_min < GRACE_MIN:
+            continue
+        exists, dmtime = resolve_deliverable(deliv)
+        # `exists` is only a real hand-off to pass 1 if the file was actually TOUCHED
+        # at/after this task was created. A deliverable whose newest mtime PRE-DATES the
+        # assignment is a pre-existing/unrelated file (worker pointed at a stale path, or
+        # dropped an empty stub at creation) → the task is still genuinely DROPPED. Without
+        # this, pass 1 mis-buckets such a file as "stale→manager verify+flip" (looks-done)
+        # and the dropped task gets closed against a DRIFTED artifact — the exact
+        # silent-drop this pass exists to catch, re-opened via the bare existence gate.
+        # (created is None → can't establish staleness → defer to pass 1, old behavior.)
+        if exists and (created is None or dmtime is None or dmtime >= created):
+            continue
+        # idle-guard: read the bottom of the assignee pane; skip if mid-work or unreadable.
+        try:
+            pane = subprocess.run([str(TP), assignee, "12"], capture_output=True, text=True, timeout=12).stdout
+        except Exception:
+            pane = ""
+        if not pane or MIDWORK_REGEX.search(pane):
+            continue
+        # throttle
+        last = stamps.get(t["id"])
+        if last:
+            try:
+                if (now - datetime.fromisoformat(last)).total_seconds() / 60 < COOLDOWN_MIN:
+                    continue
+            except (ValueError, TypeError):
+                pass
+        msg = (f"提醒:assigned task {t['id']} 至今没看到 deliverable 产出:'{deliv}' "
+               f"({age_min/60:.1f}h 前派的)。三选一:① 其实已完成→cc-task done {t['id']} "
+               f"--verdict <1-line> --artifact <真实文件路径>(deliverable 指针必须指向真实产出文件,"
+               f"别漂移);② 被更高优先级 mandate 取代→cc-task cancel {t['id']} <reason>;"
+               f"③ 都不是→收尾当前步后把它做了。别无限挂着。")
+        try:
+            subprocess.run([str(TS), assignee, msg], check=False, capture_output=True, timeout=10)
+            stamps[t["id"]] = now.isoformat()
+            flagged.append((t["id"], assignee, deliv, int(age_min)))
+        except Exception:
+            pass
+    if flagged:
+        _save_stamp_map(DROPPED_SEEN_FILE, stamps)
+        print(f"dropped-task-detection: {len(flagged)} dropped side-task(s) re-surfaced (deliverable missing + worker idle):")
+        for tid, a, d, mins in flagged:
+            print(f"  {tid} ({a}, {mins}min old): nudged — deliverable '{d}' not produced")
+    else:
+        print("dropped-task-detection: no dropped tasks")
+
+
+def check_uncommitted():
+    """Pass 7: ping workers to COMMIT + push their work (per the always-commit rule).
+
+    SHARED working tree — all workers commit to the SAME repo HEAD (one tree shared
+    by the fleet). So `git status` is GLOBAL, not
+    per-worker. We:
+      1. list dirty paths (git status --short), skip files touched <GRACE_MIN ago (mid-write)
+      2. attribute each path to a watched worker by matching the path / its leaf
+         module-dir name against that worker's pane tail
+      3. ping each IDLE worker with ITS OWN paths + a HARD anti-`git add -A` warning —
+         on a shared tree, `-A`/`.` would sweep in other workers' half-done files
+    Unattributable dirty paths are logged for the manager to triage. Throttled per worker.
+    """
+    GRACE_MIN = 10
+    COOLDOWN_MIN = 45
+    try:
+        out = subprocess.run(["git", "-C", str(REPO_ROOT), "status", "--short"],
+                             capture_output=True, text=True, timeout=15).stdout
+    except Exception:
+        print("uncommitted-detection: git status failed")
+        return
+    now_ts = datetime.now().timestamp()
+    dirty = []
+    for ln in out.splitlines():
+        if not ln.strip():
+            continue
+        path = ln[3:].strip().strip('"')
+        full = REPO_ROOT / path
+        # `_`-prefixed DIR under a strategies/ tree = explore-not-ship scratch probe
+        # (convention documented in probe headers, e.g. "_-prefixed research probe").
+        # Intentionally never committed → skip so it isn't nudged-to-commit nor re-escalated
+        # to manager-triage every cycle (else throwaway probes get flagged dozens of times).
+        # Scoped to a DIRECTORY component: a `_`-prefixed helper FILE inside a real module
+        # dir (e.g. some-module/_dispatch.py) still gets nudged.
+        _pp = Path(path.rstrip("/")).parts
+        if "strategies" in _pp:
+            _dirparts = _pp if (path.endswith("/") or full.is_dir()) else _pp[:-1]
+            if any(seg.startswith("_") for seg in _dirparts):
+                continue
+        try:
+            if full.is_dir():
+                mt = max((p.stat().st_mtime for p in full.rglob("*") if p.is_file()), default=0)
+            else:
+                mt = full.stat().st_mtime
+        except Exception:
+            mt = 0
+        if mt and (now_ts - mt) / 60 < GRACE_MIN:
+            continue  # actively being written — let cc-watch mid-work guard handle
+        dirty.append(path)
+    if not dirty:
+        print("uncommitted-detection: clean tree")
+        return
+    sessions = ([l.strip() for l in WATCH_LIST.read_text().splitlines()
+                 if l.strip() and not l.startswith("#")] if WATCH_LIST.exists() else [])
+    panes = {}
+    for sess in sessions:
+        try:
+            panes[sess] = subprocess.run([str(TP), sess, "60"], capture_output=True, text=True, timeout=12).stdout
+        except Exception:
+            panes[sess] = ""
+    # current_goal/role persists even after the path scrolls out of the pane → fallback signal.
+    goals = {}
+    try:
+        reg = json.loads((Path.home() / ".cc-manager" / "workers.json").read_text())
+        for w in reg.get("workers", []):
+            goals[w["name"]] = f"{w.get('current_goal','')} {w.get('role','')}"
+    except Exception:
+        pass
+    # Distinctive key per path = the module/parent dir, NOT a generic filename.
+    # ('config.json'/'main.py' appear in many panes → false attribution, e.g. a
+    # cross-worker misfire.) Require key length >=5; match the
+    # FULL key as a substring (conservative — ambiguous/short keys stay unattributed
+    # for manager triage rather than risk a wrong commit-ping on a shared tree).
+    GENERIC_LEAVES = {"config.json", "main.py", "__init__.py", "PERF_CARD.md", "research.py", "research.ipynb"}
+    # Parent dirs that are NOT distinctive enough to attribute on (would match many panes).
+    GENERIC_DIRS = {"strategies", "candidates", "modules", "research", "assets",
+                    "src", "bin", "data", "tests", "lib", "pkg", "your-repo", "__pycache__"}
+    attributed = {}
+    claimed = set()
+    for path in dirty:
+        parts = Path(path.rstrip("/")).parts
+        leaf = parts[-1]
+        # Candidate keys: the distinctive leaf (if non-generic) AND the distinctive
+        # parent module-dir. A one-off script filename (e.g. _dispatch.py)
+        # often does NOT appear in the worker's pane/goal, but its module DIR almost
+        # always does (it's in the /goal, ledger path, file listings). Fix:
+        # some-module/_dispatch.py went UNATTRIBUTED because only the
+        # leaf was keyed; the dir matched another worker's pane. Try both, attribute on first
+        # match; both keys still require len>=5 + full-substring (conservative).
+        keys = []
+        if leaf not in GENERIC_LEAVES:
+            keys.append(leaf)
+        if len(parts) >= 2 and parts[-2] not in GENERIC_DIRS:
+            keys.append(parts[-2])
+        keys = [k for k in keys if len(k) >= 5]
+        if not keys:
+            continue  # nothing distinctive enough to attribute safely → unclaimed
+        for sess in sessions:
+            hay = panes.get(sess, "") + " " + goals.get(sess, "")
+            if any(k in hay for k in keys):
+                attributed.setdefault(sess, []).append(path)
+                claimed.add(path)
+                break
+    # Fallback: deterministic path-component → unique-session-name-token match.
+    # The pane-substring pass above misses files whose module dir is referenced
+    # by a SHORTER token than the full dir name (e.g. a worker's pane says
+    # "alpha" but the dir is "alpha-crosstest" → full-substring fails;
+    # and loose token-splitting is unsafe once several workers transiently mention
+    # "alpha"). A path COMPONENT equal to a session-name token that is UNIQUE
+    # across the watchlist (e.g. a token owned by exactly one worker) is an unambiguous
+    # owner signal independent of volatile pane text. Shared infra/cache dir names are
+    # excluded — they name no owner even when unique.
+    SHARED_TOKENS = {"data", "lib", "tests", "infra", "research", "assets"}
+    sess_tokens = {}
+    for sess in sessions:
+        for t in re.split(r"[_\-]", sess):
+            if len(t) >= 4:
+                sess_tokens.setdefault(t, set()).add(sess)
+    unique_tok = {t: next(iter(s)) for t, s in sess_tokens.items()
+                  if len(s) == 1 and t not in SHARED_TOKENS}
+    for path in dirty:
+        if path in claimed:
+            continue
+        comps = set(Path(path.rstrip("/")).parts)
+        for t, sess in unique_tok.items():
+            if t in comps:
+                attributed.setdefault(sess, []).append(path)
+                claimed.add(path)
+                break
+    stamps = _load_stamp_map(COMMIT_SEEN_FILE)
+    now = datetime.now()
+    nudged = []
+    for sess, paths in attributed.items():
+        pane = panes.get(sess, "")
+        if not pane or MIDWORK_REGEX.search(pane):
+            continue  # idle-guard: don't interrupt mid-work
+        last = stamps.get(sess)
+        if last:
+            try:
+                if (now - datetime.fromisoformat(last)).total_seconds() / 60 < COOLDOWN_MIN:
+                    continue
+            except (ValueError, TypeError):
+                pass
+        plist = " ".join(paths)
+        msg = (f"你有未提交改动:{plist}。per always-commit,现在 commit + push。"
+               f"**只 add 你自己这些路径**:git add {plist} —— 千万别 git add -A / git add . "
+               f"(这是共享 working tree,-A 会把别人的半成品也一起提交)。")
+        try:
+            subprocess.run([str(TS), sess, msg], check=False, capture_output=True, timeout=10)
+            stamps[sess] = now.isoformat()
+            nudged.append((sess, paths))
+        except Exception:
+            pass
+    unclaimed = [p for p in dirty if p not in claimed]
+    if nudged:
+        _save_stamp_map(COMMIT_SEEN_FILE, stamps)
+        print(f"uncommitted-detection: nudged {len(nudged)} worker(s) to commit own paths:")
+        for sess, paths in nudged:
+            print(f"  {sess} → {paths}")
+    if unclaimed:
+        print(f"uncommitted-detection: {len(unclaimed)} dirty path(s) UNATTRIBUTED (manager triage): {unclaimed}")
+    if not nudged and not unclaimed:
+        print("uncommitted-detection: all dirty paths attributed but workers mid-work/throttled")
+
+
+def check_goal_stale():
+    """Pass 8: enforce that the manager sets a PERSISTENT /goal when it dispatches
+    work — not just a tactical --nudge.
+
+    Root cause (operator lesson): when the manager assigned tasks all cycle via
+    `cc-goal <w> --nudge "..."` (plain ts, NO /goal anchor), each worker's status-bar
+    /goal stayed frozen at its
+    recruit-time mandate. A worker then drifted on a 22-min-stale anchor, dropped a
+    step, and hallucinated a scope reversal. cc-goal's DEFAULT (non-nudge) path now
+    stamps workers.json `goal_updated`; this guard catches the failure: a worker has
+    an OPEN task whose created_at is NEWER than its last /goal refresh (or /goal never
+    set) ⇒ the manager only nudged. It is a MANAGER self-check → loud actionable print
+    (the manager reads cc-monitor stdout in its cron cycle); it does NOT message the
+    worker (the fix is the manager re-issuing /goal with the real mandate text, which
+    only the manager knows).
+
+    Guards: skip manager/multi assignees; GRACE so a just-created task isn't flagged
+    before the manager has had a cycle to set /goal; throttle per (worker,task)."""
+    GRACE_MIN = 20
+    COOLDOWN_MIN = 60
+    tasks = materialize()
+    now = datetime.now()
+    # newest OPEN task per assignee
+    newest_open = {}
+    for t in tasks.values():
+        if t["status"] not in ("assigned", "in_progress"):
+            continue
+        a = t["assignee"]
+        if not a or a in ("manager", "multi"):
+            continue
+        created = t.get("created_at")
+        if not created:
+            continue
+        if a not in newest_open or created > newest_open[a]["created_at"]:
+            newest_open[a] = {"created_at": created, "id": t["id"], "desc": (t.get("description") or "")[:50]}
+    # per-worker last /goal refresh
+    goal_updated = {}
+    try:
+        reg = json.loads(WORKERS_FILE.read_text())
+        for w in reg.get("workers", []):
+            gu = w.get("goal_updated")
+            if gu:
+                try:
+                    goal_updated[w["name"]] = datetime.fromisoformat(gu)
+                except (ValueError, TypeError):
+                    pass
+    except Exception:
+        pass
+    stamps = _load_stamp_map(GOAL_STALE_SEEN_FILE)
+    flagged = []
+    for worker, info in newest_open.items():
+        task_ts = info["created_at"]
+        age_min = (now - task_ts).total_seconds() / 60
+        if age_min < GRACE_MIN:
+            continue  # give the manager a cycle to set /goal after assigning
+        last_goal = goal_updated.get(worker)
+        # FAIL: /goal never set, OR last /goal predates this open task (only nudged since)
+        if last_goal is not None and last_goal >= task_ts:
+            continue  # /goal anchor is fresher than the task → properly dispatched
+        # throttle on (worker, task)
+        key = f"{worker}:{info['id']}"
+        last = stamps.get(key)
+        if last:
+            try:
+                if (now - datetime.fromisoformat(last)).total_seconds() / 60 < COOLDOWN_MIN:
+                    continue
+            except (ValueError, TypeError):
+                pass
+        reason = "/goal NEVER set" if last_goal is None else f"/goal last set {(now-last_goal).total_seconds()/60:.0f}min ago, BEFORE task"
+        flagged.append((worker, info["id"], info["desc"], int(age_min), reason))
+        stamps[key] = now.isoformat()
+    if flagged:
+        _save_stamp_map(GOAL_STALE_SEEN_FILE, stamps)
+        print(f"goal-stale-detection: {len(flagged)} worker(s) have an OPEN task but a STALE/absent /goal anchor — MANAGER must set /goal (NOT --nudge):")
+        for w, tid, desc, mins, reason in flagged:
+            print(f"  [goal-stale] {w}: task {tid} ({mins}min old, '{desc}') — {reason}. FIX: cc-goal {w} '<full mandate>' (persistent anchor), NOT cc-goal {w} --nudge.")
+    else:
+        print("goal-stale-detection: all open tasks have a fresh /goal anchor")
+
+
+def check_session_health():
+    """Pass 16: LIVE pane health sweep over every watch.list session (operator lesson:
+    some workers' servers go down, and some have the wrong kind of anchor set).
+    Two failure modes the metadata-only passes can't see:
+
+    (a) /goal anchor LOST on the live session — footer no longer shows '◎ /goal
+        active' even though workers.json says it was set. check_goal_stale compares
+        TIMESTAMPS (workers.json goal_updated vs tasks.jsonl) and SKIPS workers with
+        no open cc-task, so a worker can sit goal-less for an hour unseen.
+        FIX: auto re-anchor from workers.json current_goal — UNLESS an unsent
+        input-box draft exists (ts would splice INTO the user's draft; the manual
+        RC-draft protocol owns that case) or a dialog is hiding the footer.
+
+    (b) session BLOCKED — what 'server down' looks like from remote control: hit
+        the session limit without switching to usage credits, an interactive
+        dialog/menu holding the pane ('Enter to confirm'), or an API/server error.
+        Menus are interactive and can be BILLING consents → print loud FIX lines
+        for the manager; NEVER blind-keystroke into them."""
+    COOLDOWN_MIN = 45
+    if not WATCH_LIST.exists():
+        return
+    sessions = [l.strip() for l in WATCH_LIST.read_text().splitlines() if l.strip() and not l.startswith("#")]
+    goals = {}
+    try:
+        for w in json.loads(WORKERS_FILE.read_text()).get("workers", []):
+            g = (w.get("current_goal") or "").strip()
+            if g:
+                goals[w["name"]] = g
+    except Exception:
+        pass
+    stamps = _load_stamp_map(SESSION_HEALTH_SEEN_FILE)
+    now = datetime.now()
+    issues = 0
+
+    def throttled(key: str) -> bool:
+        last = stamps.get(key)
+        if last:
+            try:
+                if (now - datetime.fromisoformat(last)).total_seconds() / 60 < COOLDOWN_MIN:
+                    return True
+            except (ValueError, TypeError):
+                pass
+        return False
+
+    for sess in sessions:
+        try:
+            out = subprocess.run(["tmux", "capture-pane", "-t", sess, "-p"],
+                                 capture_output=True, text=True, timeout=10)
+        except Exception:
+            continue
+        if out.returncode != 0:
+            if throttled(f"{sess}:gone"):
+                continue
+            stamps[f"{sess}:gone"] = now.isoformat()
+            issues += 1
+            print(f"  [session-health] {sess}: tmux pane GONE (session down) — FIX: tmux ls 核对;确实死了按 recruit 流程重建(deadend 才 cc-rm,绝不 tmux kill)")
+            continue
+        pane = out.stdout
+        tail = "\n".join(pane.splitlines()[-25:])
+        # ---- (b) blocked states FIRST: dialogs hide the footer, so the goal check
+        #          below would false-positive; and never auto-type into a dialog ----
+        dialog = "Enter to confirm" in tail
+        limit_block = ("hit your session limit" in tail) and ("usage credits" not in tail)
+        api_err = re.search(r"API Error|overloaded_error|Connection (?:error|lost)|server (?:is )?(?:down|overloaded)|fetch failed", tail, re.IGNORECASE)
+        if dialog or limit_block or api_err:
+            if throttled(f"{sess}:blocked"):
+                continue
+            stamps[f"{sess}:blocked"] = now.isoformat()
+            issues += 1
+            why = ("interactive dialog/menu holding the pane" if dialog
+                   else "session limit hit, NOT on usage credits" if limit_block
+                   else f"error text: {api_err.group(0)}")
+            fix = ("ts {s} '/usage-credits' → menu 选 'Continue with usage credits';billing/auto-reload 同意框绝不盲按 Enter,报 user".format(s=sess)
+                   if limit_block else f"tp {sess} 30 人工看一眼再操作(对话框/菜单需手动导航)")
+            print(f"  [session-health] {sess}: BLOCKED — {why}. FIX: {fix}")
+            continue
+        # ---- (a) lost /goal anchor (only judge when a normal TUI frame is rendering) ----
+        if "⏵⏵" not in tail and "❯" not in tail:
+            continue  # alt screen / non-claude frame → footer absence proves nothing
+        if "/goal active" in tail:
+            continue
+        if throttled(f"{sess}:goal-lost"):
+            continue
+        stamps[f"{sess}:goal-lost"] = now.isoformat()
+        issues += 1
+        # unsent input-box draft? the LAST '❯' line with content → NEVER auto-ts (splice risk)
+        last_prompt = None
+        for ln in pane.splitlines():
+            if re.match(r"\s*❯", ln):
+                last_prompt = ln
+        draft = ""
+        if last_prompt:
+            m = re.match(r"\s*❯\s+(\S.*)$", last_prompt)
+            if m:
+                draft = m.group(1).strip()
+        goal = goals.get(sess)
+        if draft:
+            print(f"  [session-health] {sess}: /goal anchor LOST but input-box has unsent draft ('{draft[:40]}…') — manual: 先走 RC-draft 协议(≥2轮不变 C-u+ts 原文)再 cc-goal 重锚")
+        elif goal:
+            print(f"  [session-health] {sess}: /goal anchor LOST — auto re-anchoring from workers.json current_goal")
+            try:
+                subprocess.run([str(Path.home() / ".local" / "bin" / "cc-goal"), sess, goal],
+                               check=False, capture_output=True, timeout=90)
+            except Exception as e:
+                print(f"  [session-health] {sess}: auto re-anchor FAILED ({e}) — manual cc-goal needed")
+        else:
+            print(f"  [session-health] {sess}: /goal anchor LOST and no current_goal in workers.json — manual cc-goal needed")
+    if issues:
+        _save_stamp_map(SESSION_HEALTH_SEEN_FILE, stamps)
+        print(f"session-health: {issues} issue(s) found")
+    else:
+        print("session-health: all watched sessions healthy (goal anchored, not blocked)")
+
+
+# Run-type = a task whose success criterion is "an EXECUTION engine actually RUNS the
+# loop end-to-end" (the verification backend producing a result), not "a file exists".
+# Keyword-gated TIGHT to engine-execution plumbing. Deliberately EXCLUDES bare
+# 'pipeline'/'ingest' (data-ingestion tasks prove via a written data panel, NOT a run —
+# check_deliverables owns those) and bare 'run' (every task says it).
+# Only genuine make-the-engine-run signals: smoke test, close-the-loop, local-engine,
+# container/docker. The keyword set below is plugin-specific (here it targets the
+# project's local execution backend); ingestion/format-conversion tasks do not match.
+# NOTE on excluded alternatives: format-conversion phrases denote INGESTION (writing
+# data into the engine's on-disk format), which is the OPPOSITE of running a job —
+# including them re-introduced ingestion false-positives. A genuine close-the-loop /
+# smoke-test / local-engine case is caught by the run-execution phrases below.
+RUN_TYPE_REGEX = re.compile(
+    r"smoke[\s_-]?test|close the .{0,20}loop|local[\s_-]?lean|lean[\s_-]?local|"
+    r"lean[\s_-]?cli|colima|\bdocker\b|"
+    r"end[\s_-]?to[\s_-]?end (bt|backtest|run)",
+    re.IGNORECASE)
+# Tokens that PROVE an engine run happened — kept ENGINE-LOG-SPECIFIC. Loose tokens
+# (a metric label, 'bars read') appear in ordinary research/verdict docs and would make
+# the check wrongly believe a run happened (false negative), so they are excluded; a
+# real metric ledger is already a separate proof path in _has_run_proof.
+RUN_PROOF_TOKEN = re.compile(
+    r"SMOKE_BAR_COUNT|Successfully ran|Total Orders|Algorithm Id|"
+    r"BACKTEST(ING)? (PASS|OK|COMPLETE)",
+    re.IGNORECASE)
+
+# A metric ledger only proves a RUN if it carries an engine-emitted substance signature:
+# a 32-hex result-artifact / run id, OR a real METRIC (a metric LABEL co-present with a
+# >=2-fractional-digit value — "metric_a 0.997", a "| metric_b |…| 33.20 |" table).
+# The bare-decimal hole: the OLD
+# `\d+\.\d{2,}` alternative matched ANY incidental decimal, and the container/local-engine
+# plumbing notes this pass targets are FULL of them (timing "0.85s", python "3.13", row
+# counts) — so a feasibility note with NO real run passed as proof and silenced the alert.
+# Requiring a metric LABEL alongside the value kills
+# that: a plumbing/feasibility note carries decimals but no metric label.
+# Label+value are checked FILE-GLOBAL (not within-line) so table-formatted ledgers (label in
+# the header row, value in the next row) still pass — within-line anchoring would false-
+# negative real tables and wrongly auto-reopen landing-debt tasks. A bare `touch`, an
+# all-TBD stub, and "the metric was good, trust me" (no value) still correctly fail. Version
+# strings (v1.0, 1 fractional digit) do NOT match the value. Mirrors the .log 2048-byte gate.
+PERF_CARD_BTID = re.compile(r"[0-9a-f]{32}")
+PERF_CARD_METRIC_LABEL = re.compile(
+    r"sharpe|sortino|cagr|compounding\s+annual|drawdown|max\.?dd|calmar|"
+    r"probabilistic|\bpsr\b|total\s+orders|net\s+profit|annual\s+return",
+    re.IGNORECASE)
+PERF_CARD_VALUE = re.compile(r"[-+]?\d+\.\d{2,}")
+
+
+def _has_run_proof(deliv: str) -> bool:
+    """True if an EXECUTION-GENERATED proof artifact exists under the deliverable's
+    subtree. Three accepted proofs, all hard-to-fake (artifact names are plugin-specific,
+    set here to the project's local execution backend):
+      1. a non-empty result-output dir (the local engine writes this),
+      2. a metric ledger CARRYING A SUBSTANCE SIGNATURE (32-hex result-artifact / run id
+         or a real metric value) — a touch/prose/all-TBD/feasibility ledger is NOT proof,
+      3. a run-success token in a `.log` file (raw engine/CLI stdout).
+    CRITICAL: a run-success token in a `.md`/`.txt` is NOT
+    accepted — a worker can simply TYPE 'Successfully ran / 2208 rows' into a markdown
+    self-report (this happened before any real run). Prose is
+    not proof; only engine-emitted artifacts count. File EXISTENCE only (not freshness —
+    a stale-but-real run still proves the loop runs)."""
+    spec = _deliv_path(deliv)
+    if spec is None:
+        return False
+    base = Path(spec) if spec.startswith("/") else REPO_ROOT / spec
+    root = base if base.is_dir() else base.parent
+    if not root.exists():
+        return False
+    try:
+        for bt in root.rglob("backtests"):
+            if bt.is_dir() and any(bt.iterdir()):
+                return True
+        for pc in root.rglob("PERF_CARD.md"):
+            if pc.is_file():
+                try:
+                    ptxt = pc.read_text(errors="ignore")[:20000]
+                    if PERF_CARD_BTID.search(ptxt) or (
+                            PERF_CARD_METRIC_LABEL.search(ptxt) and PERF_CARD_VALUE.search(ptxt)):
+                        return True
+                except Exception:
+                    continue
+        scanned = 0
+        for f in root.rglob("*.log"):  # raw engine/CLI stdout — never .md/.txt prose
+            if scanned >= 400:  # bound cost on a large deliverable subtree
+                break
+            if f.is_file():
+                scanned += 1
+                try:
+                    txt = f.read_text(errors="ignore")[:20000]
+                except Exception:
+                    continue
+                # ALL run-success tokens are TYPEABLE — incl. the SMOKE_BAR_COUNT
+                # sentinel, whose name is in THIS (worker-readable) source, so the old
+                # "instrumented sentinel, not forgeable → accept at any size" carve-out
+                # was a 21-byte backdoor (`echo "SMOKE_BAR_COUNT=2208" > x.log` passed).
+                # No real harness emits SMOKE_BAR_COUNT
+                # anywhere in the repo, so subjecting it to the same size floor costs no
+                # legitimate proof. The other prose tokens ('Successfully ran' / 'Total
+                # Orders' / 'Algorithm Id' / 'BACKTEST PASS') are equally typeable (a
+                # worker can rename a self-report .md→.log). A genuine engine/smoke log is
+                # many KB; a hand-typed forgery is a few dozen bytes. Require substance —
+                # SMOKE_BAR_COUNT is already inside RUN_PROOF_TOKEN, so one gate covers all.
+                try:
+                    if RUN_PROOF_TOKEN.search(txt) and f.stat().st_size >= 2048:
+                        return True
+                except Exception:
+                    continue
+    except Exception:
+        return False
+    return False
+
+
+def check_run_proof():
+    """Pass 9: a RUN-TYPE task (close-the-loop / pipeline / ingest / smoke / local-engine)
+    must not be `completed` without an EXECUTION-PROOF artifact. Catches the failure
+    (operator lesson: 'a container job never actually completed the goal — why was it
+    not supervised?'): a close-the-loop task was treated as done because the ingested
+    output existed and looked format-correct — but a container/mount blocker meant a real
+    end-to-end run had NEVER happened, so the loop did not actually work. Format/file-
+    existence ≠ loop runs.
+
+    check_completed_integrity (pass 4) only fires on an explicit WORK-REMAINS marker in
+    the deliverable text; a clean-looking-but-never-executed loop has no such marker, so
+    it slipped through. This pass closes that hole.
+
+    ALERT-ONLY (does NOT auto-block): proof-detection is heuristic, so a false positive
+    must not destructively reopen genuinely-done work (an early auto-block draft wrongly
+    reopened legit refresh tasks). Like check_goal_stale, this is a MANAGER
+    self-check — loud actionable stdout the manager reads in its cron cycle; the fix is
+    the manager RUNNING the end-to-end job itself and confirming expected output before
+    accepting done (verify by execution, not by the worker's say-so). One-shot per task
+    (seen-set) so the alert isn't repeated every cycle.
+
+    Precision guards: keyword-gated TIGHT to engine-execution (research/DR/ingestion
+    tasks excluded); only fires on `completed` with an existing deliverable."""
+    seen = load_json_seen(RUN_PROOF_SEEN_FILE)
+    tasks = materialize()
+    flagged = []
+    for t in tasks.values():
+        if t.get("status") != "completed" or t["id"] in seen:
+            continue
+        deliv = t.get("deliverable")
+        if not deliv:
+            continue
+        blob = f"{t.get('description','')} {deliv}"
+        if not RUN_TYPE_REGEX.search(blob):
+            continue
+        exists, _ = resolve_deliverable(deliv)
+        if not exists:
+            continue  # check_deliverables owns 'file missing'
+        if _has_run_proof(deliv):
+            continue
+        flagged.append((t["id"], t.get("assignee", ""), deliv))
+        seen.add(t["id"])
+    save_json_seen(RUN_PROOF_SEEN_FILE, seen)
+    if flagged:
+        print(f"run-proof: ⚠ {len(flagged)} engine-RUN-type 'completed' task(s) have NO execution proof (loop never proven to RUN — file-existence ≠ loop runs):")
+        for tid, a, d in flagged:
+            print(f"  [run-proof] {tid} ({a}): no result-output dir, no metric ledger, no run-success log under {d}. FIX: manager RUN the end-to-end job yourself, confirm expected output, THEN accept done.")
+    else:
+        print("run-proof: engine-run-type completed tasks all have execution proof")
+
+
+def check_idle_on_blockers():
+    """Pass 10: surface workers whose ONLY open work is BLOCKED — effectively idle, but
+    the task-store still shows them 'busy' (a blocked task is not idle by status, so
+    cc-task fleet and the 15-min pane brain both treat the worker as occupied).
+
+    Caught once: a worker's free deliverable landed (done) and its sole
+    remaining task was paid-review-BLOCKED → it sat spinning on a gated paid-data
+    decision while the manager assumed it was working ('why is it stuck — isn't there
+    other work?'). A worker with no parallel FREE task while a blocker is parked is a manager-DISPATCH
+    failure, not a worker state: the fix is the manager assigning a NEW FREE direction
+    (explore-not-ship — the free space is rarely exhausted) or suspending the worker,
+    NOT leaving it to poll a gated blocker indefinitely.
+
+    ALERT-ONLY (never auto-cancels/reopens): a blocker may be legitimately short-lived.
+    Prints the actionable list the manager reads each cron cycle, throttled per worker
+    (COOLDOWN) so a long-lived blocker re-pings occasionally instead of every cycle.
+    Self-clears once the worker gets any assigned/in_progress task again."""
+    COOLDOWN_MIN = 60
+    tasks = materialize()
+    now = datetime.now()
+    stamps = _load_stamp_map(IDLE_ON_BLOCKERS_SEEN_FILE)
+    per_worker = {}
+    for t in tasks.values():
+        a = t.get("assignee")
+        if not a or a in ("manager", "multi"):
+            continue
+        st = t.get("status")
+        if st not in ("assigned", "in_progress", "blocked"):
+            continue
+        b = per_worker.setdefault(a, {"active": [], "blocked": []})
+        (b["blocked"] if st == "blocked" else b["active"]).append(t)
+    flagged = []
+    for a, b in per_worker.items():
+        # only fire when EVERY open task is blocked (no free/active work in parallel)
+        if b["active"] or not b["blocked"]:
+            continue
+        last = stamps.get(a)
+        if last:
+            try:
+                if (now - datetime.fromisoformat(last)).total_seconds() / 60 < COOLDOWN_MIN:
+                    continue
+            except (ValueError, TypeError):
+                pass
+        paid = any("paid" in (t.get("category") or "").lower()
+                   or "paid-review" in (t.get("description") or "").lower()
+                   for t in b["blocked"])
+        stamps[a] = now.isoformat()
+        flagged.append((a, [t["id"] for t in b["blocked"]], paid))
+    if flagged:
+        _save_stamp_map(IDLE_ON_BLOCKERS_SEEN_FILE, stamps)
+        print(f"idle-on-blockers: ⚠ {len(flagged)} worker(s) whose ONLY open task is BLOCKED (effectively idle — dispatch a NEW FREE direction or suspend):")
+        for a, ids, paid in flagged:
+            tag = " [paid-review gate]" if paid else ""
+            print(f"  [idle-on-blockers] {a}: only open work = blocked {','.join(ids)}{tag}. "
+                  f"FIX: assign a NEW FREE explore task (don't let it spin on a gated blocker), or cc-rm if the line is truly done.")
+    else:
+        print("idle-on-blockers: no workers idle-on-blockers")
+
+
+def check_ops_crons():
+    """Pass 11: ops-cron health — the launchd jobs run autonomously and are NOT in
+    the task store, so no other pass ever sees them. Incident: a batch of zombie
+    crons fired daily on scripts deleted in a cleanup (exit-2 'No such file') for WEEKS,
+    fully undetected, because cc-monitor only watched worker tmux tasks. This reads
+    `launchctl list` + resolves each plist's inner target script. A cron whose target
+    script is GONE is a definitive zombie (can never do real work → retire). exit!=0
+    WITH the script present is INFO only (some jobs exit non-zero BY DESIGN when they
+    fire alerts, e.g. a monitor cron exit=1) — never hard-flagged, to avoid the
+    false-positive of misreading a by-design alerting cron as 'stalled'.
+
+    ALERT-ONLY. Throttled per job (twice/day)."""
+    if not LAUNCH_AGENTS_DIR.exists():
+        return
+    status = {}
+    try:
+        out = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=10)
+        for line in out.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 3 and parts[2].startswith(OPS_CRON_PREFIX):
+                status[parts[2]] = parts[1]  # column = last exit code (str)
+    except Exception:
+        return
+    zombies, failing = [], []
+    for plist in sorted(LAUNCH_AGENTS_DIR.glob(f"{OPS_CRON_PREFIX}*.plist")):
+        label = plist.stem
+        try:
+            text = plist.read_text()
+        except Exception:
+            continue
+        targets = re.findall(r"bin/[A-Za-z0-9_./-]+\.(?:py|sh)", text)
+        inner = [t for t in targets if "alert_pipe.sh" not in t]
+        target = (inner or targets or [None])[-1]
+        ex = status.get(label)
+        if target is not None and not (REPO_ROOT / target).exists():
+            zombies.append((label, target, ex))
+            continue
+        if ex not in (None, "0", 0):
+            failing.append((label, target, ex))
+    stamps = _load_stamp_map(OPS_CRON_SEEN_FILE)
+    now = datetime.now()
+    COOLDOWN_MIN = 720
+    fresh = []
+    for label, target, ex in zombies:
+        last = stamps.get(label)
+        if last:
+            try:
+                if (now - datetime.fromisoformat(last)).total_seconds() / 60 < COOLDOWN_MIN:
+                    continue
+            except (ValueError, TypeError):
+                pass
+        stamps[label] = now.isoformat()
+        fresh.append((label, target, ex))
+    if zombies:
+        _save_stamp_map(OPS_CRON_SEEN_FILE, stamps)
+    if fresh:
+        print(f"ops-cron: 🔴 {len(fresh)} ZOMBIE cron(s) pointing at DELETED scripts (retire: backup + launchctl unload + rm plist):")
+        for label, target, ex in fresh:
+            print(f"  [ops-cron-zombie] {label} → {target} MISSING (exit={ex}). "
+                  f"FIX: cp plist to infra/retired-crons/ && launchctl unload ~/Library/LaunchAgents/{label}.plist && rm it.")
+    if failing:
+        print(f"ops-cron: ⚠ {len(failing)} cron(s) exit!=0 WITH script present (may be by-design alerts — READ the real log before judging, do NOT assume broken):")
+        for label, target, ex in failing:
+            print(f"  [ops-cron-check] {label} → {target} exit={ex}.")
+    if not zombies and not failing:
+        print("ops-cron: all claude-code-fleet launchd crons healthy (no missing-script zombies)")
+
+
+def check_paid_review_sla():
+    """Pass 12: paid-review close-loop. check_paid() dedups on CREATE,
+    but NOTHING forces open paid-review stubs to ever RESOLVE → they pile on 'manager'
+    forever (e.g. 19 open at once, many duplicated per worker). A paid-review stub is a
+    user $-decision the manager must either escalate as ONE batch digest or close as
+    dup/moot — never leave parked. This surfaces (a) workers with >1 open paid-review
+    (collapse to 1) and (b) the whole backlog as a single digest for one user decision.
+    ALERT-ONLY (never auto-cancels — paid approve/decline is the operator's call).
+    Throttled (twice/day)."""
+    tasks = materialize()
+    open_pr = [t for t in tasks.values()
+               if t.get("status") in ("assigned", "blocked")
+               and "[paid-review]" in (t.get("description") or "")]
+    if not open_pr:
+        print("paid-review-sla: no open paid-review backlog")
+        return
+    by_worker = {}
+    for t in open_pr:
+        m = re.search(r"\[paid-review\]\s*([a-z_0-9]+)\s*:", t.get("description") or "")
+        by_worker.setdefault(m.group(1) if m else "?", []).append(
+            (t["id"], _paid_tokens(t.get("description") or "")))
+    stamps = _load_stamp_map(PAID_REVIEW_SLA_SEEN_FILE)
+    now = datetime.now()
+    last = stamps.get("_digest")
+    if last:
+        try:
+            if (now - datetime.fromisoformat(last)).total_seconds() / 60 < 720:
+                return
+        except (ValueError, TypeError):
+            pass
+    stamps["_digest"] = now.isoformat()
+    _save_stamp_map(PAID_REVIEW_SLA_SEEN_FILE, stamps)
+    # DUP = stubs whose descriptions share a canonical vendor/$-amount token
+    # (_paid_tokens), NOT merely "same worker, >1 stub". A worker's two feeds at
+    # $160/mo + $75/mo are two DISTINCT user decisions; the
+    # old len(ids)-1 count labeled one a DUP with destructive 'cancel rest' advice.
+    # Token-connected components per worker; tokenless stubs are singletons (can't
+    # prove dup → never advise cancel).
+    def _dup_groups(items):
+        groups = []
+        for tid, toks in items:
+            g = next((g for g in groups if toks and g["toks"] & toks), None)
+            if g:
+                g["ids"].append(tid); g["toks"] |= toks
+            else:
+                groups.append({"ids": [tid], "toks": set(toks)})
+        return groups
+    grouped = {w: _dup_groups(items) for w, items in by_worker.items()}
+    dup_total = sum(len(g["ids"]) - 1 for gs in grouped.values() for g in gs)
+    print(f"paid-review-sla: ⚠ {len(open_pr)} OPEN paid-review stub(s) parked on manager "
+          f"across {len(by_worker)} worker(s) ({dup_total} are dups) — RESOLVE: escalate as 1 user digest or close dup/moot:")
+    for w, items in sorted(by_worker.items(), key=lambda x: -len(x[1])):
+        ids = [tid for tid, _ in items]
+        dups = [g["ids"] for g in grouped[w] if len(g["ids"]) > 1]
+        if dups:
+            dtag = "  ← DUPS (shared vendor/$): " + "; ".join(
+                f"{'+'.join(g)} → keep newest, cancel rest" for g in dups)
+        elif len(ids) > 1:
+            dtag = f"  ← {len(ids)} DISTINCT proposals (no shared vendor/$) → batch into ONE user digest, do NOT cancel"
+        else:
+            dtag = ""
+        print(f"  [paid-review-sla] {w}: {','.join(ids)}{dtag}")
+
+
+LANDING_PROOF_TOKEN = re.compile(
+    r"s3://[\w.\-/]+"                                          # real S3 URI (DRY-RUN proposal output)
+    r"|arn:aws:[\w:.\-/]+"                                     # deployed AWS resource ARN
+    r"|Stack(?:Id|Name)\b|CloudFormation|FunctionArn"
+    r"|aws[ _-]lambda[ _-](?:deploy|update-function|create-function|invoke)"
+    r"|(?:client_)?order_id['\"]?\s*[:=]\s*['\"]?[\w-]{6,}"    # broker order id
+    r"|(?:paper|alpaca|ibkr|ib)[^\n]{0,40}(?:order|fill)[^\n]{0,24}[\w-]{6,}"  # paper order/fill id
+    r"|DRY[ _-]?RUN[^\n]{0,80}(?:proposal|runs/|\.json)",      # actual DRY-RUN run output
+    re.IGNORECASE)
+LANDING_PROOF_EXT = {".md", ".json", ".log", ".txt", ".csv", ".yaml", ".yml"}
+# DEPLOY-intent gate: 'landing' is an overloaded word — some tasks tag category=landing
+# meaning "validate a config" (proof = a normal run-proof / metric ledger), NOT "deploy
+# to production". Only tasks whose description/deliverable is genuinely DEPLOY-oriented
+# are held to the strict S3/ARN/paper-order-id bar; the rest accept a normal run-proof.
+# Without this, a legitimately-validated config task was wrongly auto-reopened.
+DEPLOY_INTENT_REGEX = re.compile(
+    r"deploy|部署|上线|\bAWS\b|lambda|cloudformation|eventbridge|s3://|s3[ _-]bucket"
+    r"|paper[ _-]?(?:trade|trading|account)|alpaca|ibkr|interactive[ _-]?brokers"
+    r"|promote[ _-]?to[ _-]?live|go[ _-]?live|production|prod[ _-]?ramp|DRY[ _-]?RUN",
+    re.IGNORECASE)
+
+
+def _has_landing_proof(deliv: str) -> bool:
+    """True if a DEPLOYMENT-EVIDENCE artifact exists under the deliverable subtree.
+    Landing proof is deploy-specific (NOT a metric ledger): an S3 DRY-RUN output URI,
+    a deployed AWS ARN/StackId, or a broker paper order/fill id. File-existence of
+    code/metrics alone is NOT landing — that is the exact gap this check closes."""
+    spec = _deliv_path(deliv)
+    if spec is None:
+        return False
+    base = Path(spec) if spec.startswith("/") else REPO_ROOT / spec
+    root = base if base.is_dir() else base.parent
+    if not root.exists():
+        return False
+    scanned = 0
+    try:
+        for f in root.rglob("*"):
+            if scanned >= 600:
+                break
+            if not f.is_file() or f.suffix.lower() not in LANDING_PROOF_EXT:
+                continue
+            scanned += 1
+            try:
+                if LANDING_PROOF_TOKEN.search(f.read_text(errors="ignore")[:40000]):
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        return False
+    return False
+
+
+def open_landing_workers(tasks=None) -> set:
+    """Assignees with an OPEN (assigned/in_progress/blocked) category=landing task.
+    Used to (a) exempt landing lines from the explore-not-ship ship-drift GRILL and
+    (b) by cc-watch's cost-guard so a designated landing line is never silenced."""
+    tasks = tasks if tasks is not None else materialize()
+    return {t.get("assignee") for t in tasks.values()
+            if t.get("category") == "landing"
+            and t.get("status") in ACTIVE_STATUSES
+            and t.get("assignee") and t.get("assignee") not in ("manager", "multi")}
+
+
+def check_landing_debt():
+    """Pass 13 (operator lesson): a category=landing task is a USER-DESIGNATED landing
+    line and must NOT be accepted as `completed` on file-existence alone. Landing = the
+    thing actually DEPLOYED/RAN in production (S3 DRY-RUN output, AWS deploy ARN, broker
+    paper order id). This closes the exact gap the 15-min cron missed — a refresh
+    pipeline was code-complete but never deployed, and another line was 'ship-ready'
+    but never put on a live/paper account, yet neither was flagged (deploy/landing was
+    deliberately out-of-scope per explore-not-ship).
+
+    UNLIKE the alert-only run-proof pass, landing-debt AUTO-REOPENS (cc-task start) a
+    landing task closed WITHOUT deploy evidence — the operator mandated 'file existence
+    does not count as done' for this category. Reopen is throttled per task
+    (REOPEN_COOLDOWN) so a worker that
+    re-closes-without-evidence is re-reminded what evidence is owed, not thrashed. Open
+    landing tasks are surfaced every cycle so the line stays visible."""
+    REOPEN_COOLDOWN_MIN = 60
+    tasks = materialize()
+    landing = [t for t in tasks.values() if t.get("category") == "landing"]
+    if not landing:
+        print("landing-debt: no landing-category tasks")
+        return
+    stamps = _load_stamp_map(LANDING_REOPEN_SEEN_FILE)
+    now = datetime.now()
+    open_lines = []
+    reopened = []
+    landed = []
+    for t in landing:
+        st = t.get("status")
+        tid = t["id"]
+        a = t.get("assignee", "")
+        deliv = t.get("deliverable")
+        if st in ("assigned", "in_progress", "blocked"):
+            open_lines.append((tid, a, st))
+            continue
+        if st != "completed":
+            continue  # cancelled — ignore
+        # 'landing' is overloaded: only DEPLOY-oriented tasks need strict deploy
+        # evidence; a 落地验证-a-config task is satisfied by a normal BT run-proof.
+        deploy_oriented = bool(DEPLOY_INTENT_REGEX.search(f"{t.get('description','')} {deliv or ''}"))
+        if deliv and _has_landing_proof(deliv):
+            landed.append((tid, a))
+            continue
+        if deliv and not deploy_oriented and _has_run_proof(deliv):
+            landed.append((tid, a))
+            continue
+        last = stamps.get(tid)
+        if last:
+            try:
+                if (now - datetime.fromisoformat(last)).total_seconds() / 60 < REOPEN_COOLDOWN_MIN:
+                    continue
+            except (ValueError, TypeError):
+                pass
+        try:
+            subprocess.run([str(CC_TASK), "start", tid], check=False, capture_output=True, timeout=10)
+        except Exception:
+            pass
+        if a and a not in ("manager", "multi"):
+            try:
+                subprocess.run([str(TS), a,
+                    f"[manager landing-gate] task {tid} 标了 done 但 deliverable 没有真部署证据 — 已 REOPEN。"
+                    f"landing 不接受'代码/metric-ledger 文件存在'当完成,必须贴下列之一才能 done:S3 DRY-RUN 输出(s3://… runs/<date>/proposal.json)、"
+                    f"AWS 部署 ARN/StackId、或 broker paper order/fill id。把证据写进 {deliv}。"],
+                    check=False, capture_output=True, timeout=10)
+            except Exception:
+                pass
+        stamps[tid] = now.isoformat()
+        reopened.append((tid, a, deliv))
+    _save_stamp_map(LANDING_REOPEN_SEEN_FILE, stamps)
+    if reopened:
+        print(f"landing-debt: ⚠ {len(reopened)} landing task(s) closed WITHOUT deploy evidence → AUTO-REOPENED (file-existence ≠ landed):")
+        for tid, a, d in reopened:
+            print(f"  [landing-debt] {tid} ({a}): no S3/ARN/paper-order-id under {d} → reopened, worker told what evidence is owed.")
+    for tid, a, st in open_lines:
+        print(f"  [landing-debt] {tid} ({a}): landing IN-FLIGHT ({st}) — never cost-guard-skipped; drive to real deploy.")
+    if landed:
+        print(f"landing-debt: {len(landed)} landing task(s) carry real deploy evidence ✓")
+    elif not reopened and not open_lines:
+        print("landing-debt: no open or under-proven landing tasks")
+
+
+def _run_pass(fn):
+    """Run one monitor pass in isolation. A monitor's worst failure is dying SILENTLY:
+    main() runs ~14 passes with no try/except, so any pass that raises aborts main and
+    every pass AFTER it never runs — undetected, since cron just sees a non-zero exit.
+    Example (check_goal_stale): its cross-source datetime compare
+    (workers.json goal_updated vs tasks.jsonl ts) raises an uncaught TypeError the instant
+    any tool writes a tz-aware ts (today both sources are naive, so it's latent — but
+    goal_stale runs 4th and would silently kill the 10 downstream passes). Isolate every
+    pass: on exception, print a loud [pass-error] line and CONTINUE so the rest still run."""
+    try:
+        fn()
+    except Exception as e:
+        import traceback
+        print(f"[pass-error] {fn.__name__} raised {type(e).__name__}: {e} — SKIPPED, other passes continue.")
+        traceback.print_exc()
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--deliverable", action="store_true")
+    ap.add_argument("--paid", action="store_true")
+    ap.add_argument("--completion", action="store_true")
+    ap.add_argument("--goal", action="store_true")
+    ap.add_argument("--runproof", action="store_true")
+    ap.add_argument("--idle", action="store_true")
+    ap.add_argument("--ops", action="store_true")
+    ap.add_argument("--paidsla", action="store_true")
+    ap.add_argument("--landing", action="store_true")
+    args = ap.parse_args()
+    run_all = not (args.deliverable or args.paid or args.completion or args.goal or args.runproof or args.idle or args.ops or args.paidsla or args.landing)
+    if run_all or args.deliverable:
+        _run_pass(check_deliverables)
+    if run_all or args.paid:
+        _run_pass(check_paid)
+    if run_all or args.completion:
+        _run_pass(check_completed_integrity)
+    if run_all or args.goal:
+        _run_pass(check_goal_stale)
+    if run_all or args.runproof:
+        _run_pass(check_run_proof)
+    if run_all or args.idle:
+        _run_pass(check_idle_on_blockers)
+    if run_all or args.ops:
+        _run_pass(check_ops_crons)
+    if run_all or args.paidsla:
+        _run_pass(check_paid_review_sla)
+    if run_all or args.landing:
+        _run_pass(check_landing_debt)
+    if run_all:
+        _run_pass(check_ship_drift)
+        _run_pass(check_premature_exhaustion)
+        _run_pass(check_repeated_nudge)
+        _run_pass(check_excluded_scope)
+        _run_pass(check_dropped_tasks)
+        _run_pass(check_uncommitted)
+        _run_pass(check_session_health)
+
+
+if __name__ == "__main__":
+    main()

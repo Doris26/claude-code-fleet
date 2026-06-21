@@ -1,0 +1,11 @@
+[cc-manager 12h 自审 — grill-then-fix, 必须落地] 目标是产出**已验证、已提交的修复**(参照之前 operator 带着修的那次),不是松散报告。严格三段,慢、认真:
+
+(1) GRILL(用 workflow,不要手搓):跑
+    Workflow({scriptPath: "<CC_HOME>/bin/cc-self-audit-grill.js"})
+    它 fan-out 多个对抗审计 agent(机制正确性 / review 实效 / 规则矛盾 / manager↔worker 交互 / 覆盖盲区)→ 每条 finding 过 skeptical verify(默认 REFUTED 除非能复现)→ synth 出 severity 排序的 confirmed 列表(含 file:line + 具体 surgical fix)。完成后读 synthesis.confirmed。
+
+(2) FIX(派另一个 subagent,worktree 隔离,tight spec):对 confirmed 的 critical+high(low/medium 记录本轮可不修),spawn 一个 general-purpose subagent(isolation:"worktree"),给它:逐条具体 fix(从 synth 抄 file:line + 改法)+ 硬要求:SURGICAL 不重构不碰无关逻辑;每个改动文件跑 bash -n;能隔离测的逻辑写一次性测试证明生效;**不 commit/push**;报告 exact diff + bash -n + 测试结果。一个 finding 一个明确 fix,别让它自由发挥。
+
+(3) VALIDATE + COMMIT + ESCALATE(你自己做,不外包):审 diff,每文件再 bash -n;安全的(确定性正确 + bash -n 过)→ git commit -- <具体文件>(绝不 -A)+ push;任何 CRITICAL 需人决策的(付费/账号/破坏性/改 live/)→ 写 ~/.cc-manager/escalations.log + 一行通知,**不自动执行**;无 confirmed → 记一行 "self-audit clean",不为改而改。
+
+铁律:① 任何涉及 target metric/数字的声明仍须经 verification backend 真跑出 result;② 修复必须 bash -n + 测试证明,不许凭空声明"已修";③ 本轮没修的 confirmed 写 ~/.cc-manager/escalations.log 留痕,下轮接着修。目标:每 12h 机制净变好一点,每个改动 landed + validated —— 是修复,不是报告。

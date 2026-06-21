@@ -1,0 +1,77 @@
+#!/bin/bash
+# ts: send a message to a tmux session as if typed
+# Usage:
+#   ts work "status?"
+#   echo "long msg" | ts work -
+set -e
+
+if [ $# -lt 2 ]; then
+    echo "Usage: ts <name> <message>     (or: ts <name> -  for stdin)" >&2
+    exit 2
+fi
+
+NAME="$1"; shift
+
+if [ "$1" = "-" ]; then
+    MSG=$(cat)
+else
+    MSG="$*"
+fi
+
+if ! tmux has-session -t "$NAME" 2>/dev/null; then
+    echo "Session '$NAME' not found." >&2
+    echo "Active sessions:" >&2
+    tmux ls 2>/dev/null >&2 || echo "  (none)" >&2
+    exit 1
+fi
+
+# Per-worker send lock (interleave fix): multiple senders (cc-watch /loop
+# re-nudge, cc-review FAIL repoke, PASS marker, brain nudge) can fire `ts <same-worker>`
+# in one cron tick. The clear→send-keys -l→settle→Enter sequence is NOT atomic: if a 2nd
+# `ts` lands during the 1st's settle window, the two literal buffers interleave in the
+# input box and merge into one garbled Frankenstein prompt. Serialize per-worker via an
+# atomic lock DIR (macOS has no flock; mkdir is atomic on POSIX). Different workers still
+# send in parallel — the lock name is keyed on $NAME.
+LOCKDIR="/tmp/ts-${NAME}.lock.d"
+HAVE_LOCK=0
+# Release only if THIS process created the lock (guard so we never delete another's lock).
+trap '[ "$HAVE_LOCK" = 1 ] && rm -rf "$LOCKDIR" 2>/dev/null || true' EXIT
+# Acquire: retry ~10s (20 × 0.5s). If still held, steal ONLY when stale (mtime >30s = a
+# crashed sender's orphan); else proceed anyway — a send beats a hang (don't deadlock).
+for _i in $(seq 1 20); do
+    if mkdir "$LOCKDIR" 2>/dev/null; then HAVE_LOCK=1; break; fi
+    sleep 0.5 || true
+done
+if [ "$HAVE_LOCK" != 1 ]; then
+    lock_mtime=$(stat -f %m "$LOCKDIR" 2>/dev/null || echo 0)
+    now=$(date +%s)
+    if [ "$((now - lock_mtime))" -gt 30 ]; then
+        rm -rf "$LOCKDIR" 2>/dev/null || true
+        if mkdir "$LOCKDIR" 2>/dev/null; then HAVE_LOCK=1; fi
+    fi
+    # If still unacquired, fall through and send anyway (no deadlock).
+fi
+
+# Idempotent send (flood fix): clear any residual draft / queued text in the
+# input box FIRST, so a new message REPLACES rather than STACKS on a prior unsent prompt.
+# Without this, sends into a busy or USAGE-LIMITED pane accumulate; when the worker frees
+# up (5h window resets) the whole stack fires back-to-back and re-burns the fresh window
+# in minutes — the flood. This caps it: at most ONE pending prompt per worker, ever.
+# C-a (go-to-start) → C-k (kill-to-end) → C-u (kill-line) robustly wipes ANY leftover
+# draft in Claude Code's TUI input box (same family of keys cc-watch's wedge-heal uses
+# before /clear) so a partial prior draft can't merge with the new text. Harmless when
+# the box is already empty. `|| true` guards set -e.
+tmux send-keys -t "$NAME" C-a 2>/dev/null || true
+tmux send-keys -t "$NAME" C-k 2>/dev/null || true
+tmux send-keys -t "$NAME" C-u 2>/dev/null || true
+tmux send-keys -t "$NAME" -l -- "$MSG"
+# Let the TUI fully ingest the literal (possibly multi-line / bracketed-paste)
+# buffer BEFORE the submit Enter. Firing Enter immediately races the paste and
+# gets dropped on long messages → the text sits as an unsubmitted draft and the
+# worker silently stalls (observed: a long /goal to a worker never ran until a
+# manual Enter; same root cause as a prior "draft" misread).
+# Scale the settle with message length: 0.3s base, +1s per 2000 chars, cap 2s.
+settle=$(awk -v n="${#MSG}" 'BEGIN{t=0.3+n/2000; if(t>2)t=2; print t}')
+sleep "$settle"
+tmux send-keys -t "$NAME" Enter
+echo "sent -> $NAME"

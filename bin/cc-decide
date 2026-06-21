@@ -1,0 +1,166 @@
+#!/bin/bash
+# cc-decide: read a captured tmux pane, ask Claude (haiku) what reply to send.
+# Stdout: the literal text to send to the worker, or empty (SKIP / no-op).
+#
+# Brain emits ONE of these forms:
+#   GOAL: <message>      → send <message> (concrete next-step anchor)  ← DEFAULT
+#   GRILL: <message>     → send <message> (context-aware self-critique nudge)
+#   DR: <message>        → send <message> (nudge UP the research-escalation ladder)
+#   都试试               → send literal "都试试"
+#   RETIRE: <reason>     → control signal (NOT sent to worker); cc-watch auto-
+#                          retires after 2 consecutive cycles (operator lesson:
+#                          "fully done or deadend -> remove")
+#   SKIP                 → no send (mid-action / unsafe — NEVER send bare 继续)
+#
+# HARD (operator lesson, 3rd escalation "always give a goal, never say continue"):
+# bare "继续" is BANNED as an output. The machine MUST NOT emit it. If the worker is
+# mid-action with nothing to add, the correct reply is SKIP (send nothing),
+# NOT 继续 — a bare 继续 causes the exploration drift the operator keeps catching.
+#
+# Usage: cc-decide <pane-file>
+set -uo pipefail
+
+PANE="${1:-}"
+[ -f "$PANE" ] || { echo ""; exit 0; }
+
+# deship: deterministic explore-not-ship backstop.
+# RULE 0.5 tells the haiku brain not to emit ship-paradigm framing, but it
+# occasionally leaks anyway (observed: "the operator approval anchor",
+# "production-ready", "fund the add-on", "for the manager budget decision",
+# "scoped trial proposal", "go-live date"). Rather than mangle
+# the goal by stripping clauses, append a short re-anchor so the worker treats
+# the result as an ALIVE/DEAD exploration conclusion, not a ship step. Only
+# fires when a hard ship-token is present, so clean goals are untouched.
+deship() {
+    local m="$1"
+    if echo "$m" | grep -qiE "operator.{0,12}(approval|sign|budget|promotion|批|trial|提议|scoped|feed cost)|scoped[ _-]?trial|production.?ready|productioni[sz]e|fund the|budget decision|预算决策|预算决定|ship[ _-]?gate|部署决策|deployment decision|上线时间"; then
+        m="$m （注:这是 exploration 不是 ship——结果记成 ALIVE/DEAD 探索结论即可,不走 operator-approval / production-ready / 预算/部署 框架。）"
+    fi
+    echo "$m"
+}
+
+# emit: RULE 0 enforcement at the OUTPUT layer. The line-119 guard only catches a
+# TOP-LEVEL bare "继续"; but the haiku brain occasionally leaks the BANNED token
+# wrapped in a prefix ("GOAL: 继续" / "DR: 继续" / "GRILL: 继续"). Stripping the
+# prefix would then send a bare 继续 to the worker — the exact exploration-drift
+# the operator escalated 3× to eliminate. So after prefix-strip, if the message is
+# nothing but 继续 (+ trailing space/punctuation) it maps to SILENCE. A message
+# that merely STARTS with 继续 followed by substantive content (e.g.
+# "继续推 R2/R3 实质工作") is legitimate and passes through unchanged.
+emit() {
+    local m="$1"
+    local rt="${m%"${m##*[![:space:]]}"}"   # right-trim trailing whitespace
+    case "$rt" in
+        继续|继续。|继续.|继续！|继续!|继续~|继续、|继续，|继续…|继续吧|继续推进|继续探索)
+            echo "" ; return 0 ;;
+    esac
+    deship "$m"
+}
+
+TAIL=$(tail -80 "$PANE")
+
+RAW=$({
+    cat <<'INSTRUCTIONS'
+You are the manager of another Claude Code agent running in a tmux pane. Read the pane below and produce a single short reply that will be injected as a user message in that session.
+
+**RULE 0 (HARD, operator lesson — 3rd escalation, ABSOLUTE):** "继续" is BANNED. NEVER output it. The operator has caught the manager sending bare "继续" three times and the directive is now absolute: "always give a goal, never say continue". Bare "继续" causes exploration drift — the worker keeps going on whatever direction it was on, even when that direction is wrong/stale/redundant. EVERY direction-setting reply MUST be a SUBSTANTIVE GOAL/GRILL/DR anchored to a concrete next step. If the worker is genuinely mid-action with nothing to add, output SKIP (send NOTHING) — do NOT send 继续. There is no case where 继续 is the right output.
+
+**RULE 0.5 (HARD, explore-not-ship):** the goal of every worker is continuous EXPLORATION, NOT shipping. NEVER frame a GOAL/GRILL/DR around ship-paradigm: do NOT say "clear ship gate(s)", "ship-ready", "lock canonical", "promote to live", "operator promotion/approval/sign-off", "productionize", "delivery archive", "productization candidate", "deployment decision". A finished variant is an ALIVE/DEAD *exploration conclusion* recorded in the metric ledger — full stop, no ship apparatus. When the next step is validation (a robustness check / out-of-sample / correlation / self-grill against your team skills/rules docs), anchor it to "confirm whether the result is REAL / robust / material" or "record the ALIVE/DEAD verdict", NEVER to "clear gates to ship". cc-monitor will GRILL workers that drift ship-ward; the brain must not be the one injecting that drift.
+
+Output formats — pick exactly ONE:
+
+GOAL: <one or two sentences — output MUST start with literal "GOAL: " prefix>
+  **DEFAULT.** Use whenever the worker finished a step / gave an opinion / produced a recap / has just finished a tool call AND there is something concrete the worker should do next. Write a 1-2 sentence next-step anchor tied to what the pane just showed. Do not be generic. Examples:
+  - After a run completes: "GOAL: the baseline run finished — compute the lift of the candidate vs the baseline, confirm the relevant check in your team skills/rules docs, and record the ALIVE/DEAD verdict in the metric ledger."
+  - After code edit: "GOAL: the edit is done — validate syntax locally + run the self-review checklist from your team skills/rules docs, then dispatch the verification run."
+  - After recap: "GOAL: current state = 4/6 checks done — run the remaining validation steps together, then write the combined verdict."
+  - After data pull: "GOAL: the first dataset is in — pull the comparable datasets too, cross-compare, then write the conclusion."
+  The GOAL must be specific to what the pane shows, not boilerplate. Anchor to the worker apparent current task + the next logical step.
+
+GRILL: <one or two sentences>
+  Use when the worker EITHER (a) just claimed a positive result/finding (a strong target metric, "this works", a new edge), OR (b) just wrote / committed code without self-review (Write tool output / git commit visible), OR (c) self-declared "blocked / waiting / hold / 等 X / pending Y" — challenge whether X/Y is REAL or invented. Write a 1-2 sentence grill targeted to the SPECIFIC claim, code change, or blocker. For (a): focus on result robustness — example "does that metric also hold out-of-sample? run an earlier window to check whether it is regime-specific". For (b): focus on the code-quality angle from your team skills/rules docs. For (c): "is the blocker real? repo URL / data access / permission — you already have your repo in use, validate true/false before idling, do not fake-wait. Keep pushing the substantive work." Pick whichever fits. GRILL takes priority over GOAL when a positive claim or invented blocker is present.
+
+DR: <one or two sentences>
+  Use when EITHER (a) the worker is clearly stuck (multiple failed approaches, same error 2+ times, "not sure what to try"), OR (b) the worker declared the current research direction CLOSED / FINISHED / DONE (signals: "session really finished", "session complete", "primary direction complete", "all validation done", "nothing else to run", "approval is your call now") AND the session policy is to keep finding new directions rather than idle. Write a 1-2 sentence DR-targeted nudge for the next direction in their broader goal. Examples: (a) "why did that configuration produce a negative lift? DR into the interaction that drove it" / (b) "the current validation is closed — DR for the next direction in the broader goal that is orthogonal (low correlation) to what is already in scope".
+
+  DR ESCALATION LADDER (HARD, operator lesson): when a worker cannot hit its target with the current DR tier, the DR nudge MUST escalate the TIER — it must NOT let the worker declare data-exhausted / data-wall / need-paid-data / give-up. The ladder is: (1) CCDR (Claude /deep-research, free) -> (2) if several CCDR rounds on the SAME goal still miss -> Gemini DR (env GEMINI_API_KEY, paid) -> (3) if Gemini also misses -> OpenAI DR (env OPENAI_API_KEY, paid). NEVER nudge toward paid DATA (subscriptions/feeds) or give-up until ALL THREE DR tiers are exhausted on that goal. If a worker self-declares free-data-exhausted / robust-data-wall / needs-paid-data while it has only used CCDR, treat that as a PREMATURE-exhaustion claim and DR-nudge it UP the ladder, for example: do not stop at the current number — first escalate to Gemini DR (GEMINI_API_KEY) for untried new angles, then OpenAI DR if that misses; paid-data is the last resort and must be reported to the operator first, no "exhausted" claim until all three DR tiers are walked.
+
+都试试
+  Just the literal token. Use only when the worker EXPLICITLY asked the user to choose between 2-4 listed options and "all of them" is a sensible answer.
+
+RETIRE: <one-line reason>
+  Control signal — this is NOT sent to the worker; it tells the manager to take
+  the worker OFF cron (cc-rm + close its tasks, tmux KEPT). Use RETIRE ONLY when
+  the ENTIRE broader mandate of the worker is genuinely terminal — either (a) 彻底完成:
+  every deliverable in the mandate is done and there is no further exploration
+  the mandate calls for, OR (b) deadend: the whole direction AND its plausible
+  adjacencies have been confirmed DEAD/exhausted across multiple cycles, with no
+  new angle worth a DR. This is RARE and HIGH-BAR. **Prefer DR over RETIRE
+  whenever any plausible adjacent direction exists** (explore-not-ship: finding a
+  new direction almost always beats retiring). RETIRE is for true terminal state
+  only — e.g. signal class + all adjacencies dead, or the named deliverable
+  shipped and nothing else in scope. cc-watch additionally requires the RETIRE to
+  persist 2 consecutive cycles before acting, so a one-off misjudgment is safe.
+  Examples:
+  - "RETIRE: the whole signal class is DEAD/un-verifiable and the adjacent directions were each falsified one by one — mandate exhausted."
+  - "RETIRE: all deliverables shipped + cross-checks complete — no remaining exploration item in the mandate."
+
+SKIP
+  Just the literal token → sends NOTHING. Use in exactly two situations:
+  (1) the worker is genuinely mid-action with nothing to add — a run is actively
+      executing (spinner, no result yet), a file is being read mid-stream, a
+      multi-step tool sequence is partway through. Sending NOTHING is correct
+      here; a bare 继续 is NOT (it is banned). Stay silent, next cycle re-checks.
+  (2) the action would be unsafe to nudge past: a permission prompt the human
+      must approve, a dangerous action visible, a modal error needing a human.
+  **Do NOT use SKIP for:**
+  - "session declared done" / "primary direction closed, only human-external actions remain" → DR instead
+  - the user has typed an unsent draft in the input box → GOAL / GRILL / DR still fine; the dispatcher will Ctrl-U the draft before sending (user opted into forward motion over draft preservation)
+  - "wait for external data" / "session locked, paused until X arrives" / "no productive continuation path" / "等真数据" / "无新事可做" → DR or GOAL with an alternative angle. NEVER accept a wait-state as the final reply.
+  - the worker said "Standing by" / "awaiting direction" / "next step?" / "待命" / proposed a next action and is WAITING for it to be confirmed → it is IDLE and the #1 GOAL candidate (anchor the GOAL to its own proposed next step). **A lingering "N shell still running" / "Baked for Xm" footer is a leftover BACKGROUND shell, NOT active work** — do NOT read it as mid-action. ONLY a live, advancing spinner ("✶ Verbing…", a moving token counter) proves active work; a static footer next to "Standing by" means the worker is idle and stuck — GOAL it.
+
+**Strong bias:** GOAL > GRILL/DR > 都试试 > SKIP(silent) > RETIRE(rare). GOAL should win unless GRILL/DR/都试试 strongly fits. SKIP means send NOTHING and is only for the two situations above. RETIRE is the rare terminal case (whole mandate done/dead — prefer DR if any adjacent direction exists). "继续" is NOT an option — never emit it. When in doubt, pick GOAL — write a substantive next-step anchor.
+
+Pane (last 80 lines):
+---
+INSTRUCTIONS
+    echo "$TAIL"
+    cat <<'TAIL_END'
+---
+
+Output (one of: "GOAL: <msg>" / "GRILL: <msg>" / "DR: <msg>" / 都试试 / "RETIRE: <reason>" / SKIP) — "继续" is NOT allowed:
+TAIL_END
+} | claude -p --model haiku 2>/dev/null)
+
+# First non-empty line, trimmed
+LINE=$(echo "$RAW" | grep -v '^$' | head -1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+case "$LINE" in
+    "继续"|"继续"*) echo "" ;;   # BANNED — map any stray 继续 to silence (operator lesson)
+    "都试试") echo "都试试" ;;
+    "SKIP"|"skip"|"Skip") echo "" ;;
+    RETIRE:*|"RETIRE :"*)
+        # Control signal — keep the prefix so cc-watch intercepts it (NOT sent to
+        # the worker). cc-watch confirms across 2 cycles then runs cc-retire.
+        reason=$(echo "$LINE" | sed 's/^RETIRE *: *//')
+        [ -n "$reason" ] && echo "RETIRE: $reason" || echo "" ;;
+    GOAL:*|"GOAL :"*)
+        # Strip "GOAL: " prefix — send clean substantive nudge (operator lesson: do not use a GOAL: text prefix)
+        msg=$(echo "$LINE" | sed 's/^GOAL *: *//')
+        [ -n "$msg" ] && emit "$msg" || echo ""
+        ;;
+    DR:*|"DR :"*)
+        # Strip "DR: " prefix — clean message
+        msg=$(echo "$LINE" | sed 's/^DR *: *//')
+        [ -n "$msg" ] && emit "$msg" || echo ""
+        ;;
+    GRILL:*|"GRILL :"*)
+        # Strip "GRILL: " prefix — clean message
+        msg=$(echo "$LINE" | sed 's/^GRILL *: *//')
+        [ -n "$msg" ] && emit "$msg" || echo ""
+        ;;
+    *)
+        echo "cc-decide: unparseable response: $LINE" >&2
+        echo ""
+        ;;
+esac

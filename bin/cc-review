@@ -1,0 +1,333 @@
+#!/bin/bash
+# cc-review — MANAGER-SPAWNED reviewer for a landed commit (the worker can't skip it).
+#
+# WHY this is a manager tool, not a worker instruction: a worker is an autonomous LLM —
+# telling it in its goal/onboarding to "run a review before claiming results" is NOT
+# enforceable; it forgets, skips, or does a token review. So the review is driven from the
+# MANAGER side: cc-watch detects a newly-landed commit and calls THIS, which runs the
+# layered reviewers on the diff. The worker does not participate in the decision to review,
+# so it cannot skip it. ("the judge can't be the party being judged".)
+#
+# HONEST SCOPE: this is a POST-HOC ADVISORY review, NOT a pre-merge block. Workers push
+# directly to the shared branch, so a FAILing commit is ALREADY on the branch when this runs;
+# cc-review's job is to CATCH it and re-poke the owner to fix-forward (the next commit is
+# re-reviewed until PASS). To make it a hard gate, add a pre-push hook that rejects on a prior
+# FAIL verdict (not wired here).
+#
+# LAYERS:
+#   L1  process/discipline review  (built-in prompt below — domain-agnostic)
+#   L2  domain review              (optional: $CC_VERIFY_PLUGIN/review-prompt.txt, if present)
+#   L3  /code-review               (Claude built-in — correctness, HEAD only)
+#   L4  /security-review           (Claude built-in — only when an attack surface is touched)
+#   +   deterministic secret-grep  (always, zero-token)
+#   +   claim verification         ($CC_VERIFY_PLUGIN/verify-claim — is a cited result real?)
+#
+# Usage:
+#   cc-review [<sha>]                 # review one commit (default HEAD); exit 0 PASS, 3 FAIL
+#   cc-review --repoke <name> <sha>   # review + auto re-poke worker session <name> on FAIL
+#   cc-review --goal "<text>" <sha>   # pass the owning worker's goal so the domain reviewer
+#                                     # is goal-aware (won't false-FAIL an explore-only directive)
+#
+# Reviewers are forced to emit a single JSON verdict object; we parse it out of the
+# `claude -p --output-format json` envelope. Diff is bounded to keep token cost sane.
+set -uo pipefail
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/sbin"
+
+MODEL="${CC_REVIEW_MODEL:-claude-opus-4-8}"
+DIFF_MAX_LINES="${CC_REVIEW_DIFF_MAX:-600}"
+REPO="${CC_REPO:-$HOME/your-repo}"
+ARTDIR="$REPO/.cc-review"
+
+# Resolve the claude-code-fleet install dir (parent of this bin/) and the active verification plugin.
+SELF="$(cd "$(dirname "$0")" && pwd)"
+CC_HOME="${CC_HOME:-$(dirname "$SELF")}"
+CC_VERIFY_PLUGIN="${CC_VERIFY_PLUGIN:-plugins/generic}"
+case "$CC_VERIFY_PLUGIN" in
+    /*) PLUGIN_DIR="$CC_VERIFY_PLUGIN" ;;
+    *)  PLUGIN_DIR="$CC_HOME/$CC_VERIFY_PLUGIN" ;;
+esac
+
+# LOCAL user-notify primitive (cc-notify: desktop notification + durable escalations.log,
+# per-topic dedup). In-repo/in-home fallback if the ~/.local/bin symlink isn't installed.
+_CC_NOTIFY="$HOME/.local/bin/cc-notify"; [ -x "$_CC_NOTIFY" ] || _CC_NOTIFY="$CC_HOME/bin/cc-notify"
+_notify_user() { [ -x "$_CC_NOTIFY" ] && "$_CC_NOTIFY" "$1" "$2" >/dev/null 2>&1 || true; }
+
+REPOKE_WORKER=""
+if [ "${1:-}" = "--repoke" ]; then REPOKE_WORKER="${2:-}"; shift 2; fi
+# the owning worker's goal text, so the domain reviewer doesn't FALSE-FAIL an explicitly
+# explore-only / in-sample directive.
+GOAL_CTX=""
+if [ "${1:-}" = "--goal" ]; then GOAL_CTX="${2:-}"; shift 2; fi
+SHA="${1:-HEAD}"
+SHA=$(git -C "$REPO" rev-parse --short "$SHA" 2>/dev/null) || { echo "bad sha: ${1:-HEAD}" >&2; exit 2; }
+
+mkdir -p "$ARTDIR"
+ART="$ARTDIR/${SHA}.json"
+
+# --- gather the commit context (bounded) ---------------------------------------
+# `git show` on a MERGE commit emits an EMPTY diff by default → the reviewer would see nothing
+# and rubber-stamp PASS. Use --first-parent for merges so the merged-in changes are reviewed.
+SHOWOPT=""
+[ "$(git -C "$REPO" rev-list --parents -n1 "$SHA" 2>/dev/null | wc -w)" -gt 2 ] && SHOWOPT="--first-parent -m"
+STAT=$(git -C "$REPO" show $SHOWOPT --stat --format="%H%n%an%n%s%n%b" "$SHA" 2>/dev/null | head -60)
+# the diff is capped at DIFF_MAX_LINES so the reviewer never reviews code past the cap as PASS
+# though it never saw it. Detect truncation and TELL the reviewer so it can't silently rubber-stamp.
+_DIFF_TOTAL=$(git -C "$REPO" show $SHOWOPT --format= "$SHA" 2>/dev/null | wc -l | tr -d ' ')
+DIFF=$(git -C "$REPO" show $SHOWOPT --format= "$SHA" 2>/dev/null | head -"$DIFF_MAX_LINES")
+# the deterministic secret-grep MUST see the WHOLE diff, not the capped $DIFF (a secret past
+# line 600 of a big diff would never be scanned). Build a FULL uncapped diff just for that pass;
+# the capped $DIFF stays the input to the LLM reviewer prompts (token budget unchanged).
+DIFF_FULL=$(git -C "$REPO" show $SHOWOPT --format= "$SHA" 2>/dev/null)
+DIFF_TRUNC=""
+[ "${_DIFF_TOTAL:-0}" -gt "$DIFF_MAX_LINES" ] && DIFF_TRUNC="DIFF TRUNCATED: only the first $DIFF_MAX_LINES of $_DIFF_TOTAL diff lines are shown below. You did NOT see the rest. If any unseen file/region could carry a behavior-affecting change, you MUST NOT return PASS on it — return FIX noting the review is incomplete and which files exceed the cap."
+TOUCHED=$(git -C "$REPO" show $SHOWOPT --name-only --format= "$SHA" 2>/dev/null | grep -v '^$')
+
+# --- headless reviewer helper: $1=label  $2=prompt -> prints extracted JSON ----
+_run_reviewer() {
+    local label="$1" prompt="$2" raw result
+    raw=$(printf '%s' "$prompt" | claude -p --model "$MODEL" --output-format json 2>/dev/null) || { echo '{"verdict":"ERROR","note":"claude -p failed (maybe usage limit)"}'; return; }
+    # envelope .result holds the model text; pull the first {...} JSON object out of it.
+    # Pass $raw via ENV VAR, not a stdin pipe: `python3 -c` with a heredoc would swallow the pipe.
+    result=$(RAW="$raw" python3 -c '
+import json,os,re
+raw=os.environ.get("RAW","")
+try:
+    env=json.loads(raw); txt=env.get("result","") if isinstance(env,dict) else ""
+except Exception:
+    txt=""
+m=re.search(r"\{.*\}", txt, re.S)
+print(m.group(0) if m else "{\"verdict\":\"ERROR\",\"note\":\"no json in reviewer output\"}")
+' 2>/dev/null)
+    [ -n "$result" ] && printf '%s' "$result" || echo '{"verdict":"ERROR","note":"empty"}'
+}
+
+# Built-in reviewer layers: Claude's mature built-ins — /code-review (CORRECTNESS) and
+# /security-review (SECURITY). Both review the HEAD/branch diff, so only run when reviewing HEAD.
+# Output is prose → classify: "(none)"/no-issues = PASS, else FINDINGS (surfaced in repoke).
+_run_builtin_review() {  # $1 = slash command (e.g. "/code-review low") → echoes JSON {verdict, findings}
+    local raw txt
+    # under launchd, cc-watch runs with cwd=/, so a headless `claude -p` sees "not a git repository"
+    # and reviews NOTHING. Run from inside $REPO AND --add-dir it so the built-in sees the live diff
+    # (else its no-diff prose was mis-classified as FINDINGS → false FAIL → wasted worker repoke).
+    # FORCE the built-in to emit a strict verdict-JSON; parse that FIRST; only if no parseable
+    # verdict-JSON is found do we fall back to the hand-maintained substring allowlist (kept intact).
+    local prompt="$1
+Reply with ONLY a JSON object: {\"verdict\":\"PASS\",\"findings\":[]} (PASS if no real issues) or {\"verdict\":\"FINDINGS\",\"findings\":[\"...\"]}. No prose, no markdown fences, nothing before or after the JSON object."
+    raw=$(cd "$REPO" && printf '%s' "$prompt" | claude -p --add-dir "$REPO" --output-format json 2>/dev/null) || { echo '{"verdict":"ERROR"}'; return; }
+    txt=$(RAW="$raw" python3 -c 'import json,os
+try: print(json.loads(os.environ["RAW"]).get("result",""))
+except Exception: print("")' 2>/dev/null)
+    RAW="$txt" python3 -c '
+import os,json,re
+t=(os.environ.get("RAW","") or "").strip()
+low=t.lower()
+# infra-failure prose (the subagent could not see the repo/diff) must be ERROR, NEVER FINDINGS —
+# an infra failure must not be able to flip overall=FAIL. Checked FIRST, before the JSON parse.
+infra = any(s in low for s in (
+    "not a git repository", "not in a git repo", "no diff to review", "nothing to review",
+    "no changes to review", "point me at a repo", "where is the code", "wheres the code"))
+if infra:
+    print(json.dumps({"verdict":"ERROR","findings":t[:600]}, ensure_ascii=False)); raise SystemExit
+# structured-first: extract a verdict-JSON object from the output. If found AND its verdict is
+# exactly PASS/FINDINGS, trust it directly. Any other shape → fall through to the substring allowlist.
+m = re.search(r"\{.*\}", t, re.S)
+if m:
+    try:
+        j = json.loads(m.group(0))
+        v = str(j.get("verdict","")).strip().upper()
+        if v in ("PASS","FINDINGS"):
+            f = j.get("findings", t[:600])
+            if isinstance(f, (list, tuple)):
+                f = "; ".join(str(x) for x in f) if f else "(none)"
+            print(json.dumps({"verdict":v,"findings":str(f)[:600]}, ensure_ascii=False)); raise SystemExit
+    except SystemExit:
+        raise
+    except Exception:
+        pass   # malformed JSON → fall back to the substring allowlist (safety net preserved)
+# the no-findings sentinel "(none)" can be emitted AFTER a preamble, or markdown-wrapped
+# (`(none)`, **(none)**). STRIP markdown wrappers before the sentinel compare so a clean review
+# is not mis-read as FINDINGS. A REAL finding lists issue bullets, never a bare wrapped "(none)".
+_WRAP = "`*_() " + chr(34) + chr(39)
+sentinel = False
+for ln in low.splitlines():
+    core = ln.strip().strip(_WRAP)
+    if core in ("none", "no findings", "(none)", "(no findings)", "n/a") \
+       or core.startswith("(none)"):
+        sentinel = True
+        break
+clean = (not t) or low.startswith("(none)") or sentinel or "no issues" in low or "no findings" in low or "nothing to flag" in low or "no code logic" in low or "no runtime code logic" in low or "no blocking" in low or "no security" in low or "no vulnerab" in low or "no runtime-correctness bug" in low or "no correctness bug" in low or "no bug" in low or "no candidate vulnerab" in low or "found no candidate" in low or "no candidate" in low
+# FALLBACK fail-safe: an unparseable/ambiguous built-in verdict whose prose is NOT in the
+# clean-allowlist classifies as SKIP, NEVER FINDINGS — a phrasing artifact must never flip a
+# structurally-clean review to FAIL. Only an EXPLICIT, bulleted finding → FINDINGS.
+def _has_explicit_finding(text):
+    for raw in text.splitlines():
+        s = raw.strip()
+        sl = s.lower().strip(_WRAP)
+        if sl in ("", "none", "no findings", "(none)", "(no findings)", "n/a"):
+            continue
+        if re.match(r"^([-*+]\s+|\d+[.)]\s+)\S", s):
+            if not any(p in sl for p in ("no issue", "no finding", "none", "n/a", "nothing")):
+                return True
+    return False
+if clean:
+    verdict = "PASS"
+elif _has_explicit_finding(t):
+    verdict = "FINDINGS"
+else:
+    verdict = "SKIP"   # unparseable/ambiguous → cannot-classify, fail-safe SKIP (never false-FAIL)
+print(json.dumps({"verdict":verdict,"findings":t[:600]}, ensure_ascii=False))'
+}
+
+# --- L1: process/discipline reviewer (domain-agnostic) -------------------------
+# This prompt is the single source of truth for the process review. Edit it HERE to change
+# what L1 grills. It checks honesty-of-record, secrets, and shared-tree hygiene — nothing
+# domain-specific. Domain checks (overfit, correctness for a particular field) live in the
+# optional plugin review-prompt.txt (L2).
+CODE_PROMPT="CRITICAL: reply with ONLY a JSON object — no explanation, no markdown fences, nothing before or after. If this commit does not touch reviewable code, still output {\"verdict\":\"PASS\",\"issues\":[],\"repoke\":\"\"}.
+You are a PROCESS / discipline reviewer. Your job: results are recorded honestly, no secrets land, and the shared working tree is not polluted. Review ONLY this diff.
+Check (any fail -> verdict=FIX or FAIL):
+1. Single source of truth: if this commit produces a new headline result/metric, the project's metric ledger (the agreed RESULTS/metrics file) must be updated in the SAME change; a stated number that contradicts the ledger by a material margin = FAIL.
+2. Shared-tree hygiene: never 'git add -A' / 'git add .' (it sweeps other workers' WIP); stage only your own files with an explicit pathspec.
+3. Run-proof: a 'done / passing / it works' claim needs a real execution artifact (a run id, a log line, a number) — prose alone is not proof.
+4. Landing claims need real deploy evidence (an ARN / URL / order-id); a file merely existing != done.
+Note: a flat or negative result is NOT a defect — recording an honest ALIVE/DEAD verdict is a first-class outcome, not a failure.
+COMMIT:
+$STAT
+DIFF (may be truncated):
+${DIFF_TRUNC}
+$DIFF
+Output JSON: {\"verdict\":\"PASS|FIX|FAIL\",\"issues\":[...],\"repoke\":\"one line to the worker\"}"
+
+# --- L2: optional domain reviewer from the active plugin -----------------------
+# The plugin may ship review-prompt.txt with placeholders {{STAT}} {{DIFF_TRUNC}} {{DIFF}}
+# {{GOAL_CTX}}. If absent, L2 is skipped (verdict SKIP) — core stays domain-agnostic.
+DOMAIN_PROMPT=""
+DOMAIN_PROMPT_FILE="$PLUGIN_DIR/review-prompt.txt"
+if [ -f "$DOMAIN_PROMPT_FILE" ]; then
+    DOMAIN_PROMPT=$(cat "$DOMAIN_PROMPT_FILE")
+    DOMAIN_PROMPT=${DOMAIN_PROMPT//\{\{STAT\}\}/$STAT}
+    DOMAIN_PROMPT=${DOMAIN_PROMPT//\{\{DIFF_TRUNC\}\}/$DIFF_TRUNC}
+    DOMAIN_PROMPT=${DOMAIN_PROMPT//\{\{DIFF\}\}/$DIFF}
+    DOMAIN_PROMPT=${DOMAIN_PROMPT//\{\{GOAL_CTX\}\}/${GOAL_CTX:-(none provided)}}
+fi
+
+echo "[cc-review] reviewing $SHA (plugin=$CC_VERIFY_PLUGIN)..." >&2
+
+CODE_JSON=$(_run_reviewer code "$CODE_PROMPT")
+if [ -n "$DOMAIN_PROMPT" ]; then
+    ALGO_JSON=$(_run_reviewer algo "$DOMAIN_PROMPT")
+else
+    ALGO_JSON='{"verdict":"SKIP","note":"no plugin review-prompt.txt"}'
+fi
+
+# --- deterministic secret-grep (always, cheap, no LLM) -------------------------
+# Catches hardcoded keys/tokens the no-secrets rule forbids; far more reliable + free than an
+# LLM security pass. Case-SENSITIVE real-secret literals, word-bounded; lines that read from the
+# environment (os.environ / getenv / ${...} / process.env) or are citation URLs are EXCLUDED, so
+# the *_KEY = os.environ idiom and citation links never false-flag.
+if SECRET_DIFF="$DIFF_FULL" python3 -c '
+import os,re,sys
+diff=os.environ.get("SECRET_DIFF","")
+PATS=[
+    re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9_-]{19,}"),
+    re.compile(r"\bgh[ps]_[A-Za-z0-9]{20}"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"(?i)\bapi[_-]?key[\"\x27 ]*[:=][\"\x27 ]*[A-Za-z0-9]{16}"),
+    re.compile(r"\bBot [A-Za-z0-9_.-]{30}"),
+    re.compile(r"(?i)\bpassword[\"\x27 ]*[:=][\"\x27 ]*\S"),
+    # generic high-entropy: a NAME ending in TOKEN|SECRET|KEY, an assignment, then a long literal.
+    # (covers e.g. MY_API_TOKEN=..., SERVICE_SECRET=..., FOO_KEY=...; add your own named creds here.)
+    re.compile(r"(?i)\b[A-Za-z0-9_]*(?:TOKEN|SECRET|KEY)\b[\"\x27 ]*[:=][\"\x27 ]*[0-9A-Za-z]{24,}"),
+    # bare 32-64 hex value when a *TOKEN/SECRET/KEY name precedes it on the SAME line, so a lone
+    # hex id (e.g. a run/artifact id) with no cred name never fires.
+    re.compile(r"(?i)\b[A-Za-z0-9_]*(?:TOKEN|SECRET|KEY)\b[\"\x27 ]*[:=][\"\x27 ]*[0-9a-f]{32,64}\b"),
+]
+ENVREAD=re.compile(r"https?://|os\.environ|getenv|\$\{|process\.env")
+WHITELIST=re.compile(r"(?i)[A-Za-z0-9_]*KEY[A-Za-z0-9_]*\s*=\s*os\.environ")
+for line in diff.splitlines():
+    if ENVREAD.search(line) or WHITELIST.search(line):
+        continue
+    if any(p.search(line) for p in PATS):
+        sys.exit(0)   # a real hardcoded-secret literal → flag
+sys.exit(1)
+'; then
+    SECRET_JSON='{"verdict":"FAIL","note":"hardcoded secret pattern in diff — read from an env var, never commit"}'
+else
+    SECRET_JSON='{"verdict":"PASS"}'
+fi
+
+# --- claim verification (the active plugin) ------------------------------------
+# Resolve every result the commit CITES (a backtest id, a CI run id, a benchmark URL, ...)
+# against ground truth, so a worker can't fabricate a metric and pass every other layer.
+# The provider is pluggable; the default (plugins/generic) surfaces citations and returns SKIP.
+VERIFY="$PLUGIN_DIR/verify-claim"
+if [ -x "$VERIFY" ]; then
+    BTID_JSON=$(NO_PROXY="*" perl -e 'alarm 90; exec @ARGV' python3 "$VERIFY" "$SHA" --repo "$REPO" 2>/dev/null)
+    [ -n "$BTID_JSON" ] || BTID_JSON='{"verdict":"SKIP","note":"verify-claim produced no output"}'
+else
+    BTID_JSON='{"verdict":"SKIP","note":"no executable verify-claim in '"$CC_VERIFY_PLUGIN"'"}'
+fi
+
+# --- L3 /code-review + L4 /security-review (built-ins, HEAD only) ---------------
+HEAD_SHA=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)
+if [ "$SHA" = "$HEAD_SHA" ]; then
+    CR_JSON=$(_run_builtin_review "/code-review low")
+    # /security-review (LLM) only when the commit touches a real attack surface (infra/scripts/deploy);
+    # other commits get the deterministic secret-grep above, not a token-costly LLM pass.
+    if echo "$TOUCHED" | grep -qiE '^(infra/|bin/|src/|services/|.*deploy|.*\.sh$)|Dockerfile'; then
+        SEC_JSON=$(_run_builtin_review "/security-review")
+    else
+        SEC_JSON='{"verdict":"SKIP","note":"no attack surface touched — secret-grep covers it"}'
+    fi
+else
+    CR_JSON='{"verdict":"SKIP","note":"not HEAD — built-in reviewers see the live diff only"}'
+    SEC_JSON='{"verdict":"SKIP","note":"not HEAD — built-in reviewers see the live diff only"}'
+fi
+
+# --- combine verdicts + write artifact -----------------------------------------
+python3 - "$ART" "$SHA" "$CODE_JSON" "$ALGO_JSON" "$CR_JSON" "$SEC_JSON" "$SECRET_JSON" "$BTID_JSON" <<'PY'
+import json,sys
+art,sha,code_s,algo_s,cr_s,sec_s,secret_s,btid_s=sys.argv[1:9]
+def parse(s):
+    try: return json.loads(s)
+    except Exception: return {"verdict":"ERROR","raw":s[:200]}
+code,algo,cr,sec,secret,btid=parse(code_s),parse(algo_s),parse(cr_s),parse(sec_s),parse(secret_s),parse(btid_s)
+# DEAD is a LEGIT domain conclusion (signal/idea exhausted), NOT a defect — it stays visible in
+# the per-layer breakdown but must NOT flip overall=FAIL. FAIL/GRILL/FIX/FINDINGS are real defects.
+bad={"FAIL","GRILL","FIX","FINDINGS"}
+overall="PASS"
+if any(r.get("verdict") in bad for r in (code,algo,cr,sec,secret,btid)): overall="FAIL"
+if overall=="PASS" and any(r.get("verdict")=="ERROR" for r in (code,algo,cr,sec)): overall="ERROR"
+out={"sha":sha,"overall":overall,"code":code,"algo":algo,"codereview":cr,"security":sec,"secret":secret,"btid":btid}
+open(art,"w").write(json.dumps(out,ensure_ascii=False,indent=2))
+print(f"[cc-review] {sha} OVERALL={overall}  process={code.get('verdict')}  domain={algo.get('verdict')}  code-review={cr.get('verdict')}  security={sec.get('verdict')}  secret={secret.get('verdict')}  verify={btid.get('verdict')}")
+rp=[]
+for r in (code,algo):
+    if r.get("repoke"): rp.append(r["repoke"])
+if secret.get("verdict")=="FAIL": rp.append("[secret] "+secret.get("note",""))
+if btid.get("verdict")=="FAIL": rp.append("[verify] "+" | ".join(btid.get("issues",[]))[:300])
+for r,lbl in ((cr,'code-review'),(sec,'security')):
+    if r.get("verdict")=="FINDINGS" and r.get("findings"): rp.append(f"[{lbl}] "+r["findings"][:300])
+if rp: print("REPOKE: "+" | ".join(rp))
+PY
+RESULT_OVERALL=$(python3 -c "import json;print(json.load(open('$ART'))['overall'])" 2>/dev/null)
+
+# --- optional auto re-poke on FAIL ---------------------------------------------
+if [ "$RESULT_OVERALL" = "FAIL" ] && [ -n "$REPOKE_WORKER" ]; then
+    REPOKE_MSG=$(python3 -c "
+import json
+d=json.load(open('$ART'))
+parts=[]
+for k in ('code','algo'):
+    r=d.get(k,{})
+    if r.get('repoke'): parts.append(f\"[{k}] {r['repoke']}\")
+print('  '.join(parts) or 'review FAIL — see .cc-review/${SHA}.json')
+" 2>/dev/null)
+    if tmux has-session -t "$REPOKE_WORKER" 2>/dev/null; then
+        ts "$REPOKE_WORKER" "[manager cc-review $SHA FAIL] $REPOKE_MSG" >/dev/null 2>&1 \
+            && echo "[cc-review] re-poked $REPOKE_WORKER with FAIL findings"
+    fi
+fi
+
+[ "$RESULT_OVERALL" = "FAIL" ] && exit 3
+exit 0

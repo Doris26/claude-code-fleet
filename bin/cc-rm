@@ -1,0 +1,17 @@
+#!/bin/bash
+# cc-rm: remove a tmux session name from the watch list
+# Usage: cc-rm <name>
+set -e
+[ $# -eq 1 ] || { echo "Usage: cc-rm <name>" >&2; exit 2; }
+NAME="$1"
+CFG="$HOME/.cc-manager/watch.list"
+[ -f "$CFG" ] || { echo "watch list empty"; exit 0; }
+if grep -qxF "$NAME" "$CFG"; then
+    grep -vxF "$NAME" "$CFG" > "$CFG.tmp" && mv "$CFG.tmp" "$CFG"
+    rm -f "/tmp/cc-watch-${NAME}.pane" "/tmp/cc-watch-${NAME}.hash"
+    echo "removed: $NAME"
+else
+    echo "not in list: $NAME"
+fi
+echo "--- watch list ---"
+grep -v '^\s*#' "$CFG" | grep -v '^\s*$' || echo "(empty)"

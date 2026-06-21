@@ -1,0 +1,9 @@
+# local config (copy claude-code-fleet.env.example -> claude-code-fleet.env and edit; never commit it)
+claude-code-fleet.env
+# python build artifacts
+__pycache__/
+*.pyc
+# review artifacts written at runtime
+.cc-review/
+# editor / OS cruft
+.DS_Store

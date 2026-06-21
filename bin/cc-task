@@ -1,0 +1,670 @@
+#!/usr/bin/env python3
+"""cc-task — persistent task tracking across cc-manager sessions.
+
+State at ~/.cc-manager/tasks.jsonl (append-only event log).
+
+Usage:
+  cc-task add "<description>" --assignee <worker> [--deliverable <path>] [--ref <link>]
+       → creates task, prints ID
+  cc-task list [--worker name] [--status assigned|in_progress|blocked|completed|cancelled]
+  cc-task done <id> [--verdict "<one-line summary>"] [--artifact <commit|path>]
+  cc-task block <id> "<reason>"
+  cc-task unblock <id>
+  cc-task cancel <id> ["<reason>"]
+  cc-task reassign <id> <new_assignee>
+  cc-task get <id>
+  cc-task summary [--days N]
+  cc-task pending [--worker name]   # short form for "list status=assigned|in_progress"
+
+Statuses progress: assigned → in_progress → completed | blocked | cancelled
+"""
+import argparse
+import json
+import sys
+import uuid
+from datetime import datetime, timedelta
+from pathlib import Path
+
+TASKS_FILE = Path.home() / ".cc-manager" / "tasks.jsonl"
+TASKS_FILE.parent.mkdir(parents=True, exist_ok=True)
+TASKS_FILE.touch(exist_ok=True)
+
+# watch.list = the cron-supervised workers. cc-watch's cost-guard suspends the
+# moment NONE of them has an open task (see `cmd_fleet`).
+WATCH_LIST = Path.home() / ".cc-manager" / "watch.list"
+
+ACTIVE_STATUSES = {"assigned", "in_progress", "blocked"}
+
+
+def watch_workers() -> set[str]:
+    """Workers currently under cron supervision (one name per line in watch.list)."""
+    try:
+        return {
+            ln.strip()
+            for ln in WATCH_LIST.read_text().splitlines()
+            if ln.strip()
+        }
+    except FileNotFoundError:
+        return set()
+
+
+def load_events() -> list[dict]:
+    events = []
+    for line in TASKS_FILE.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return events
+
+
+def materialize(events: list[dict]) -> dict[str, dict]:
+    """Replay events into current task state."""
+    tasks = {}
+    for e in events:
+        tid = e["id"]
+        if tid not in tasks:
+            tasks[tid] = {
+                "id": tid,
+                "description": e.get("description", ""),
+                "assignee": e.get("assignee", ""),
+                "deliverable": e.get("deliverable"),
+                "ref": e.get("ref"),
+                "status": "assigned",
+                "created_at": e.get("ts"),
+                "events": [],
+            }
+        t = tasks[tid]
+        t["events"].append(e)
+        ev = e.get("event")
+        if ev == "create":
+            pass
+        elif ev == "start":
+            t["status"] = "in_progress"
+        elif ev == "block":
+            t["status"] = "blocked"
+            t["block_reason"] = e.get("reason")
+        elif ev == "unblock":
+            t["status"] = "in_progress"
+            t.pop("block_reason", None)
+        elif ev == "done":
+            t["status"] = "completed"
+            t["verdict"] = e.get("verdict")
+            t["artifact"] = e.get("artifact")
+            t["completed_at"] = e.get("ts")
+        elif ev == "cancel":
+            t["status"] = "cancelled"
+            t["cancel_reason"] = e.get("reason")
+        elif ev == "reassign":
+            t["assignee"] = e.get("new_assignee", t["assignee"])
+        elif ev == "set_deliverable":
+            t["deliverable"] = e.get("deliverable", t["deliverable"])
+    return tasks
+
+
+def append_event(event: dict):
+    event["ts"] = datetime.now().isoformat()
+    with TASKS_FILE.open("a") as f:
+        f.write(json.dumps(event) + "\n")
+
+
+def new_id() -> str:
+    return f"T-{uuid.uuid4().hex[:8]}"
+
+
+def cmd_add(args):
+    tid = new_id()
+    append_event({
+        "id": tid,
+        "event": "create",
+        "description": args.description,
+        "assignee": args.assignee,
+        "deliverable": args.deliverable,
+        "ref": args.ref,
+        "blocked_on": args.blocked_on,
+        "category": args.category,
+    })
+    print(tid)
+
+
+def cmd_done(args):
+    # Verify the artifact path exists (a worker once closed a task claiming a
+    # deliverable that did NOT exist — a fabricated claim. An existing-path check
+    # catches hallucinated deliverables at close time).
+    if args.artifact:
+        ap = Path(args.artifact).expanduser()
+        if not ap.exists():
+            print(f"  ⚠ WARNING: artifact path does not exist: {args.artifact}")
+            print(f"  ⚠ verify the deliverable was actually written before trusting this 'done'.")
+    append_event({
+        "id": args.id,
+        "event": "done",
+        "verdict": args.verdict,
+        "artifact": args.artifact,
+    })
+    print(f"completed: {args.id}")
+    # Notify downstream tasks blocked on this one
+    tasks = materialize(load_events())
+    downstream = [t for t in tasks.values() if t.get("blocked_on") == args.id]
+    if downstream:
+        import subprocess
+        ts = Path.home() / ".local" / "bin" / "ts"
+        for d in downstream:
+            assignee = d.get("assignee", "")
+            if not assignee or assignee == "multi":
+                continue
+            msg = f"/goal 上游 task {args.id} 已完成({args.verdict or 'done'}),你的 {d['id']} 解除阻塞,可以开始:{d['description'][:60]}"
+            try:
+                subprocess.run([str(ts), assignee, msg], check=False, capture_output=True, timeout=10)
+                print(f"  → notified {assignee} (task {d['id']})")
+            except Exception:
+                pass
+
+
+def cmd_block(args):
+    append_event({"id": args.id, "event": "block", "reason": args.reason})
+    print(f"blocked: {args.id}")
+
+
+def cmd_unblock(args):
+    append_event({"id": args.id, "event": "unblock"})
+    print(f"unblocked: {args.id}")
+
+
+def cmd_cancel(args):
+    append_event({"id": args.id, "event": "cancel", "reason": args.reason or ""})
+    print(f"cancelled: {args.id}")
+
+
+def cmd_reassign(args):
+    append_event({"id": args.id, "event": "reassign", "new_assignee": args.new_assignee})
+    print(f"reassigned: {args.id} → {args.new_assignee}")
+
+
+def cmd_set_deliverable(args):
+    append_event({"id": args.id, "event": "set_deliverable", "deliverable": args.deliverable})
+    print(f"deliverable set: {args.id} → {args.deliverable}")
+
+
+def cmd_start(args):
+    append_event({"id": args.id, "event": "start"})
+    print(f"started: {args.id}")
+
+
+def cmd_get(args):
+    tasks = materialize(load_events())
+    if args.id not in tasks:
+        print(f"no such task: {args.id}", file=sys.stderr)
+        sys.exit(1)
+    print(json.dumps(tasks[args.id], indent=2, default=str))
+
+
+def fmt_table(tasks: list[dict]):
+    if not tasks:
+        print("  (no tasks)")
+        return
+    print(f"  {'ID':<11} {'STATUS':<13} {'ASSIGNEE':<11} {'DESCRIPTION':<55} {'DELIVERABLE / VERDICT'}")
+    print(f"  {'-'*11} {'-'*13} {'-'*11} {'-'*55} {'-'*30}")
+    for t in tasks:
+        desc = (t["description"] or "")[:55]
+        d = t.get("deliverable") or t.get("verdict") or ""
+        d = d[:50]
+        print(f"  {t['id']:<11} {t['status']:<13} {t['assignee']:<11} {desc:<55} {d}")
+
+
+def cmd_list(args):
+    tasks = materialize(load_events()).values()
+    if args.worker:
+        tasks = [t for t in tasks if t["assignee"] == args.worker]
+    if args.status:
+        tasks = [t for t in tasks if t["status"] == args.status]
+    elif not getattr(args, "all", False):
+        # Default hides CLOSED tasks (cancelled/completed) so retired/dead workers' history
+        # doesn't clutter the live view (operator lesson "debug why they still show"). The full
+        # append-only ledger is preserved — use `--all` or `--status cancelled` to see it.
+        tasks = [t for t in tasks if t["status"] in ACTIVE_STATUSES]
+    tasks = sorted(tasks, key=lambda t: t["created_at"], reverse=True)
+    fmt_table(tasks)
+
+
+def cmd_pending(args):
+    tasks = materialize(load_events()).values()
+    tasks = [t for t in tasks if t["status"] in ACTIVE_STATUSES]
+    if args.worker:
+        tasks = [t for t in tasks if t["assignee"] == args.worker]
+    tasks = sorted(tasks, key=lambda t: t["created_at"])
+    fmt_table(tasks)
+
+
+REPORTED_FILE = Path.home() / ".cc-manager" / "reported_tasks.json"
+
+
+def cmd_report(args):
+    """Hourly status report with first-sighting tracking.
+
+    Lists every ACTIVE task, plus any COMPLETED/CANCELLED task not yet seen in a
+    prior report (✅NEW / ✖NEW). Persists the seen-set to reported_tasks.json so
+    a finished task is surfaced exactly once — fixes a gap where a completed task
+    was collapsed into a count and never reported.
+    """
+    tasks = materialize(load_events())
+    try:
+        seen = set(json.loads(REPORTED_FILE.read_text())) if REPORTED_FILE.exists() else set()
+    except Exception:
+        seen = set()
+
+    active = [t for t in tasks.values() if t["status"] in ACTIVE_STATUSES]
+    # Newly-finished = completed/cancelled tasks we've never reported before.
+    new_done = [t for t in tasks.values()
+                if t["status"] in ("completed", "cancelled") and t["id"] not in seen]
+
+    active = sorted(active, key=lambda t: t["created_at"])
+    new_done = sorted(new_done, key=lambda t: t.get("completed_at") or t["created_at"])
+
+    print(f"\n  === TASK REPORT {datetime.now().strftime('%Y-%m-%d %H:%M')} ===")
+    print(f"\n  Newly finished since last report ({len(new_done)}):")
+    if new_done:
+        for t in new_done:
+            tag = "✅NEW" if t["status"] == "completed" else "✖NEW"
+            v = (t.get("verdict") or t.get("cancel_reason") or "")[:70]
+            print(f"  {tag} {t['id']} [{t['assignee']}] {(t['description'] or '')[:50]} → {v}")
+    else:
+        print("  (none)")
+
+    print(f"\n  Active ({len(active)}):")
+    fmt_table(active)
+
+    # Cross-check: workers with a LIVE /goal but NO active cc-task = untracked
+    # work. This decoupling (a worker's core task closed, but the worker kept
+    # exploring new angles with no new task) makes the report under-count real
+    # activity. Surfacing it auto-flags the gap each hour.
+    reg = Path.home() / ".cc-manager" / "workers.json"
+    if reg.exists():
+        try:
+            workers = json.loads(reg.read_text()).get("workers", [])
+        except Exception:
+            workers = []
+        tracked = {t["assignee"] for t in active}
+        untracked = [w for w in workers
+                     if w.get("status") == "active"
+                     and (w.get("current_goal") or "").strip()
+                     and w.get("name") not in tracked]
+        print(f"\n  ⚠ Untracked work — live /goal but NO active task ({len(untracked)}):")
+        if untracked:
+            for w in untracked:
+                print(f"  ⚠ {w['name']:<12} → {(w.get('current_goal') or '')[:75]}")
+        else:
+            print("  (none — every active worker's goal is tracked by a task)")
+
+    if not args.dry_run:
+        all_done = [t["id"] for t in tasks.values()
+                    if t["status"] in ("completed", "cancelled")]
+        REPORTED_FILE.write_text(json.dumps(sorted(set(all_done))))
+
+
+def cmd_summary(args):
+    tasks = list(materialize(load_events()).values())
+    if args.days:
+        cutoff = datetime.now() - timedelta(days=args.days)
+        tasks = [t for t in tasks if datetime.fromisoformat(t["created_at"]) >= cutoff]
+    from collections import Counter
+    by_status = Counter(t["status"] for t in tasks)
+    by_assignee = Counter(t["assignee"] for t in tasks)
+    print(f"\n  Total tasks: {len(tasks)}" + (f" (last {args.days}d)" if args.days else ""))
+    print(f"  By status: {dict(by_status)}")
+    print(f"  By assignee: {dict(by_assignee)}")
+    active = [t for t in tasks if t["status"] in ACTIVE_STATUSES]
+    print(f"\n  Active ({len(active)}):")
+    fmt_table(sorted(active, key=lambda t: t["created_at"]))
+
+
+def cmd_fleet(args):
+    """Per cron-supervised worker: task-status counts + a single status token.
+
+    A worker is ACTIVE if it has ≥1 task in assigned/in_progress. Else BLOCKED if
+    it has ≥1 blocked task (and no active one). Else IDLE (all done/cancelled, or
+    no tasks at all). Used by cc-watch's cost-guard: when every worker is
+    BLOCKED/IDLE there is nothing actionable to nudge. Prints one line per worker
+    plus an OVERALL verdict, and exits 1 when NO worker is ACTIVE (all-idle),
+    0 otherwise — so a shell caller can branch on `cc-task fleet`'s exit code.
+    """
+    tasks = list(materialize(load_events()).values())
+    workers = sorted(watch_workers())
+    any_active = False
+    for w in workers:
+        mine = [t for t in tasks if t["assignee"] == w]
+        active = sum(1 for t in mine if t["status"] in ("assigned", "in_progress"))
+        blocked = sum(1 for t in mine if t["status"] == "blocked")
+        done = sum(1 for t in mine if t["status"] in ("completed", "cancelled"))
+        if active:
+            token = "ACTIVE"
+            any_active = True
+        elif blocked:
+            token = "BLOCKED"
+        else:
+            token = "IDLE"
+        print(f"  {w:<12} {token:<8} active={active} blocked={blocked} done={done}")
+    n_active = sum(
+        1 for w in workers
+        if any(t["assignee"] == w and t["status"] in ("assigned", "in_progress")
+               for t in tasks)
+    )
+    verdict = "HAS_ACTIVE" if any_active else "ALL_IDLE"
+    print(f"  OVERALL: {verdict} ({n_active}/{len(workers)} workers active)")
+    sys.exit(0 if any_active else 1)
+
+
+def cmd_goalfor(args):
+    """Print '<TID>|<description>' for <worker>'s open task, for re-goaling after a
+    /clear unwedge (cc-watch's self-heal). Prefers in_progress over assigned. Exits
+    1 (prints nothing) if the worker has no open task — caller skips the re-goal."""
+    tasks = list(materialize(load_events()).values())
+    mine = [t for t in tasks if t["assignee"] == args.worker
+            and t["status"] in ("assigned", "in_progress")]
+    if not mine:
+        sys.exit(1)
+    mine.sort(key=lambda t: 0 if t["status"] == "in_progress" else 1)
+    t = mine[0]
+    print(f'{t["id"]}|{t["description"]}')
+
+
+_ZH_STATUS = {
+    "assigned": "待开始",
+    "in_progress": "进行中",
+    "blocked": "⛔阻塞",
+    "completed": "✅完成",
+    "cancelled": "✖取消",
+}
+
+
+def _is_paid_review(t: dict) -> bool:
+    """paid-review stubs are manager-owned subscription approvals, not research
+    main-lines. They dominate the raw log (many dup subscription records) and bury
+    the few real open tasks — so the mainline view filters them out.
+
+    NB: filter on owner/description, NOT the `category` tag — a real worker task
+    can be tagged `paid-review` merely because it activates a subscription,
+    and must stay visible."""
+    return (
+        t.get("assignee") == "manager"
+        or "[paid-review]" in (t.get("description") or "")
+    )
+
+
+def _last_ts(t: dict) -> str:
+    evs = t.get("events") or []
+    return evs[-1].get("ts", t.get("created_at", "")) if evs else t.get("created_at", "")
+
+
+import re as _re
+
+# Keyword → work-line (主线) map. Tried only after a project-path lookup
+# fails. Order matters: first match wins, so put specific tokens before generic.
+# Populate with the keyword→line pairs that fit your own project's work-lines.
+_LINE_KEYWORDS = [
+    ("frontend", "frontend"), ("ui", "frontend"),
+    ("backend", "backend"), ("api", "backend"),
+    ("infra", "infra"), ("deploy", "infra"),
+    ("docs", "docs"), ("research", "research"),
+]
+
+
+def _line_key(t: dict) -> str:
+    """Derive a task's 主线 (work line), independent of which worker holds it.
+
+    Workers get reused across lines, so owner is a poor index. Prefer the project
+    folder named in deliverable/ref; else a keyword in the description; else fall
+    back to owner so nothing is dropped from the grouping. Adjust the path regex
+    to your repo's project-folder convention."""
+    for field in (t.get("deliverable"), t.get("ref")):
+        if field:
+            m = _re.search(r"projects/([^/]+)", field)
+            if m:
+                return m.group(1)
+    blob = (t.get("description") or "").lower()
+    for token, line in _LINE_KEYWORDS:
+        if token in blob:
+            return line
+    return f"~{t.get('assignee', '?')}"  # ~ marks an owner-fallback (no line tag)
+
+
+def _mainline_row(t: dict, w_id: int, w_own: int, w_st: int, *, show_owner: bool = True,
+                  width: int | None = None) -> str:
+    desc = (t["description"] or "").replace("\n", " ")
+    if width and len(desc) > width:
+        desc = desc[: width - 1] + "…"
+    st = _ZH_STATUS.get(t["status"], t["status"])
+    own = t["assignee"] if show_owner else ""
+    return f"{t['id']:<{w_id}}{own:<{w_own}}{st:<{w_st}}{desc}"
+
+
+def cmd_mainline(args):
+    """主线视图 — guaranteed-complete, noise-free task index.
+
+    Rebuilds every task from the append-only log (so nothing can be silently
+    dropped), filters out paid-review subscription stubs, then shows OPEN
+    main-lines first followed by the most-recent closed ones, capped at --limit
+    rows total. Columns: task / owner / 状态 / 主线. Read-only.
+
+    --by-owner: group every task under its owner (owners with an OPEN task first),
+    instead of the flat OPEN-then-recent layout. Ignores --limit."""
+    tasks = list(materialize(load_events()).values())
+    tasks = [t for t in tasks if not _is_paid_review(t)]
+    w_id, w_own, w_st = 12, 13, 8
+
+    open_rows = sorted(
+        [t for t in tasks if t["status"] in ACTIVE_STATUSES],
+        key=_last_ts, reverse=True,
+    )
+    closed_rows = sorted(
+        [t for t in tasks if t["status"] in ("completed", "cancelled")],
+        key=_last_ts, reverse=True,
+    )
+    done = sum(1 for t in closed_rows if t["status"] == "completed")
+    canc = sum(1 for t in closed_rows if t["status"] == "cancelled")
+    footer = (
+        f"全量: OPEN {len(open_rows)} + 关闭 {len(closed_rows)}"
+        f"(✅{done}/✖{canc}) = {len(tasks)} 主线  "
+        f"[tasks.jsonl 重建·无遗漏·已滤paid]"
+    )
+
+    nested = not (args.by_owner or args.by_line or args.flat)
+    if nested or args.by_owner or args.by_line:
+        from collections import defaultdict
+        import unicodedata
+
+        def _w(s):  # display width (CJK/emoji = 2)
+            return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+
+        def _pad(s, n):
+            return s + " " * max(0, n - _w(s))
+
+        def _clip(s, n):
+            while _w(s) > n and s:
+                s = s[:-1]
+            return s
+
+        def _order(grp):  # groups with an OPEN task first, then most-recent desc
+            ks = sorted(grp, key=lambda g: max(_last_ts(t) for t in grp[g]), reverse=True)
+            return sorted(ks, key=lambda g: not any(t["status"] in ACTIVE_STATUSES
+                                                    for t in grp[g]))
+
+        def _row(lcol, ocol, t, w_line, w_own2, w_id2, w_st2):
+            st = _ZH_STATUS.get(t["status"], t["status"])
+            task = (t["description"] or "").replace("\n", " ")
+            if args.width and len(task) > args.width:
+                task = task[: args.width - 1] + "…"
+            return (_pad(lcol, w_line) + _pad(ocol, w_own2) + _pad(t["id"], w_id2)
+                    + _pad(st, w_st2) + task)
+
+        w_line, w_own2, w_id2, w_st2 = 16, 14, 12, 9
+
+        if nested:  # two-level 主线 → owner; cap args.limit tasks PER 主线 (default 5)
+            lines: dict[str, list[dict]] = defaultdict(list)
+            for t in tasks:
+                lines[_line_key(t)].append(t)
+            print(_pad("主线", w_line) + _pad("owner", w_own2) + _pad("task", w_id2)
+                  + _pad("状态", w_st2) + "任务")
+            print("-" * 100)
+            for lk in _order(lines):
+                ltasks = lines[lk]
+                n_open_l = sum(1 for t in ltasks if t["status"] in ACTIVE_STATUSES)
+                ltag = _clip(lk + (f" 🔴{n_open_l}" if n_open_l else ""), w_line - 1)
+                owners: dict[str, list[dict]] = defaultdict(list)
+                for t in ltasks:
+                    owners[t["assignee"]].append(t)
+                line_first = True
+                shown_n = 0
+                for ow in _order(owners):
+                    if shown_n >= args.limit:
+                        break
+                    rows = sorted(owners[ow], key=_last_ts, reverse=True)
+                    take = rows[: args.limit - shown_n]
+                    own_first = True
+                    for t in take:
+                        print(_row(ltag if line_first else "",
+                                   _clip(ow, w_own2 - 1) if own_first else "",
+                                   t, w_line, w_own2, w_id2, w_st2))
+                        line_first = own_first = False
+                    shown_n += len(take)
+                remaining = len(ltasks) - shown_n
+                if remaining > 0:
+                    print(_pad("", w_line) + _pad("", w_own2)
+                          + f"… +{remaining} 更多 (--limit 调整)")
+                print("-" * 100)
+            print(footer)
+            return
+
+        # single-axis: --by-owner or --by-line
+        keyfn = _line_key if args.by_line else (lambda t: t["assignee"])
+        label = "主线" if args.by_line else "owner"
+        groups: dict[str, list[dict]] = defaultdict(list)
+        for t in tasks:
+            groups[keyfn(t)].append(t)
+        print(_pad(label, w_line) + _pad("owner", w_own2) + _pad("task", w_id2)
+              + _pad("状态", w_st2) + "任务")
+        print("-" * 100)
+        for g in _order(groups):
+            rows = sorted(groups[g], key=_last_ts, reverse=True)
+            n_open = sum(1 for t in rows if t["status"] in ACTIVE_STATUSES)
+            shown = rows[: args.limit]
+            gtag = _clip(g + (f" 🔴{n_open}" if n_open else ""), w_line - 1)
+            for i, t in enumerate(shown):
+                print(_row(gtag if i == 0 else "", t["assignee"],
+                           t, w_line, w_own2, w_id2, w_st2))
+            if len(rows) > len(shown):
+                print(_pad("", w_line) + f"… +{len(rows) - len(shown)} 更多 (--limit 调整)")
+            print("-" * 100)
+        print(footer)
+        return
+
+    view = open_rows + closed_rows[: max(0, args.limit - len(open_rows))]
+    w_line = 11
+    print(f"{'task':<{w_id}}{'owner':<{w_own}}{'状态':<{w_st}}{'主线':<{w_line}}任务")
+    print("-" * 92)
+    for t in view:
+        st = _ZH_STATUS.get(t["status"], t["status"])
+        line = _line_key(t)
+        if len(line) >= w_line:
+            line = line[: w_line - 2] + "…"
+        task = (t["description"] or "").replace("\n", " ")
+        if args.width and len(task) > args.width:
+            task = task[: args.width - 1] + "…"
+        print(f"{t['id']:<{w_id}}{t['assignee']:<{w_own}}{st:<{w_st}}{line:<{w_line}}{task}")
+    print("-" * 92)
+    print(footer)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    pa = sub.add_parser("add", help="create a new task")
+    pa.add_argument("description")
+    pa.add_argument("--assignee", required=True)
+    pa.add_argument("--deliverable", help="expected output (file path)")
+    pa.add_argument("--ref", help="reference link/issue")
+    pa.add_argument("--blocked-on", dest="blocked_on", help="upstream task ID that must complete first")
+    pa.add_argument("--category", help="optional tag (e.g. paid-review / regime / alt-data)")
+    pa.set_defaults(func=cmd_add)
+
+    pd = sub.add_parser("done", help="mark task completed")
+    pd.add_argument("id")
+    pd.add_argument("--verdict", help="one-line summary of outcome")
+    pd.add_argument("--artifact", help="commit SHA / file path of deliverable")
+    pd.set_defaults(func=cmd_done)
+
+    pb = sub.add_parser("block", help="mark blocked")
+    pb.add_argument("id")
+    pb.add_argument("reason")
+    pb.set_defaults(func=cmd_block)
+
+    pu = sub.add_parser("unblock", help="resume blocked task")
+    pu.add_argument("id")
+    pu.set_defaults(func=cmd_unblock)
+
+    pc = sub.add_parser("cancel", help="cancel task")
+    pc.add_argument("id")
+    pc.add_argument("reason", nargs="?")
+    pc.set_defaults(func=cmd_cancel)
+
+    pr = sub.add_parser("reassign", help="change assignee")
+    pr.add_argument("id")
+    pr.add_argument("new_assignee")
+    pr.set_defaults(func=cmd_reassign)
+
+    ps = sub.add_parser("start", help="mark in_progress")
+    ps.add_argument("id")
+    ps.set_defaults(func=cmd_start)
+
+    psd = sub.add_parser("set-deliverable", help="point a task at its concrete verdict file (for completion-integrity)")
+    psd.add_argument("id")
+    psd.add_argument("deliverable")
+    psd.set_defaults(func=cmd_set_deliverable)
+
+    pg = sub.add_parser("get", help="show full task detail")
+    pg.add_argument("id")
+    pg.set_defaults(func=cmd_get)
+
+    pl = sub.add_parser("list", help="list tasks (active by default; --all for full ledger)")
+    pl.add_argument("--worker")
+    pl.add_argument("--status", choices=["assigned", "in_progress", "blocked", "completed", "cancelled"])
+    pl.add_argument("--all", action="store_true", help="include cancelled/completed (full ledger)")
+    pl.set_defaults(func=cmd_list)
+
+    pp = sub.add_parser("pending", help="active tasks only")
+    pp.add_argument("--worker")
+    pp.set_defaults(func=cmd_pending)
+
+    psum = sub.add_parser("summary", help="aggregate stats")
+    psum.add_argument("--days", type=int)
+    psum.set_defaults(func=cmd_summary)
+
+    prep = sub.add_parser("report", help="hourly report: active + first-sighting of finished tasks")
+    prep.add_argument("--dry-run", action="store_true", help="don't update the seen-set (preview only)")
+    prep.set_defaults(func=cmd_report)
+
+    pf = sub.add_parser("fleet", help="per-worker task status; exit 1 if all workers idle/blocked")
+    pf.set_defaults(func=cmd_fleet)
+
+    pgf = sub.add_parser("goalfor", help="print 'TID|description' of <worker>'s open task (for re-goal after unwedge)")
+    pgf.add_argument("worker")
+    pgf.set_defaults(func=cmd_goalfor)
+
+    pm = sub.add_parser("mainline", help="主线视图: OPEN tasks + recent closed, paid-review filtered (read-only)")
+    pm.add_argument("--limit", type=int, default=5, help="max tasks per group (default 5: 每主线展示最近 5 个); rows in flat view")
+    pm.add_argument("--flat", action="store_true", help="flat one-row-per-task view (opt out of default 主线 grouping)")
+    pm.add_argument("--by-owner", action="store_true", help="group all tasks under each worker")
+    pm.add_argument("--by-line", action="store_true", help="group by research line 主线 (this is the DEFAULT)")
+    pm.add_argument("--width", type=int, default=None, help="truncate task text to N chars (default: full)")
+    pm.set_defaults(func=cmd_mainline)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

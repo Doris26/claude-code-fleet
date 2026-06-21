@@ -1,0 +1,1693 @@
+#!/bin/bash
+# cc-watch: iterate over all sessions in ~/.cc-manager/watch.list and auto-send a
+# SUBSTANTIVE brain reply (GOAL/GRILL/DR via cc-decide) when idle. Bare "继续" is
+# BANNED (operator lesson: "always give a goal, never just say 继续") — if the brain has nothing
+# substantive, it returns empty (SKIP) and cc-watch sends NOTHING.
+# Per-session state in /tmp/cc-watch-<name>.{pane,hash}.
+# Logs one line per session per fire to stdout (captured to /tmp/cc-manager.log by launchd).
+set -uo pipefail
+
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/sbin:$PATH"
+# FIX 1(c): BOOT SELF-TEST. If the core toolchain is unreachable under PATH, ABORT LOUD instead
+# of silently false-orphaning the whole live fleet (a clobbered PATH made tmux/cc-task "command
+# not found", errors swallowed by 2>/dev/null, has-session returns 127 → "confirmed dead").
+command -v tmux ts cc-task cc-decide >/dev/null 2>&1 || { echo "$(date '+%F %T') CRIT: cc-watch toolchain unreachable under PATH=$PATH — aborting (would otherwise false-orphan the live fleet)" | tee -a /tmp/cc-manager.log >&2; exit 1; }
+# FIX 5a: CONDITIONAL verifier-creds source so the result-id verifier (run via cc-review) works under
+# launchd, which has none of the verification-plugin's API creds in its env. Harmless no-op if the file
+# is absent; auto-activates result-id verification the moment the user drops creds at ~/.cc-manager/qc.env
+# (we do NOT make a missing-creds SKIP a hard FAIL — that half is escalated to the user). `set -a` exports
+# everything the file sources.
+[ -f "$HOME/.cc-manager/qc.env" ] && { set -a; . "$HOME/.cc-manager/qc.env"; set +a; }
+# Numeric stamp read — scrub to digits so a corrupt/partial /tmp stamp can NEVER abort the
+# whole tick via set -u arithmetic (grill 2026-06-13 #13/#14/#15). Returns 0 if empty/garbage.
+_numread() { local v; v=$(cat "$1" 2>/dev/null); v=${v//[^0-9]/}; printf %s "${v:-0}"; }
+
+# self-audit #5: LOCAL user-notify primitive (cc-notify: macOS notification + durable
+# escalations.log, per-topic dedup). Falls back to the in-repo path if the ~/.local/bin symlink
+# isn't installed yet. Best-effort — a notify failure must never abort the tick.
+_CC_NOTIFY="$HOME/.local/bin/cc-notify"
+# FIX 1(b): fallback derived from THIS script's dir (cc-notify is a sibling in bin/),
+# not a hardcoded /home/ubuntu path that does not exist on this box.
+_SCRIPT_DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
+[ -x "$_CC_NOTIFY" ] || _CC_NOTIFY="${_SCRIPT_DIR:-.}/cc-notify"
+_notify_user() { [ -x "$_CC_NOTIFY" ] && "$_CC_NOTIFY" "$1" "$2" >/dev/null 2>&1 || true; }
+
+CFG="$HOME/.cc-manager/watch.list"
+NOW=$(date '+%Y-%m-%d %H:%M:%S')
+
+if [ ! -f "$CFG" ]; then
+    echo "$NOW err: $CFG missing"
+    exit 0
+fi
+
+# Single-instance lock — if previous cc-watch still running, skip this tick.
+# launchd fires every 1800s (30min) (plist StartInterval); a tick may take 100-200s (more with
+# cc-review headless calls). If a slow cycle overlaps the next fire, this lock makes the
+# skip explicit + recoverable.
+# Grill 2026-06-13 fixes: (a) ATOMIC acquire via `mkdir` (the old `[ -f ] … echo $$` was a
+# TOCTOU race — two instances, e.g. the launchd tick + the documented manual run, could BOTH
+# acquire and then corrupt shared /tmp state + double-increment the 2-cycle kill state machines);
+# (b) MTIME stale-steal — a HUNG holder (tick wedged on a headless call / SIGKILLed with a reused
+# PID) used to make every future tick self-skip FOREVER (supervision silently dead). Now a holder
+# older than LOCK_MAX_AGE is stolen so the supervisor self-heals; (c) ownership-aware cleanup.
+LOCKDIR="/tmp/cc-watch.lock.d"
+LOCK_MAX_AGE=1800   # 30min — generous: a tick w/ several cc-review headless calls can be long; only a
+                    # genuinely wedged holder ages out. Live ticks refresh mtime (below) so they never age.
+LOCK_TOKEN="$$:$(date +%s)"   # grill #2 fix: PID alone reuses; pid:start-second is effectively unique
+if ! mkdir "$LOCKDIR" 2>/dev/null; then
+    prev_pid=$(cat "$LOCKDIR/pid" 2>/dev/null || echo "")
+    lock_mtime=$(stat -f %m "$LOCKDIR" 2>/dev/null || echo 0)
+    age=$(( $(date +%s) - lock_mtime ))
+    # Steal ONLY if the holder is dead, OR provably hung (alive but mtime not refreshed past MAX_AGE).
+    # grill #3 fix: a live tick touches LOCKDIR each worker iteration, so a healthy-but-slow tick keeps
+    # age small and is NOT stolen; only a wedged holder (not touching) ages out.
+    if [ -n "$prev_pid" ] && kill -0 "$prev_pid" 2>/dev/null && [ "$age" -lt "$LOCK_MAX_AGE" ]; then
+        echo "$NOW skip: previous cc-watch pid=$prev_pid still running (age ${age}s)"
+        exit 0
+    fi
+    echo "$NOW WARN: stealing stale cc-watch lock (pid=${prev_pid:-?} age=${age}s — dead or hung >$LOCK_MAX_AGE s)"
+    rm -rf "$LOCKDIR"
+    mkdir "$LOCKDIR" 2>/dev/null || { echo "$NOW skip: lost lock-steal race"; exit 0; }
+fi
+echo $$ > "$LOCKDIR/pid"
+printf '%s' "$LOCK_TOKEN" > "$LOCKDIR/token"
+# grill #2 fix: ownership-aware cleanup — only remove the lock if WE still own it (our token). A
+# finishing holder that was already STOLEN (token differs) must NOT delete the stealer's live lock.
+trap '[ "$(cat "$LOCKDIR/token" 2>/dev/null)" = "$LOCK_TOKEN" ] && rm -rf "$LOCKDIR"' EXIT INT TERM
+
+# ── Spend-freeze gate (with zero-token resume) ────────────────────────────────
+# During a 5h/spend-limit freeze every worker message is EATEN and every cc-decide
+# brain call is a wasted spend-attempt. Gate the whole tick: FROZEN → log + exit
+# (no brains, no sends, no cc-review). This exit-0 is what actually prevented the
+# flood (NOT the in-watch_one limit-gate, which never runs when we exit here).
+#
+# ZERO-TOKEN RESUME (operator lesson: "make sure cron comes back without burning tokens"): the old code ran a
+# headless haiku probe EVERY tick that banners showed (~16 probes over a 4h freeze) —
+# needed because reset-stale banners never refresh on their own, so pane-grep alone
+# would stay frozen forever. New design splits detection from confirmation:
+#   1. Detect banners with `--panes-only` (pure pane grep, ZERO token) — the fast path.
+#   2. Run the authoritative haiku probe only every 4th frozen tick (~hourly), not every
+#      tick → 4× fewer probe tokens while still auto-resuming within ~1h of reset.
+#   3. The expensive Opus worker pings stay gated behind the exit-0 the whole time.
+# So: zero Opus spend + ~1 haiku/hour while frozen, and resume needs NO manual step.
+panes_frozen=$(cc-freeze-check --panes-only 2>/dev/null)
+if echo "$panes_frozen" | grep -q "^OVERALL: FROZEN"; then
+    PCNT="$HOME/.cc-manager/.freeze_probe_count"; n=0
+    n=$(_numread "$PCNT")
+    if [ "$((n % 4))" -eq 0 ]; then
+        # hourly authoritative probe — banners may be stale (reset already happened)
+        verdict=$(cc-freeze-check 2>/dev/null)
+        if echo "$verdict" | grep -q "^OVERALL: FROZEN"; then
+            echo "$((n + 1))" > "$PCNT"
+            echo "$verdict" | sed "s/^/$NOW [freeze] /"
+            echo "$NOW [freeze] CONFIRMED frozen via probe — skip tick (next probe in ~1h)"
+            exit 0
+        fi
+        # probe says tokens flow → reset happened; clear counter and fall through to resume
+        rm -f "$PCNT"
+        # grill #1 fix (stale-banner circular trap): the haiku probe PROVED tokens flow, but worker
+        # panes still show the stale banner (panes only refresh when a turn renders) → watch_one's
+        # per-worker banner gate would re-freeze every worker, send nothing, no turn renders, and the
+        # next tick's panes-only grep is STILL frozen → fleet stuck forever. Drop a fresh resume marker;
+        # the per-worker gate TRUSTS the probe for this one tick (sends instead of re-freezing, which
+        # refreshes the pane and clears the stale banner).
+        date +%s > "$HOME/.cc-manager/.freeze_resume"
+        echo "$NOW [freeze] probe=ok → tokens back, RESUMING supervision (resume-override set; de-sync downstream)"
+    else
+        echo "$((n + 1))" > "$PCNT"
+        echo "$NOW [freeze] banners present, probe throttled (tick $n/4) — skip, ZERO token spent this tick"
+        exit 0
+    fi
+else
+    # Grill 2026-06-13 #23: fleet not frozen → clear the probe counter so the NEXT freeze episode
+    # starts its throttle at 0 (else a stale count delayed the first authoritative probe up to ~45min).
+    rm -f "$HOME/.cc-manager/.freeze_probe_count"
+fi
+
+# ── FLEET-FREEZE account guard (FIX 3) ────────────────────────────────────────
+# Documented incident: the active oauthAccount flipped to ANOTHER email mid-session and workers were
+# nudged/supervised under the WRONG account. spawn (cc-recruit) and respawn/restart (cc-keepalive:80-82)
+# were already account-guarded, but cc-watch's ~48x/day per-tick supervision/nudge/repoke path was NOT.
+# Guard the WHOLE tick at the TOP (before keepalive / cc-review repoke / per-worker nudge sends): read
+# oauthAccount.emailAddress from ~/.claude.json; if it != the expected account, log + notify ONCE
+# (date-keyed dedup) and SKIP the tick entirely (send nothing, exit cleanly). A missing/unreadable
+# ~/.claude.json makes _acct empty → != EXPECT_ACCT → safe skip (treated as drift, sends nothing).
+# Mirrors cc-keepalive:80-82's exact var names + account string. `ts` (the universal send primitive)
+# is deliberately NOT modified — this loop-level guard covers the high-frequency send path.
+EXPECT_ACCT="${CC_EXPECT_ACCT:-you@example.com}"
+CC_BOT_NAME="${CC_BOT_NAME:-}"
+_acct() { python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.claude.json')))['oauthAccount']['emailAddress'])" 2>/dev/null; }
+_cc_acct=$(_acct)
+if [ "$_cc_acct" != "$EXPECT_ACCT" ]; then
+    echo "$NOW [acct-guard] FLEET FREEZE — active account is '${_cc_acct:-?}' not $EXPECT_ACCT — skipping tick (no nudge/send/repoke)"
+    _acct_stamp="$HOME/.cc-manager/.acct-drift.$(date '+%Y-%m-%d').sent"
+    if [ ! -f "$_acct_stamp" ]; then
+        mkdir -p "$HOME/.cc-manager" 2>/dev/null || true
+        echo "$NOW [acct-guard] account is '${_cc_acct:-?}' not $EXPECT_ACCT — cc-watch tick frozen (workers NOT nudged under wrong account)" >> "$HOME/.cc-manager/escalations.log"
+        _notify_user "acct-drift-$(date '+%Y-%m-%d')" "cc-watch FLEET FREEZE: oauthAccount is '${_cc_acct:-?}' not $EXPECT_ACCT — supervision/nudges skipped until restored"
+        touch "$_acct_stamp"
+    fi
+    exit 0
+fi
+
+# ── Keepalive: time-boxed "run until deadline OR terminal verdict" ──
+# Runs BEFORE the cost-guard so a kept worker is restarted/re-nudged even with no open cc-task
+# (a worker stopped at its first DEAD verdict at 3.5h of an 8h box, then its session died and sat
+# dead 7h). cc-keepalive tick: dead session → respawn; idle → re-nudge next angle; deadline → release.
+if [ -x "$HOME/.local/bin/cc-keepalive" ]; then
+    "$HOME/.local/bin/cc-keepalive" tick 2>&1 | sed 's/^/[keepalive] /'
+fi
+
+# ── Registry↔tmux reconcile (self-audit #6) ──────────────────────────────────
+# A status=active worker whose tmux pane has DIED rots in workers.json and makes cc-monitor emit
+# false flags (stale-deliverable / deadlock / repeated-nudge) on a worker that no longer exists —
+# the exact thing the manager just hand-triaged. Cheap idempotent pass: for each active worker
+# whose tmux session is ABSENT → status=orphaned + orphaned_at, drop from watch.list, notify once.
+# The 'manager' session is exempt (it's this supervisor, not a worker).
+_LIVE_SESS=$(tmux ls -F '#{session_name}' 2>/dev/null | tr '\n' ',')
+# FIX 1(b) — transient `tmux ls` failure guard. A glitched/empty `tmux ls` snapshot used to
+# false-orphan + cc-rm EVERY active worker (FIRED in prod once: a worker that was alive + freshly
+# committed got retired off an empty list). The 'manager' session is ALWAYS live, so an EMPTY
+# snapshot while `tmux has-session -t manager` SUCCEEDS proves `tmux ls` glitched, not that the
+# fleet died → SKIP the whole orphan-reconcile pass this tick (mirror the per-session idiom used
+# at the cc-review/keepalive has-session checks). A genuinely-empty fleet keeps the manager live.
+if [ -z "$_LIVE_SESS" ] && tmux has-session -t manager 2>/dev/null; then
+    echo "$NOW [reconcile] tmux ls returned EMPTY but manager session is live → transient tmux failure, SKIP orphan-reconcile this tick"
+else
+    # python lists ONLY CANDIDATES (status=active + not in the list snapshot) — it does NOT mutate
+    # workers.json. The bash loop below re-confirms each candidate with a DIRECT per-session
+    # `tmux has-session` (FIX 1(a)) and only the still-confirmed-dead ones are flipped + cc-rm'd.
+    _orphan_cands=$(LIVE="$_LIVE_SESS" python3 - "$HOME/.cc-manager/workers.json" <<'PY' 2>/dev/null
+import json, os, sys
+live = set(s for s in os.environ.get("LIVE", "").split(",") if s)
+p = sys.argv[1]
+try:
+    d = json.load(open(p))
+except Exception:
+    sys.exit(0)
+for w in d.get("workers", []):
+    name = w.get("name")
+    if not name or name == "manager":
+        continue
+    sess = w.get("tmux") or name
+    if w.get("status") == "active" and sess not in live:
+        # emit "name<TAB>sess" so bash can re-confirm the ACTUAL tmux session (which may differ
+        # from name) before retiring it.
+        print(f"{name}\t{sess}")
+PY
+)
+    _confirmed_orphans=""
+    if [ -n "$_orphan_cands" ]; then
+        while IFS=$'\t' read -r _ow _osess; do
+            [ -z "$_ow" ] && continue
+            [ -z "$_osess" ] && _osess="$_ow"
+            # FIX 1(a) — DIRECT per-session re-confirm. A worker present in the per-session check is
+            # NOT orphaned regardless of the racy list snapshot (the list could have glitched for just
+            # this row). Only a has-session that returns FALSE (non-zero) is a genuine orphan.
+            if tmux has-session -t "$_osess" 2>/dev/null; then
+                echo "$NOW [reconcile] $_ow absent from tmux-ls snapshot but has-session=ALIVE → NOT orphaned (snapshot race)"
+                continue
+            fi
+            _confirmed_orphans="${_confirmed_orphans}${_ow}"$'\n'
+        done <<< "$_orphan_cands"
+    fi
+    # Persist status=orphaned ONLY for the confirmed-dead set, then notify + drop from watch.list.
+    if [ -n "$_confirmed_orphans" ]; then
+        _orphaned=$(CONFIRMED="$_confirmed_orphans" python3 - "$HOME/.cc-manager/workers.json" <<'PY' 2>/dev/null
+import json, os, sys
+from datetime import datetime
+confirmed = set(s for s in os.environ.get("CONFIRMED", "").split("\n") if s.strip())
+p = sys.argv[1]
+try:
+    d = json.load(open(p))
+except Exception:
+    sys.exit(0)
+changed = []
+for w in d.get("workers", []):
+    name = w.get("name")
+    if name in confirmed and w.get("status") == "active":
+        w["status"] = "orphaned"
+        w["orphaned_at"] = datetime.now().isoformat()
+        changed.append(name)
+if changed:
+    d["updated"] = datetime.now().strftime("%Y-%m-%d")
+    open(p, "w").write(json.dumps(d, indent=2))
+    print("\n".join(changed))
+PY
+)
+        if [ -n "$_orphaned" ]; then
+            while IFS= read -r _ow; do
+                [ -z "$_ow" ] && continue
+                echo "$NOW [reconcile] $_ow status=active but tmux pane GONE (has-session confirmed dead) → marked orphaned + dropped from watch.list"
+                cc-rm "$_ow" >/dev/null 2>&1 || true
+                _notify_user "orphaned:$_ow" "$_ow was status=active but its tmux session died — marked orphaned + removed from watch.list (recruit to restart, or leave retired)"
+            done <<< "$_orphaned"
+        fi
+    fi
+fi
+
+# cc-review: MANAGER-SPAWNED dual review of newly-landed commits (added 2026-06-13).
+# self-audit #3 FIX: MOVED above the idle-fleet cost-guard `exit 0` (it used to sit at the very end of
+# the tick, so a new commit landed UNREVIEWED whenever the fleet was idle — the dominant steady state).
+# Review is keyed ONLY on "a new commit exists since the last reviewed sha", NOT on fleet activity, so it
+# must run before any fleet-idle early-exit. It sits AFTER the freeze gate + lock (a FROZEN tick already
+# exited) and keeps its OWN spend-limit guard (_cr_limited) so it never burns tokens during a freeze.
+# THIS is what makes review non-skippable and answers "who invokes this flow" (operator lesson):
+# cc-watch invokes it — not the worker, not a human. Commits land on shared main, so this runs ONCE
+# per tick (not per worker). For each new commit since the last reviewed sha, spawn cc-review (2x
+# headless claude -p: a logic-grill + a code/metric-ledger check), which writes .cc-review/<sha>.json
+# and logs the verdict. Capped at 3 new commits/tick so a burst can't stall the supervisor or blow token budget.
+# FAIL is auto-attributed to the owning worker (by path-prefix) and the repoke text is sent to its pane
+# (loop closure — the manager owns goal-align + drives the research ladder; the reviewer shares the correctness load):
+# FAIL → attribute → repoke → worker fixes → next commit → re-review → until PASS. Guards against the
+# two original deferral risks: (a) attribution uses a stable path-prefix map (not the mutable registry),
+# (b) a repoke is skipped if the target pane shows a 5h usage-limit banner (don't feed a limited pane),
+# and each sha is repoked at most once (.repoked stamp).
+CCREVIEW="$HOME/.local/bin/cc-review"
+[ -x "$CCREVIEW" ] || CCREVIEW="$HOME/.local/bin/cc-review"
+if [ -x "$CCREVIEW" ]; then
+    REPO_CR="${CC_REPO:-$HOME/your-repo}"
+    STAMP="$HOME/.cc-manager/.last_reviewed_sha"
+    # FIX 1: attribution must follow the LIVE fleet, not a stale static map. The old code keyed ONLY
+    # on the static PREFIX (which can point at DEAD workers) → a live worker on a newly-added dir
+    # matched NO owner → cc-review FAILs went UNROUTED while the cursor advanced
+    # (repoke loop non-functional for the live fleet). New order: (1) LIVE roster — for each touched
+    # path, the status=="active" worker whose tmux session is alive AND whose current_goal/role/name
+    # matches a path token; (2) static PREFIX as LAST-RESORT fallback;
+    # (3) if STILL nothing, the SOLE live non-manager worker. Output shape unchanged (distinct owners,
+    # one per line). Live-session check shells out to `tmux has-session`.
+    _owner_of() {  # $1 = newline-list of touched paths; echoes ALL distinct owners (one per line)
+        printf '%s\n' "$1" | WORKERS="$HOME/.cc-manager/workers.json" python3 -c '
+import sys, os, json, re, subprocess
+# grill #4 fix: use SPECIFIC trailing-slash prefixes — a too-broad prefix ("src/area")
+# used to swallow sibling subdirs (area-a, area-b) and route them all to one worker.
+# This static fallback map is repo-specific; populate it with your own path-prefix ->
+# worker-name pairs. The shape is what matters: (path-prefix, worker-name) tuples.
+PREFIX=[("src/area-one/","worker_a"),("src/area-two/","worker_b"),
+        ("src/area-three/","worker_c"),("bin/some_tool","worker_d")]
+paths=[l.strip() for l in sys.stdin if l.strip()]
+
+def alive(sess):
+    try:
+        return subprocess.run(["tmux","has-session","-t",sess],
+                              stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode==0
+    except Exception:
+        return False
+
+# --- live roster: active + tmux-alive workers ---
+# FIX A: ALSO collect the set of status=active worker NAMES (regardless of tmux liveness) so the
+# static PREFIX fallback can refuse to attribute a FAIL to a RETIRED/completed/orphaned worker (e.g.
+# a worker whose status is retired) — a stale-map match there routes the FAIL to a dead worker, the repoke
+# loop has-session check fails, the FAIL is escalated manual-route-owed + the cursor advances → a FAIL
+# on the LIVE work area is silently dropped. Only status=active workers are valid PREFIX targets. We
+# do NOT admit completed-but-live workers (a completed worker is not active) — ACTIVE only.
+live=[]
+active_names=set()
+try:
+    reg=json.loads(open(os.environ["WORKERS"]).read())
+    for w in reg.get("workers",[]):
+        if w.get("status")!="active": continue
+        name=w.get("name")
+        if name: active_names.add(name)
+        sess=w.get("tmux") or w.get("name")
+        if not name or not sess: continue
+        if alive(sess):
+            live.append(w)
+except Exception:
+    live=[]
+    active_names=set()
+
+def path_tokens(p):
+    # work-area-dir tokens: components under src/ (+ the leading dir name), lowercased.
+    # Adjust this prefix to match the top-level source dir in your repo.
+    toks=set()
+    m=re.search(r"src/(.+)", p)
+    if m:
+        for seg in m.group(1).split("/")[:-1]:  # dir components, drop the filename
+            seg=seg.strip().lower()
+            if len(seg)>=3: toks.add(seg)
+    return toks
+
+def matches(w, p):
+    # a path matches a live worker if any of its work-area-dir tokens appears in the worker
+    # current_goal/role text, OR the worker name stem appears in the path (own-name dir).
+    blob=((w.get("current_goal") or "")+" "+(w.get("role") or "")).lower()
+    nm=(w.get("name") or "").lower()
+    pl=p.lower()
+    if nm and (nm in pl or nm.replace("_","-") in pl):
+        return True
+    for t in path_tokens(p):
+        if t in blob:
+            return True
+    return False
+
+owners=[]   # grill #5 fix: ALL distinct owners (a cross-owner commit must repoke EVERY author)
+def add(w):
+    if w and w not in owners: owners.append(w)
+
+for p in paths:
+    claimed=False
+    # (1) live roster first
+    for w in live:
+        if w.get("name")=="manager": continue
+        if matches(w, p):
+            add(w["name"]); claimed=True
+    if claimed: continue
+    # (2) static PREFIX last-resort — FIX A: only attribute if the MAPPED worker is status=active.
+    # A retired/completed/orphaned PREFIX target is NOT a valid owner; skip it so
+    # the commit falls through to the existing no-live-owner branch (notify + escalate), instead of
+    # routing a LIVE work-area FAIL to a dead worker where it gets silently dropped.
+    for pre,wn in PREFIX:
+        if p.startswith(pre):
+            if wn in active_names:
+                add(wn); claimed=True
+            break
+
+# (3) sole-live fallback: nothing matched at all + exactly one live non-manager worker.
+# FIX A: gate on PATH-RELEVANCE — only attribute to the sole-live worker if at least one
+# touched path shares a lane token with it (reuse matches()). Otherwise an un-owned
+# manager/colleague commit (e.g. a docs-only change) gets mis-repoked to the lone worker;
+# leave it UNROUTED instead (fall through to the existing escalation branch).
+if not owners:
+    nonmgr=[w for w in live if w.get("name")!="manager"]
+    if len(nonmgr)==1 and any(matches(nonmgr[0], p) for p in paths):
+        add(nonmgr[0]["name"])
+
+print("\n".join(owners))'
+    }
+    # FIX 2 (ADDITIVE): fabrication-class FAIL detector + durable unrouted-fails ledger. A
+    # fabrication-class FAIL = a result-id real-fabrication (404 / metric-mismatch) OR a secret-leak —
+    # the highest-severity FAILs that must NEVER be silently dropped when there's no live owner.
+    # _fab_class_fail <artifact> → echoes "1" if fabrication-class, else "0" (best-effort; "0" on error).
+    _fab_class_fail() {
+        FCF_ART="$1" python3 -c '
+import json, os
+def lay(d,k):
+    v=d.get(k)
+    return v if isinstance(v,dict) else {}
+try:
+    d=json.load(open(os.environ["FCF_ART"]))
+except Exception:
+    print("0"); raise SystemExit
+fab=False
+# secret-leak: the secret layer FAILed
+if lay(d,"secret").get("verdict")=="FAIL": fab=True
+# result-id real-fabrication: btid FAIL whose issues name a 404 / fabricated / metric-mismatch
+# (NOT a no-creds / cannot-verify / cross-account SKIP-class escalation).
+bt=lay(d,"btid")
+if bt.get("verdict")=="FAIL":
+    iss=" ".join(map(str, bt.get("issues") or [])).lower()
+    if any(s in iss for s in ("fabricat","does not resolve","not found","claims sharpe","unverifiable perf claim","perf claim")):
+        if not any(s in iss for s in ("cross-account","cross-acct","cannot-verify","no qc creds","manual-verify owed")):
+            fab=True
+print("1" if fab else "0")' 2>/dev/null || echo "0"
+    }
+    # _append_unrouted <sha> <touched-newline-paths> <failing-layers-csv> — appends ONE JSON line to
+    # ~/.cc-manager/unrouted_fails.jsonl so a dropped fabrication-class FAIL is durably re-consumable.
+    _append_unrouted() {
+        AU_SHA="$1" AU_PATHS="$2" AU_LAYERS="$3" python3 -c '
+import json, os
+rec={"sha":os.environ.get("AU_SHA",""),
+     "touched_paths":[p for p in os.environ.get("AU_PATHS","").splitlines() if p.strip()],
+     "failing_layers":[x for x in os.environ.get("AU_LAYERS","").split(",") if x],
+     "ts":__import__("datetime").datetime.now().isoformat()}
+led=os.path.expanduser("~/.cc-manager/unrouted_fails.jsonl")
+os.makedirs(os.path.dirname(led), exist_ok=True)
+with open(led,"a") as f: f.write(json.dumps(rec, ensure_ascii=False)+"\n")' 2>/dev/null || true
+    }
+    # _failing_layers <artifact> — echoes a CSV of layer names whose verdict is a FAIL-class verdict.
+    _failing_layers() {
+        FL_ART="$1" python3 -c '
+import json, os
+def lay(d,k):
+    v=d.get(k)
+    return v if isinstance(v,dict) else {}
+try:
+    d=json.load(open(os.environ["FL_ART"]))
+except Exception:
+    print(""); raise SystemExit
+out=[k for k in ("algo","code","codereview","security","secret","btid")
+     if lay(d,k).get("verdict") in ("FAIL","GRILL","DEAD","FIX","FINDINGS")]
+print(",".join(out))' 2>/dev/null || echo ""
+    }
+    # Grill 2026-06-13 #6: spend guard before the Opus-spawning review loop. The freeze gate above
+    # already exit-0s on any banner, but a banner can appear mid-tick (after the gate passed); skip
+    # the headless cc-review spawns if any pane is now limited — cursor not advanced, retries next tick.
+    _cr_limited=0
+    for _s in $(tmux ls -F '#{session_name}' 2>/dev/null); do
+        tmux capture-pane -p -t "$_s" -S -12 2>/dev/null | grep -qiE "spend limit|usage-credits|usage limit reached|resets [0-9]{1,2}(:[0-9]{2})?[[:space:]]*(am|pm)" && { _cr_limited=1; break; }
+    done
+    head_sha=$(git -C "$REPO_CR" rev-parse --short HEAD 2>/dev/null || echo "")
+    last_sha=""; [ -f "$STAMP" ] && last_sha=$(cat "$STAMP" 2>/dev/null)
+    if [ "$_cr_limited" = 1 ]; then
+        echo "$NOW [cc-review] skip: a pane is spend-limited — deferring review spawns (cursor unchanged, retry next tick)"
+    elif [ -n "$head_sha" ] && [ "$head_sha" != "$last_sha" ]; then
+        if [ -n "$last_sha" ] && git -C "$REPO_CR" cat-file -e "${last_sha}^{commit}" 2>/dev/null; then
+            # CRITICAL fix (grill 2026-06-13): `--reverse --max-count=3` returns the 3 NEWEST
+            # commits (--max-count truncates the default newest-first walk, THEN --reverse flips
+            # display order) — so with a >3 backlog the OLDER commits were silently never reviewed
+            # while the cursor jumped to HEAD. Take the OLDEST 3: full reverse, then head -3.
+            new_shas=$(git -C "$REPO_CR" rev-list --reverse "${last_sha}..HEAD" 2>/dev/null | head -3)
+        else
+            new_shas=$(git -C "$REPO_CR" rev-list --reverse --max-count=1 HEAD 2>/dev/null)  # first run: just HEAD, no history backlog
+        fi
+        cursor_target="$last_sha"   # advance the cursor only past SUCCESSFULLY-reviewed commits
+        for s in $new_shas; do
+            touch "$LOCKDIR" 2>/dev/null || true   # FIX 3: heartbeat the lock each reviewed commit — a review tick with many unbounded `claude -p` calls can run >LOCK_MAX_AGE; without this refresh the next 30-min cron fire steals the lock mid-review → two concurrent ticks corrupt cursor/failstreak state.
+            ss=$(git -C "$REPO_CR" rev-parse --short "$s" 2>/dev/null)
+            [ -n "$ss" ] || continue
+            # goal-aware grill (meta-grill fix): look up the owning worker's goal BEFORE review so the
+            # algo-grill won't FALSE-FAIL an in-sample/5yr-only/explore directive on the tiering/deploy checks.
+            _gowner=$(_owner_of "$(git -C "$REPO_CR" show --name-only --format= "$ss" 2>/dev/null)" | head -1)
+            _gtext=""
+            [ -n "$_gowner" ] && [ -f "$HOME/.cc-manager/keepalive/$_gowner" ] && _gtext=$(cut -f2- "$HOME/.cc-manager/keepalive/$_gowner" 2>/dev/null)
+            [ -z "$_gtext" ] && [ -n "$_gowner" ] && _gtext=$(cc-task goalfor "$_gowner" 2>/dev/null | head -1 | cut -d'|' -f2)
+            echo "$NOW [cc-review] auto-reviewing new commit $ss (goal-scope owner=${_gowner:-?})"
+            "$CCREVIEW" --goal "$_gtext" "$ss" 2>&1 | sed 's/^/[cc-review] /'
+            art="$REPO_CR/.cc-review/${ss}.json"
+            # Visibility feed (operator lesson: "I can't see that the review subagent actually ran"): cc-watch is launchd-
+            # headless so its review subagents can't appear in the /workflows UI. Mirror each review's
+            # per-layer verdict to a human-readable feed the user can watch live: `tmux attach -t ccfeed`.
+            if [ -f "$art" ]; then
+                python3 -c "import json,sys;d=json.load(open('$art'));L=lambda k:(d.get(k) or {}).get('verdict','-');print(f\"$(date '+%H:%M:%S') $ss [{d.get('overall')}] owner=${_gowner:-?} | process={L('code')} algo={L('algo')} code-review={L('codereview')} secret={L('secret')} btid={L('btid')} security={L('security')}\")" >> "$HOME/.cc-manager/cc-review-feed.log" 2>/dev/null
+            fi
+            # meta-grill CRITICAL A: no artifact = cc-review crashed/killed before writing → NOT reviewed.
+            # Must NOT advance the cursor past it (the old `continue` let a later PASS jump over it →
+            # permanently unreviewed). Treat exactly like ERROR: break, leave cursor before $ss for retry.
+            if [ ! -f "$art" ]; then
+                echo "$NOW [cc-review] $ss NO artifact (reviewer crashed?) — cursor NOT advanced, retry next tick"
+                break
+            fi
+            overall=$(python3 -c "import json;print(json.load(open('$art')).get('overall',''))" 2>/dev/null)
+            # ── ERROR handling (fix 2026-06-13): an ERROR verdict = infra failure (the reviewer's own
+            # claude -p hit the 5h limit / returned no-json), NOT a real review. Do NOT advance the
+            # cursor past it — leave it for retry when tokens return. Cap at 3 retries so a genuinely
+            # malformed commit can't block the cursor forever. (2 commits were silently lost this way
+            # when the burn froze the account mid-review.)
+            if [ "$overall" = "ERROR" ]; then
+                # FIX (DARK-hold vs genuine-infra ERROR): cc-review sets overall=ERROR for TWO distinct
+                # cases. (a) a genuine claude -p infra ERROR (5h limit / no-json) → the existing 3-strike
+                # give-up below. (b) a DARK-HOLD: a metric-claim commit whose result-id gate was DARK (the
+                # verifier unreachable this run) — cc-review HELD it as ERROR expecting a re-review when the
+                # verifier returns, and wrote btid_gate.dark=true into the artifact. Counting (b) toward the
+                # 3-strike give-up would advance the cursor PAST the held metric-claim commit during a verifier
+                # outage — silently dropping the exact fabrication the gate exists to catch. So for a DARK-hold:
+                # do NOT count it toward the give-up; HOLD (don't advance) so it re-reviews when the verifier
+                # returns. Cap the hold by WALL-CLOCK age (first-seen stamp): past DARK_HOLD_CAP, durably record
+                # the dropped claim (unrouted_fails.jsonl + notify once) + advance, so an indefinitely-dark
+                # verifier outage can't block the whole review queue forever.
+                _is_dark=$(python3 -c "import json;print('1' if (json.load(open('$art')).get('btid_gate',{}) or {}).get('dark') else '0')" 2>/dev/null)
+                [ -n "$_is_dark" ] || _is_dark=0
+                if [ "$_is_dark" = "1" ]; then
+                    DARK_HOLD_CAP=21600   # 6h
+                    dfirst="/tmp/cc-review-${ss}.darkfirst"
+                    [ -f "$dfirst" ] || date +%s > "$dfirst"
+                    _dage=$(( $(date +%s) - $(_numread "$dfirst") ))
+                    if [ "$_dage" -ge "$DARK_HOLD_CAP" ]; then
+                        echo "$NOW [cc-review] $ss DARK-hold exceeded ${DARK_HOLD_CAP}s (age ${_dage}s) — verifier still dark; recording dropped metric-claim to unrouted_fails.jsonl + advancing cursor"
+                        _dtouched=$(git -C "$REPO_CR" show --name-only --format= "$ss" 2>/dev/null)
+                        _append_unrouted "$ss" "$_dtouched" "$(_failing_layers "$art")"
+                        echo "$NOW $ss DARK-hold > ${DARK_HOLD_CAP}s — metric-claim result-id UNVERIFIED during verifier outage, appended to unrouted_fails.jsonl + cursor advanced" >> "$HOME/.cc-manager/escalations.log"
+                        _notify_user "ccreview-darkhold:$ss" "cc-review $ss held DARK >6h (verifier unreachable) — metric-claim result-id still unverified; appended to unrouted_fails.jsonl + cursor advanced"
+                        cursor_target="$ss"; rm -f "$dfirst"; continue
+                    fi
+                    echo "$NOW [cc-review] $ss DARK-hold (result-id gate dark, verifier unreachable; age ${_dage}s < ${DARK_HOLD_CAP}s) — cursor NOT advanced, NOT counted toward 3-strike, re-review when the verifier returns"
+                    break   # HOLD: leave cursor before $ss; errcount NOT touched (this is not an infra-ERROR strike)
+                fi
+                ecnt="/tmp/cc-review-${ss}.errcount"; ec=0
+                ec=$(_numread "$ecnt")
+                ec=$((ec + 1)); echo "$ec" > "$ecnt"
+                if [ "$ec" -ge 3 ]; then
+                    echo "$NOW [cc-review] $ss ERROR x3 — giving up, advancing cursor past it (likely malformed, not transient)"
+                    cursor_target="$ss"; rm -f "$ecnt"; continue
+                fi
+                echo "$NOW [cc-review] $ss ERROR (infra/limit, retry $ec/3) — cursor NOT advanced, will re-review next tick"
+                break   # stop this tick; leave cursor before $ss so it (and later commits) retry in order
+            fi
+            rm -f "/tmp/cc-review-${ss}.errcount" "/tmp/cc-review-${ss}.darkfirst"   # clean on a real verdict (verifier returned → DARK-hold stamp cleared too)
+            # ── loop closure: FAIL → attribute → repoke owner ──
+            # cursor advances ONLY when this commit is fully handled (grill fix #8: the old code set
+            # cursor_target before the repoke, so a limit-deferred FAIL had its cursor advanced past
+            # it → the repoke was lost forever). PASS/handled-FAIL → advance; limit-defer → break w/o advancing.
+            if [ "$overall" != "FAIL" ]; then
+                # visibility (operator lesson: "I need to see in the worker's URL that the review subagent ran"): the review
+                # subagent is headless (manager-side) so it can't appear IN the worker's session as its own
+                # subagent — but post a one-line PASS marker into the owner's pane so the worker's URL shows
+                # that a cc-review subagent ran on this commit. FAILs already land as the repoke below.
+                if [ -n "$_gowner" ] && tmux has-session -t "$_gowner" 2>/dev/null; then
+                    # operator lesson: carry the FULL per-layer breakdown into the ping, not a bare PASS,
+                    # so the worker sees which checks actually ran (reuses the feed lambda above). A
+                    # SKIP is surfaced as not-run (e.g. btid=SKIP = the result-id was NOT verified, per self-audit #1).
+                    _brk=$(python3 -c "import json;d=json.load(open('$art'));L=lambda k:(d.get(k) or {}).get('verdict','-');print(f\"process={L('code')} algo={L('algo')} code-review={L('codereview')} secret={L('secret')} btid={L('btid')} security={L('security')}\")" 2>/dev/null)
+                    ts "$_gowner" "ℹ️[cc-review subagent ✓ ran on $ss → $overall] ${_brk} · 仅告知,无需动作(manager 侧 headless 评审已通过；SKIP=该层未触发/未验证，非通过)" >/dev/null 2>&1
+                fi
+                # FIX #4 (meta-grill 2026-06-14): a PASS for this owner RESETS its failstreaks —
+                # the worker is producing clean commits again, so the circuit breaker re-arms from
+                # zero. (Reset all owners of a PASS commit, not just the primary _gowner, so a
+                # cross-owner PASS clears every author's streak.) self-audit #4: clear ALL of the
+                # owner's per-signature streak files (glob) plus the legacy bare-owner path.
+                for _po in $(_owner_of "$(git -C "$REPO_CR" show --name-only --format= "$ss" 2>/dev/null)"); do
+                    rm -f "/tmp/cc-review-${_po}.failstreak" /tmp/cc-review-"${_po}"-*.failstreak
+                done
+                cursor_target="$ss"; continue
+            fi   # PASS → marker + advance + next
+            rstamp="/tmp/cc-review-${ss}.repoked"
+            [ -f "$rstamp" ] && { cursor_target="$ss"; continue; }   # already repoked → advance
+            touched=$(git -C "$REPO_CR" show --name-only --format= "$ss" 2>/dev/null)
+            owners=$(_owner_of "$touched")
+            # FIX 3 (ADDITIVE — retired-owner + colleague-author gate): the static PREFIX map can
+            # match a RETIRED worker (e.g. some paths → a dead worker). For a commit authored by a
+            # human colleague (NOT the manager bot) that matches NO live+active owner, repoking/escalating
+            # "manual route owed" reaches no one and fires every tick. Filter $owners to live+active;
+            # if NONE remain AND the author is a colleague (not a managed worker-bot), advance the
+            # cursor as advisory-only — no escalation, no repoke. Keeps the manager-bot self-route (below)
+            # and the genuine live-worker repoke path (below) intact: only the retired+colleague case
+            # is intercepted here.
+            _live_owners=""
+            if [ -n "$owners" ]; then
+                for _o in $owners; do
+                    # active in workers.json AND tmux session live → keep
+                    _ostat=$(OWN="$_o" python3 -c '
+import json,os,sys
+try:
+    d=json.loads(open(os.path.expanduser("~/.cc-manager/workers.json")).read())
+except Exception:
+    sys.exit(0)
+own=os.environ["OWN"]
+for w in d.get("workers",[]):
+    if w.get("name")==own and w.get("status")=="active":
+        print("active"); break' 2>/dev/null)
+                    if [ "$_ostat" = "active" ] && tmux has-session -t "$_o" 2>/dev/null; then
+                        _live_owners="${_live_owners}${_o}"$'\n'
+                    fi
+                done
+            fi
+            _live_owners=$(printf '%s' "$_live_owners" | sed '/^$/d')
+            if [ -n "$owners" ] && [ -z "$_live_owners" ]; then
+                _cauth_email=$(git -C "$REPO_CR" log -1 --format='%ae' "$ss" 2>/dev/null)
+                _cauth_name=$(git -C "$REPO_CR" log -1 --format='%an' "$ss" 2>/dev/null)
+                # managed worker-bot commits under CC_BOT_NAME / EXPECT_ACCT. A commit by any other
+                # git identity (a human colleague's) is advisory-only, NOT routed.
+                if [ "$_cauth_name" != "$CC_BOT_NAME" ] && [ "$_cauth_email" != "$EXPECT_ACCT" ]; then
+                    echo "$NOW [cc-review] $ss FAIL matched only RETIRED owner(s) ($(echo $owners | tr '\n' ',')) + colleague/retired-author commit (author=${_cauth_email:-?}) — advisory only, not routed"
+                    touch "$rstamp"; cursor_target="$ss"; continue
+                fi
+            fi
+            if [ -z "$owners" ]; then
+                # FIX 1: even with no owner match (live roster + static map + sole-live all empty),
+                # a FAIL must NOT silently drop+advance — log to escalations.log AND notify the user.
+                echo "$NOW [cc-review] $ss FAIL but no owner matched — escalated to manager (manual route owed)"
+                echo "$NOW $ss FAIL UNROUTED (no owner matched) — manager must route; verdict in .cc-review/${ss}.json" >> "$HOME/.cc-manager/escalations.log"
+                _notify_user "ccreview-unrouted:$ss" "cc-review $ss FAIL but no owner matched — manual route owed"
+                # FIX 2 (ADDITIVE — no cursor change): a fabrication-class FAIL (result-id 404 / metric-
+                # mismatch / secret-leak) with no owner must be durably re-consumable, not log+drop.
+                # Append ONE JSON line to ~/.cc-manager/unrouted_fails.jsonl. Pure addition.
+                if [ "$(_fab_class_fail "$art")" = "1" ]; then
+                    _append_unrouted "$ss" "$touched" "$(_failing_layers "$art")"
+                    echo "$NOW [cc-review] $ss fabrication-class FAIL (no owner) → appended to unrouted_fails.jsonl"
+                fi
+                # FIX 3 (ADDITIVE): if the commit was AUTHORED by the manager bot, the empty-owner
+                # drop leaves the manager with no actionable. Append the repoke to a durable manager
+                # action list so the manager has a self-route list. Keeps notify/escalation above intact.
+                _cauthor=$(git -C "$REPO_CR" log -1 --format='%an' "$ss" 2>/dev/null)
+                if [ "$_cauthor" = "$CC_BOT_NAME" ]; then
+                    _mrepoke=$(python3 -c "
+import json
+try:
+    d=json.load(open('$art')); parts=[]
+    for k in ('algo','code','codereview','security','secret','btid'):
+        r=d.get(k,{}) or {}
+        if r.get('repoke'): parts.append(f\"[{k}] {r['repoke']}\")
+    print('  '.join(parts)[:900])" 2>/dev/null)
+                    [ -n "$_mrepoke" ] || _mrepoke="cc-review $ss FAIL — see .cc-review/${ss}.json"
+                    echo "$NOW $ss FAIL (manager-authored) $_mrepoke" >> "$HOME/.cc-manager/manager_review_actions.log"
+                    echo "$NOW [cc-review] $ss FAIL authored by manager bot → appended to manager_review_actions.log"
+                fi
+                touch "$rstamp"; cursor_target="$ss"; continue
+            fi
+            # build the repoke text once
+            repoke=$(python3 -c "
+import json
+d=json.load(open('$art')); parts=[]
+for k in ('algo','code'):
+    r=d.get(k,{}) or {}
+    if r.get('repoke'): parts.append(f\"[{k}] {r['repoke']}\")
+print('  '.join(parts)[:900])" 2>/dev/null)
+            [ -n "$repoke" ] || repoke="cc-review $ss 判 FAIL — 见 .cc-review/${ss}.json,修复后重新 commit"
+            # self-audit #4: the circuit-breaker MUST key on the FAIL SIGNATURE, not bare owner —
+            # else 3 DISTINCT real bugs (different failed_checks) trip it and silently swallow a genuine bug.
+            # self-audit #5 FIX: the OLD signature folded the free-form repoke/findings/note PROSE into the
+            # hash, so 6 same-root-cause repokes to one worker (same complaint re-worded) hashed to 6
+            # DISTINCT signatures → the streak never reached 3 and the breaker fired 0 times (INERT).
+            # Compute the signature from STRUCTURED fields ONLY: the sorted SET of failing LAYER names +
+            # a normalized check-id per failing check (layer:normalized-check, sha/digits/punct stripped,
+            # clipped to the leading tokens). NO repoke/findings/note prose. Same complaint → same sig
+            # (trips); genuinely different checks → different sigs (own streak). Keyed per (owner × sig) below.
+            # FIX B: _failsig = STABLE taxonomy. The OLD sig folded EVERY failing
+            # layer + EVERY normalized check into a set, so any wording/order change in any bullet
+            # produced a DISTINCT hash (5 same-root FAILs on one worker → 5 sigs) → the streak never
+            # reached 3 → the breaker was INERT. New sig keys on the SINGLE highest-severity failing
+            # LAYER (precedence btid>secret>algo>code>codereview>security) + a SORTED-then-LEAD
+            # normalized check-id from THAT layer ONLY (sort the bullets so order doesn't move the
+            # sig). Emits "<top-layer> <hash>" so the carve-out below can branch on the top layer.
+            _failsig_out=$(python3 -c "
+import json,re,hashlib,sys
+try:
+    d=json.load(open('$art'))
+except Exception:
+    print('none nojson'); sys.exit(0)
+def norm(s):
+    s=str(s).lower()
+    s=re.sub(r'[0-9a-f]{8,}','',s)        # drop sha/result-id-like tokens
+    s=re.sub(r'\d+','#',s)                # normalize numbers
+    s=re.sub(r'[^a-z#: -]+',' ',s)        # drop punctuation/cjk prose noise
+    s=re.sub(r'\s+',' ',s).strip()
+    return ' '.join(s.split()[:6])        # leading tokens = stable check-id, not the full prose
+# precedence: highest severity FIRST — the breaker keys on the single top failing layer only
+PREC=('btid','secret','algo','code','codereview','security')
+top=None
+for k in PREC:
+    r=d.get(k,{}) or {}
+    if r.get('verdict') in ('FAIL','GRILL','DEAD','FIX','FINDINGS'):
+        top=k; break
+if top is None:
+    print('none empty'); sys.exit(0)
+r=d.get(top,{}) or {}
+checks=[norm(f) for f in (r.get('failed_checks') or r.get('issues') or [])]
+checks=[c for c in checks if c]
+checks.sort()                                        # SORTED → bullet order can't change the sig
+lead=checks[0] if checks else ''                     # LEAD normalized check from the top layer only
+lead=' '.join(lead.split()[:3])                      # first 3 tokens = the check NAME; drop the re-worded tail
+t=top+':'+lead
+print(top+' '+(hashlib.sha1(t.encode()).hexdigest()[:10]))
+" 2>/dev/null)
+            [ -n "$_failsig_out" ] || _failsig_out="none nojson"
+            _failtop=${_failsig_out%% *}              # top failing layer (btid/secret/algo/...)
+            _failsig=${_failsig_out##* }              # stable hash keyed on top layer + lead check
+            # grill #9/#11: hardened banner regex. If ANY owner's pane is 5h-limited → defer the whole
+            # sha (break WITHOUT advancing cursor) so it re-reviews+repokes next tick when tokens return.
+            _limited=0
+            for owner in $owners; do
+                tmux has-session -t "$owner" 2>/dev/null || continue
+                if tmux capture-pane -p -t "$owner" -S -12 2>/dev/null | grep -qiE "spend limit|usage-credits|usage limit reached|limit will reset|resets [0-9]{1,2}(:[0-9]{2})?\s*(am|pm)"; then _limited=1; break; fi
+            done
+            if [ "$_limited" = 1 ]; then echo "$NOW [cc-review] $ss FAIL but an owner pane is usage-limited — repoke + cursor deferred (retry next tick)"; break; fi
+            # grill #5: repoke EVERY owner of a cross-owner FAIL (was: only most_common(1))
+            # meta-grill HIGH #1: track whether at least one owner actually got the repoke. If NONE did
+            # (all dead sessions), do NOT mark handled + advance — the FAIL would be silently dropped.
+            _repoked=0
+            for owner in $owners; do
+                if ! tmux has-session -t "$owner" 2>/dev/null; then echo "$NOW [cc-review] $ss FAIL owner=$owner but no live session"; continue; fi
+                # FIX #4 (meta-grill 2026-06-14) + self-audit #4 (2026-06-13): SAME-CHECK FAIL
+                # CIRCUIT-BREAKER, keyed by (owner × FAIL-signature) — NOT bare owner. A clean,
+                # committing worker that keeps drawing the SAME FAIL usually means the GRADER is
+                # wrong (the goal-blind grill bug), not the worker — so stop hammering it. But 3
+                # DISTINCT real bugs (different signatures) must NOT trip it (they'd silently
+                # swallow a genuine bug). The streak increments only when the SAME complaint
+                # repeats, RESETS on any PASS (below). At 3 SUPPRESS auto-repoke + escalate.
+                _fstreak="/tmp/cc-review-${owner}-${_failsig}.failstreak"
+                _fs=$(_numread "$_fstreak"); _fs=$((_fs + 1)); echo "$_fs" > "$_fstreak"
+                # FIX B carve-out: the breaker's premise — "same FAIL repeating = the
+                # GRADER is wrong" — holds ONLY for the LLM layers (algo/code/codereview/security).
+                # For DETERMINISTIC fabrication layers (result-id 404 / metric-mismatch, secret-leak) the
+                # FAIL is a FACT, not grader flakiness — "audit the check" is misdirected. So if the
+                # top failing layer is btid or secret, NEVER suppress: always repoke + escalate the
+                # worker, regardless of streak. The breaker suppresses ONLY for the LLM layers.
+                if [ "$_failtop" = "btid" ] || [ "$_failtop" = "secret" ]; then
+                    if ts "$owner" "[manager cc-review $ss FAIL] $repoke" >/dev/null 2>&1; then
+                        echo "$NOW [cc-review] $ss FAIL ($_failtop) → repoked owner=$owner (fabrication carve-out: breaker NOT applied, streak=$_fs)"
+                        _repoked=1
+                    fi
+                    echo "$NOW $ss $_failtop-layer FAIL (deterministic fabrication) — repoked $owner + escalated regardless of streak=$_fs (sha=$ss)" >> "$HOME/.cc-manager/escalations.log"
+                    _notify_user "ccreview-fab:$ss:$owner" "cc-review $ss FAIL on $_failtop layer (deterministic — 404/metric-mismatch/secret) — NOT a grader issue; $owner repoked + escalated"
+                    continue
+                fi
+                if [ "$_fs" -ge 3 ]; then
+                    _cbmsg="[circuit-breaker] $owner: ${_fs}th IDENTICAL FAIL (sig ${_failsig}) — AUDIT THE CHECK not the worker"
+                    echo "$NOW [cc-review] $ss FAIL → $_cbmsg (auto-repoke SUPPRESSED)"
+                    echo "$NOW $_cbmsg (sha=$ss, verdict in .cc-review/${ss}.json)" >> "$HOME/.cc-manager/escalations.log"
+                    _repoked=1   # treat as handled so the cursor advances; the breaker durably escalated it
+                    continue
+                fi
+                ts "$owner" "[manager cc-review $ss FAIL] $repoke" >/dev/null 2>&1 \
+                    && { echo "$NOW [cc-review] $ss FAIL → repoked owner=$owner (failstreak=$_fs)"; _repoked=1; }
+            done
+            if [ "$_repoked" = 0 ]; then
+                # meta-grill HIGH #1: no live owner to repoke → don't SILENTLY drop it (cron log only).
+                # Surface to escalations.log so the manager routes it; verdict is saved in .cc-review/<sha>.json.
+                # Then ADVANCE the cursor (re-reviewing every tick forever would just burn tokens — the
+                # FAIL is now durably escalated, not lost).
+                echo "$NOW [cc-review] $ss FAIL but NO owner had a live session — escalated to manager (verdict saved, cursor advanced)"
+                echo "$NOW $ss FAIL unrouted (owners=$(echo $owners | tr '\n' ',') all dead) — manager must route; verdict in .cc-review/${ss}.json" >> "$HOME/.cc-manager/escalations.log"
+                _notify_user "ccreview-unrouted:$ss" "cc-review $ss FAIL but no live owner session — manual route owed"   # FIX 1: notify, not just log
+                # FIX 2 (ADDITIVE — no cursor change): durable ledger for a no-live-owner fabrication-class
+                # FAIL so it's re-consumable later (the matched owner exists but its session is dead).
+                if [ "$(_fab_class_fail "$art")" = "1" ]; then
+                    _append_unrouted "$ss" "$touched" "$(_failing_layers "$art")"
+                    echo "$NOW [cc-review] $ss fabrication-class FAIL (owners all dead) → appended to unrouted_fails.jsonl"
+                fi
+            fi
+            touch "$rstamp"
+            cursor_target="$ss"   # reviewed (repoked to ≥1 live owner, OR escalated if none) → advance
+        done
+        # advance cursor only to the last SUCCESSFULLY-reviewed sha (ERROR'd commits stay for retry)
+        [ -n "$cursor_target" ] && echo "$cursor_target" > "$STAMP"
+    fi
+    # ── self-audit #15(3): result-id INERT-control smoke alarm ──────────────────────────────────
+    # The anti-fabrication control ran 0 PASS / 0 real-FAIL for 2 audit rounds (no creds) WITHOUT any
+    # alarm. Add a loud smoke assertion: scan the most-recent N result-claim review artifacts; if
+    # the result-id layer never produced a single PASS AND never produced a single REAL FAIL (404 /
+    # metric-mismatch / metric-claim-with-no-result-id — NOT a no-creds/cannot-verify SKIP) across all of
+    # them, the control is silently inert → escalate loudly (once/day) so a multi-round-inert control cannot recur unseen.
+    SMOKE_N=8
+    _smoke=$(SMOKE_N="$SMOKE_N" python3 - "$REPO_CR/.cc-review" <<'PY' 2>/dev/null
+import json, os, sys, glob
+d=sys.argv[1]; N=int(os.environ.get("SMOKE_N","8"))
+files=sorted(glob.glob(os.path.join(d,"*.json")), key=os.path.getmtime, reverse=True)
+seen=0; npass=0; nrealfail=0
+for f in files:
+    try: a=json.load(open(f))
+    except Exception: continue
+    b=(a.get("btid") or {})
+    v=b.get("verdict"); note=(b.get("note") or "").lower()
+    # result-claim commit = btid layer actually engaged (not the "non-strategy or verifier absent" SKIP)
+    if v=="SKIP" and ("non-strategy" in note or "verifier absent" in note): continue
+    if v is None: continue
+    seen+=1
+    if v=="PASS": npass+=1
+    if v=="FAIL":
+        issues=" ".join(map(str, b.get("issues") or [])).lower()
+        # real FAIL = a fabrication signal, NOT a creds/cannot-verify escalation
+        if not ("no qc creds" in issues or "no creds" in issues or "cannot-verify" in issues or "unverifiable" in issues):
+            nrealfail+=1
+    if seen>=N: break
+print(f"{seen} {npass} {nrealfail}")
+PY
+)
+    set -- $_smoke; _sk_seen="${1:-0}"; _sk_pass="${2:-0}"; _sk_fail="${3:-0}"
+    if [ "${_sk_seen:-0}" -ge "$SMOKE_N" ] && [ "${_sk_pass:-0}" -eq 0 ] && [ "${_sk_fail:-0}" -eq 0 ]; then
+        _smoke_stamp="$HOME/.cc-manager/.btid-inert-smoke.$(date '+%Y-%m-%d').sent"
+        if [ ! -f "$_smoke_stamp" ]; then
+            _sm="result-id SMOKE ALARM: anti-fabrication control INERT — $SMOKE_N consecutive result-claim commits with 0 PASS AND 0 real-FAIL (all SKIP/cannot-verify). Control is silently doing nothing; check the verifier's creds + the result-id verifier."
+            echo "$NOW [cc-review] $_sm"
+            echo "$NOW [cc-review] $_sm" >> "$HOME/.cc-manager/escalations.log"
+            _notify_user "btid-inert-$(date '+%Y-%m-%d')" "$_sm"
+            touch "$_smoke_stamp"
+        fi
+    fi
+fi
+
+# ── Cost-guard: stop nudging the moment there is NO open task ──
+# Operator lesson: "every worker is either blocked or done → stop cron to save spend." The cron used to invent fresh
+# explore /goals for idle workers every cycle (autonomous exploration), which kept
+# the fleet — and Opus — spending even when nothing the user assigned was pending.
+# User's call: nudging must be GATED on having an open cc-task. cc-task fleet exits
+# 0 if ANY worker has an active task (assigned/in_progress), 1 if every worker is
+# BLOCKED or IDLE (done). When all-idle: suspend immediately (NO grace period) —
+# early-exit before any haiku/cc-monitor spend, and on the FIRST suspended cycle
+# tell each worker to halt its /loop so the Opus workers stop spending too.
+# Auto-resumes the next cycle after the user assigns/unblocks a worker's task
+# (→ that worker becomes ACTIVE → fleet has work again). Non-destructive: no tmux
+# kill, no launchd unload — just a quiet idle until there's real work to supervise.
+SUSPEND="$HOME/.cc-manager/suspended"
+fleet_status=$(cc-task fleet 2>/dev/null); fleet_rc=$?
+[ -n "$fleet_status" ] && echo "$fleet_status" | sed "s/^ */$NOW [fleet] /"
+
+# ── Landing-line exemption ───────────────────────────────────────────────────
+# A worker with an OPEN category=landing task is a USER-DESIGNATED landing line —
+# it must NEVER be silenced by the cost-guard, even if the rest of the fleet is
+# idle/blocked (a landing task blocked on the operator would otherwise let the suspend
+# gate halt it). Compute landing workers from the task log and treat them as
+# always-active: skip the fleet-suspend while any exists, and force is_active true.
+landing_workers=$(python3 - "$HOME/.cc-manager/tasks.jsonl" <<'PY' 2>/dev/null
+import json, sys
+from pathlib import Path
+p = Path(sys.argv[1]); st = {}
+if p.exists():
+    for ln in p.read_text().splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            e = json.loads(ln)
+        except Exception:
+            continue
+        i = e["id"]
+        d = st.setdefault(i, {"a": e.get("assignee", ""), "cat": e.get("category"), "s": "assigned"})
+        if e.get("category") is not None:
+            d["cat"] = e.get("category")
+        ev = e.get("event")
+        if ev == "done": d["s"] = "completed"
+        elif ev == "cancel": d["s"] = "cancelled"
+        elif ev in ("start", "unblock"): d["s"] = "in_progress"
+        elif ev == "block": d["s"] = "blocked"
+        elif ev == "reassign": d["a"] = e.get("new_assignee", d["a"])
+for d in st.values():
+    if d["cat"] == "landing" and d["s"] in ("assigned", "in_progress", "blocked") and d["a"] not in ("", "manager", "multi"):
+        print(d["a"])
+PY
+)
+is_landing() { [ -n "$landing_workers" ] && echo "$landing_workers" | grep -qxF "$1"; }
+[ -n "$landing_workers" ] && echo "$NOW [landing] always-active lines (cost-guard-exempt): $(echo "$landing_workers" | tr '\n' ' ')"
+
+# ── ONE canonical mid-work regex (FIX A 2026-06-19) ──────────────────────────
+# Defined UNCONDITIONALLY at top-level so the cost-guard AND both runaway watchdogs
+# (hoisted + downstream, inside watch_one) all mean the SAME thing by "mid-work".
+# Previously the cost-guard matched tokens the two watchdog greps OMITTED (esc to
+# interrupt / N local agents / N/N agents done / Waiting for workflow) — so a stalled
+# /deep-research showing ONLY those tokens (no spinner glyph) never accumulated runaway
+# dwell → the 75-min Esc never fired → unbounded DR. 75min of ANY continuous mid-work
+# state = genuine runaway, so broadening the watchdogs to this superset is safe. Set ONCE.
+MIDWORK_RE='(✶|✻|✽) [A-Z][a-z]+ing|still thinking|⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|[↑↓] [0-9]+(\.[0-9]+)?k tokens|esc to interrupt|[0-9]+/[0-9]+ agents done|Waiting for .*workflow|[0-9]+ local agent|Press up to edit queued'
+
+if [ "$fleet_rc" -ne 0 ] && [ -z "$landing_workers" ]; then   # fleet says ALL_IDLE + no landing line
+    # PANE IS GROUND TRUTH. fleet uses cc-task status, which can be STALE/WRONG — e.g. a
+    # task auto-blocked while the worker is actively working the unblock (observed: a
+    # blocked task-id paused a worker mid research-ladder). NEVER pause a worker whose pane shows
+    # live work. If ANY watch.list worker is mid-work, the cost-guard premise is false →
+    # do not pause, clear any suspend, fall through to normal supervision. Bias toward
+    # "live" here (include esc-to-interrupt / agents-done / workflow-wait): a false
+    # "live" just forgoes token savings on a quiet worker; a false "idle" pauses an
+    # actively-hunting one — the failure we are fixing.
+    # MIDWORK_RE is now the ONE canonical regex set unconditionally above (FIX A).
+    live=""
+    while IFS= read -r w; do
+        [ -z "$w" ] && continue
+        tp "$w" 12 2>/dev/null | tail -10 | grep -qE "$MIDWORK_RE" && live="$live $w"
+    done < "$CFG"
+    if [ -n "$live" ]; then
+        echo "$NOW [cost-guard] fleet=ALL_IDLE but mid-work panes:$live — stale cc-task status, NOT pausing (clearing suspend)"
+        rm -f "$SUSPEND"
+        # fall through to normal supervision below
+    else
+        if [ ! -f "$SUSPEND" ]; then
+            echo "$NOW [cost-guard] all workers blocked/done AND panes idle — suspending + pausing workers (省钱)"
+            while IFS= read -r w; do
+                [ -z "$w" ] && continue
+                ts "$w" "[manager cost-guard] 所有员工的 task 都 block/完成,没有待办 — 暂停探索省钱:停止 /loop、不要再 schedule wakeup、静默等待。manager 会在 user 下新任务后重新派 goal 唤醒你,不要自行重启。" >/dev/null 2>&1
+            done < "$CFG"
+            touch "$SUSPEND"
+        fi
+        exit 0
+    fi
+fi
+if [ -f "$SUSPEND" ]; then
+    echo "$NOW [cost-guard] open task again — resuming supervision"
+    rm -f "$SUSPEND"
+fi
+
+# ── Per-worker cost-guard ────────────────────────────────────────────────────
+# The fleet gate above only decides whether the cron runs AT ALL (≥1 worker has
+# an open task). But the brain (cc-decide) nudges off PANE state, NOT cc-task
+# state — so once the cron proceeds, it would re-goal the IDLE workers too.
+# Observed: giving one worker a task flipped the fleet to HAS_ACTIVE, and
+# the very next cycle re-issued a fresh /goal to two OTHER idle workers —
+# neither had an open cc-task, and one of them is infra-only.
+# Operator lesson "because I started working, this kept going?" — yes, and that's the bug. Fix: only
+# nudge a worker that has its OWN open task. We reuse the ACTIVE rows already
+# printed by `cc-task fleet` ($2=="ACTIVE") instead of a second cc-task call.
+# Fail-closed: if fleet output is empty, active_workers is empty → nudge nobody
+# (cheap). This is the per-worker version of the open-task gate — a worker goes
+# quiet the moment ITS filed task closes, even while siblings keep working.
+active_workers=$(echo "$fleet_status" | awk '$2=="ACTIVE"{print $1}')
+# A landing line counts as active even if its task is BLOCKED (e.g. on the operator) and
+# fleet would otherwise label the worker idle — so it is never per-worker-skipped.
+is_active() { echo "$active_workers" | grep -qxF "$1" || is_landing "$1"; }
+
+# Returns 0 if the user is currently typing in the input box (last line between dividers has content beyond "❯ ").
+user_is_typing() {
+    local pane="$1"
+    # Find last two divider lines (start with ─)
+    local nums
+    nums=$(grep -n "^─" "$pane" | tail -2 | cut -d: -f1)
+    local n
+    n=$(echo "$nums" | wc -l | tr -d ' ')
+    [ "$n" -lt 2 ] && return 1   # not enough dividers, can't tell — assume not typing
+    local first last
+    first=$(echo "$nums" | head -1)
+    last=$(echo "$nums" | tail -1)
+    [ "$last" -le "$first" ] && return 1
+    # Block between dividers (exclusive)
+    local block
+    block=$(awk -v a="$((first+1))" -v b="$((last-1))" 'NR>=a && NR<=b' "$pane")
+    # Strip prompt prefix "❯ " from the first non-empty line, then check for any non-whitespace
+    local stripped
+    stripped=$(echo "$block" | sed -E 's/^[[:space:]]*❯[[:space:]]*//' | tr -d '[:space:]')
+    [ -n "$stripped" ]
+}
+
+# Returns: "assistant" / "user" / "none"
+# Looks at conversation history (lines BEFORE the last input-box divider block).
+# Recognises assistant turns by either ^⏺ (start) or ^✻/✻/✶ <verb> for <time>s (end-of-turn footer),
+# so long assistant messages whose ^⏺ has scrolled out of the capture window still count.
+last_speaker() {
+    local pane="$1"
+    local first_div
+    first_div=$(grep -n "^─" "$pane" | tail -2 | head -1 | cut -d: -f1)
+    [ -z "$first_div" ] && first_div=$(wc -l < "$pane")
+    local hist_end=$((first_div - 1))
+    [ "$hist_end" -lt 1 ] && { echo "none"; return; }
+    local last_a last_u
+    # Assistant markers (any of these indicates assistant turn happened):
+    #   ^⏺                                = assistant start (text/tool call)
+    #   ^[✻✶✽] [A-Z][a-z]+ for             = end-of-turn footer "Baked for 50s"
+    #   ^[[:space:]]+⎿                     = tool-result continuation indicator
+    #   ^[[:space:]]+(Read|Wrote|Write|Bash|Edit|Update|Search|Glob|Grep) [0-9]+ = tool-summary lines
+    # Bug: a worker was rate-limited 35min, only ⏺-less continuation lines visible
+    # in capture window. last_speaker wrongly returned "user" for 5 ticks.
+    last_a=$(awk -v lim="$hist_end" 'NR<=lim && (/^⏺/ || /^(✻|✶|✽) [A-Z][a-z]+ for / || /^[[:space:]]+⎿/ || /^[[:space:]]+(Read|Wrote|Write|Bash|Edit|Update|Search|Glob|Grep) [0-9]+/) {n=NR} END {print n+0}' "$pane")
+    last_u=$(awk -v lim="$hist_end" 'NR<=lim && /^❯ / {n=NR} END {print n+0}' "$pane")
+    if [ "$last_a" -eq 0 ] && [ "$last_u" -eq 0 ]; then
+        echo "none"
+    elif [ "$last_a" -ge "$last_u" ]; then
+        echo "assistant"
+    else
+        echo "user"
+    fi
+}
+
+watch_one() {
+    local name="$1"
+    local pane="/tmp/cc-watch-${name}.pane"
+    local last="/tmp/cc-watch-${name}.hash"
+
+    # ── Runaway watchdog — HOISTED above the is_active early-return (reachability FIX) ──────────
+    # BUG (original D): the runaway-dwell watchdog lived ONLY inside the mid-work guard far below,
+    # AFTER the per-worker cost-guard `is_active` early-return — so a worker with NO open cc-task could
+    # spin on a runaway turn (stuck /deep-research, 198k-token thinking turn) FOREVER: it returned at
+    # the cost-guard before the pane was captured, so the dwell timer never started. A runaway burns
+    # tokens regardless of cc-task state → the interrupt MUST be reachable for inactive workers too.
+    # cc-review 0df71986 FIX: use a SEPARATE dwell stamp (.midwork-rwy) DECOUPLED from the downstream
+    # active-worker .midwork stamp. Sharing it leaked across spins — an inactive worker that spun,
+    # idled (the downstream two-idle-tick reset is unreachable for it), then spun again later fired a
+    # FALSE Esc on a fresh spin from the stale stamp. Scope the dwell to ONE CONTINUOUS spin with the
+    # SAME two-idle-tick reset the downstream guard uses (.midwork-rwy.idle companion): a spinner
+    # cancels a pending idle-reset; two consecutive no-spinner ticks clear the stamp. Threshold/Esc
+    # unchanged. Own stamp ⇒ zero interference with the downstream active-worker flow.
+    if tp "$name" 200 > "$pane" 2>&1; then
+        local rwystamp="/tmp/cc-watch-${name}.midwork-rwy" rwyidle="/tmp/cc-watch-${name}.midwork-rwy.idle"
+        if tail -10 "$pane" | grep -qE "$MIDWORK_RE" ; then   # FIX A: canonical mid-work (was a narrower literal blind to cost-guard-only tokens)
+            local rwyfirst rwydwell RUNAWAY_DWELL=4500
+            rm -f "$rwyidle"                                    # spinner showing → cancel any pending idle-reset
+            rwyfirst=$(_numread "$rwystamp")
+            if [ "$rwyfirst" -eq 0 ]; then date +%s > "$rwystamp"; rwyfirst=$(_numread "$rwystamp"); fi
+            rwydwell=$(( $(date +%s) - rwyfirst ))
+            if [ "$rwydwell" -gt "$RUNAWAY_DWELL" ]; then
+                echo "$NOW [$name] RUNAWAY: mid-work ${rwydwell}s (>$((RUNAWAY_DWELL/60))min) — interrupting turn (Esc) regardless of cc-task state"
+                tmux send-keys -t "$name" Escape 2>/dev/null; sleep 1; tmux send-keys -t "$name" Escape 2>/dev/null
+                rm -f "$rwystamp" "$rwyidle"
+                echo "$NOW $name RUNAWAY mid-work >$((RUNAWAY_DWELL/60))min — interrupted (cc-task-agnostic); check it's not looping a DR" >> "$HOME/.cc-manager/escalations.log"
+                return
+            fi
+        elif [ -f "$rwystamp" ]; then
+            # NO spinner — scope the dwell to ONE continuous spin via a two-idle-tick reset (mirrors
+            # the downstream guard) so a stale cross-spin stamp can't fire a false Esc on a fresh spin.
+            if [ -f "$rwyidle" ]; then rm -f "$rwystamp" "$rwyidle"; else touch "$rwyidle"; fi
+        fi
+    fi
+
+    # Per-worker cost-guard: skip any worker without its own open cc-task. Stage 1
+    # already wrote an empty decision for these, but guard here too so no modal /
+    # draft / send path runs for a paused worker.
+    if ! is_active "$name"; then
+        echo "$NOW [$name] skip: no open cc-task (per-worker cost-guard)"
+        return
+    fi
+
+    if ! tp "$name" 200 > "$pane" 2>&1; then
+        echo "$NOW [$name] skip: session not present"
+        return
+    fi
+
+    # ── 5h USAGE-LIMIT gate (flood fix 2026-06-13; banner-text corrected 2026-06-13) ──
+    # ROOT CAUSE of the reset-flood: Claude Code's 5-HOUR usage limit makes a worker look
+    # idle; the brain keeps ts/cc-goal-ing prompts INTO the limited pane every tick, they
+    # QUEUE, and when the window resets the whole queue runs back-to-back → re-burns the
+    # fresh 5h. Fleet shares one limit → all reset together = thundering herd. FIX: while
+    # the banner is up, send NOTHING and keep the input box EMPTY (C-u) → zero queued at reset.
+    #
+    # BANNER TEXT (corrected — the original regex missed the real one): this Claude Code
+    # build prints the 5h limit MIS-LABELED as "You've hit your monthly spend limit. /usage-
+    # credits to adjust" (operator lesson: the "monthly spend limit" message is mislabeled; it's really the 5h limit).
+    # The classic form is "Claude usage limit reached · resets 3:45pm". Match BOTH. Do NOT
+    # match the bare phrase "usage limit" alone — the transient-stall error line literally
+    # says "(not your usage limit)", a NEGATION that would false-trigger; require "reached"
+    # or "resets <time>" or the spend-limit/usage-credits wording instead.
+    if tail -12 "$pane" | grep -qiE "spend limit|usage-credits|usage limit reached|limit will reset|resets [0-9]{1,2}(:[0-9]{2})?\s*(am|pm)"; then
+        # grill #1 fix (stale-banner circular trap): if the freeze gate's authoritative probe just
+        # proved tokens flow THIS tick (.freeze_resume fresh), the banner is STALE (panes don't refresh
+        # on their own). Re-freezing here would send nothing → no turn renders → banner stays → fleet
+        # frozen forever. Instead TRUST the probe: fall through to the send path (a real send refreshes
+        # the pane and clears the stale banner). Only one resume tick — it ages out in 150s.
+        local fr=0; fr=$(_numread "$HOME/.cc-manager/.freeze_resume")
+        if [ "$fr" -gt 0 ] && [ "$(( $(date +%s) - fr ))" -lt 150 ]; then
+            echo "$NOW [$name] limit banner present but probe=ok this tick (resume-override) — sending to refresh stale pane"
+            rm -f "/tmp/cc-watch-${name}.limited"
+        else
+            tmux send-keys -t "$name" C-u 2>/dev/null || true   # keep box empty → zero queued at reset
+            local resets
+            resets=$(tail -12 "$pane" | grep -oiE "resets [0-9]{1,2}(:[0-9]{2})?\s*(am|pm)?" | tail -1)
+            echo "$NOW [$name] skip: 5h USAGE LIMIT — input flushed, no sends until reset (${resets:-reset time unknown})"
+            touch "/tmp/cc-watch-${name}.limited"
+            return
+        fi
+    fi
+    # Banner gone → first clean tick after a limit. De-sync the shared-org herd: half the
+    # fleet (by name hash) holds ONE extra tick so workers don't all resume on the same
+    # cron fire and re-spike the limit the instant it lifts.
+    if [ -f "/tmp/cc-watch-${name}.limited" ]; then
+        rm -f "/tmp/cc-watch-${name}.limited"
+        if [ "$(( $(printf '%s' "$name" | cksum | cut -d' ' -f1) % 2 ))" -eq 0 ]; then
+            echo "$NOW [$name] limit lifted — de-sync: holding this tick to stagger resume"
+            return
+        fi
+        echo "$NOW [$name] limit lifted — resuming (de-sync: this worker resumes now)"
+    fi
+
+    # ── Thinking-block 400 wedge self-heal (operator lesson: "auto /clear + re-assign") ──
+    # Failure mode: "API Error: 400 ... `thinking` or `redacted_thinking` blocks in the
+    # latest assistant message cannot be modified". This PERMANENTLY corrupts the
+    # conversation — EVERY later turn 400s, and a nudge just feeds the corruption. The
+    # worker cannot self-recover; it sits dead holding an open task forever.
+    # KEY LEARNING (operator lesson): /clear briefly recovers but can RE-WEDGE; a
+    # single /clear is NOT a guaranteed fix. So this is a TWO-STAGE heal, never an
+    # unattended respawn (kill+recruit is a big hammer — leave that to the manager):
+    #   stage 1 (2-cycle-confirmed): auto `/clear` + re-goal from the worker's open
+    #           cc-task (cc-task goalfor). Marks .wedgehealed.
+    #   stage 2: if STILL wedged on a later cycle (healed flag present) → /clear failed
+    #           → ESCALATE: stop nudging, loud log + ~/.cc-manager/escalations.log +
+    #           macOS notif for the manager to do a kill+recreate (cc-recruit). Do NOT
+    #           auto-/clear again, do NOT auto-respawn.
+    # Match ONLY the permanent thinking-block signature — NOT transient 500/overload/429
+    # (those self-recover; a /clear would needlessly nuke good context).
+    if tail -30 "$pane" | grep -qE '(thinking|redacted_thinking)\x60? blocks in the latest assistant message cannot be modified|`thinking` or `redacted_thinking` blocks'; then
+        local wedgeseen="/tmp/cc-watch-${name}.wedgeseen"
+        local wedgehealed="/tmp/cc-watch-${name}.wedgehealed"
+        if [ -f "$wedgehealed" ]; then
+            # stage 2 — /clear already tried, still wedged → escalate (throttle 30min)
+            local wescal="/tmp/cc-watch-${name}.wedgeescal" enow eprev
+            enow=$(date +%s); eprev=0
+            eprev=$(_numread "$wescal")
+            if [ "$((enow - eprev))" -gt 1800 ]; then
+                echo "$NOW [$name] WEDGE PERSISTS post-/clear — ESCALATE: needs kill+recreate (cc-recruit $name); NOT auto-respawned"
+                echo "$NOW $name PERMANENTLY WEDGED (thinking-block 400) — /clear failed, manager must kill+recreate (cc-recruit $name)" >> "$HOME/.cc-manager/escalations.log"
+                osascript -e "display notification \"$name wedged (thinking-block 400), /clear failed — needs kill+recreate\" with title \"cc-manager escalation\"" >/dev/null 2>&1 || true
+                echo "$enow" > "$wescal"
+            else
+                echo "$NOW [$name] skip: wedge persists post-/clear, escalation throttled"
+            fi
+            return
+        fi
+        if [ -f "$wedgeseen" ]; then
+            # 2nd consecutive cycle → act: auto /clear + re-goal from open cc-task
+            echo "$NOW [$name] WEDGE confirmed 2-cycle (thinking-block 400) → auto /clear + re-goal"
+            tmux send-keys -t "$name" C-u 2>/dev/null
+            ts "$name" "/clear" >/dev/null 2>&1
+            sleep 2
+            local goalinfo
+            goalinfo=$(cc-task goalfor "$name" 2>/dev/null)
+            if [ -n "$goalinfo" ]; then
+                local gdesc="${goalinfo#*|}"
+                cc-goal "$name" "$gdesc" >/dev/null 2>&1 \
+                    && echo "$NOW [$name] re-goaled from ${goalinfo%%|*} after /clear" \
+                    || echo "$NOW [$name] err: re-goal failed after /clear"
+            else
+                echo "$NOW [$name] /clear done but no open cc-task to re-goal"
+            fi
+            touch "$wedgehealed"
+            rm -f "$wedgeseen"
+            return
+        fi
+        touch "$wedgeseen"
+        echo "$NOW [$name] WEDGE seen 1st cycle (thinking-block 400; need 2 cycles to act)"
+        return
+    fi
+    # Pane clean of the wedge signature → wipe any stale wedge state (recovered, or
+    # the /clear worked and the conversation is fresh).
+    rm -f "/tmp/cc-watch-${name}.wedgeseen" "/tmp/cc-watch-${name}.wedgehealed" "/tmp/cc-watch-${name}.wedgeescal"
+
+    # Mid-work guard: spinner glyph (✶/✻/✽) + present-continuous verb, or braille spinner,
+    # or "still thinking", or token-progress footer "(... tokens)".
+    # Mid-work guard — only signals that prove ACTIVE tool execution:
+    # spinner verb (✶ Zigzagging…) / braille spinner / "still thinking" /
+    # token-progress footer ("↓ 2.8k tokens"). Last 10 lines only (live render area).
+    #
+    # REMOVED from regex (false positives observed 2026-05-10):
+    # - `· N shells` / `· N monitors` — persist when background shells are idle
+    # - `esc to interrupt` — also persists when bg shells are running but Claude is idle
+    #   (bug: newbie pane showed `· 2 shells · esc to interrupt · ↓ to manage` for 13min
+    #   while Claude was IDLE waiting for me to submit; mid-work guard wrongly skipped
+    #   3 ticks, never invoked Ctrl-U + send to flush stale input).
+    # FIX A (2026-06-19) deliberately KEEPS this site on the NARROW literal: it is DUAL-DUTY
+    # (supervision-skip + runaway dwell), and broadening it to the canonical $MIDWORK_RE would
+    # re-introduce the 2026-05-10 idle-skip bug. The stalled-DR runaway case is already covered
+    # for ALL workers by the HOISTED watchdog at the top of watch_one (which uses $MIDWORK_RE),
+    # so this site does NOT need the broad tokens — keep it narrow to preserve the idle-skip fix.
+    if tail -10 "$pane" | grep -qE "(✶|✻|✽) [A-Z][a-z]+ing|still thinking|⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|[↑↓] [0-9]+(\.[0-9]+)?k tokens|Press up to edit queued|[0-9]+ local agent" ; then
+        # ── Runaway watchdog (operator lesson: "a deep-research run went on for over 2 hours") ──
+        # The old guard SKIPPED unconditionally while a spinner showed → a wedged/runaway turn
+        # (e.g. a /deep-research stuck 2h, or a single 198k-token thinking turn) was treated as
+        # "working, leave alone" FOREVER, burning huge tokens. Add a max-dwell: track continuous
+        # mid-work time; past RUNAWAY_DWELL interrupt the turn (Esc) so the worker re-plans.
+        # Threshold is generous (75min) so a legit 100-agent /deep-research (~30-40min) is NOT killed.
+        local mwstamp="/tmp/cc-watch-${name}.midwork" mwfirst mwdwell RUNAWAY_DWELL=4500
+        mwfirst=$(_numread "$mwstamp")
+        if [ "$mwfirst" -eq 0 ]; then date +%s > "$mwstamp"; mwfirst=$(_numread "$mwstamp"); fi
+        mwdwell=$(( $(date +%s) - mwfirst ))
+        if [ "$mwdwell" -gt "$RUNAWAY_DWELL" ]; then
+            echo "$NOW [$name] RUNAWAY: mid-work ${mwdwell}s (>$((RUNAWAY_DWELL/60))min) — interrupting turn (Esc) to break stuck DR / token-runaway"
+            tmux send-keys -t "$name" Escape 2>/dev/null; sleep 1; tmux send-keys -t "$name" Escape 2>/dev/null
+            rm -f "$mwstamp"
+            echo "$NOW $name RUNAWAY mid-work >$((RUNAWAY_DWELL/60))min — interrupted; check it's not looping a DR" >> "$HOME/.cc-manager/escalations.log"
+            return
+        fi
+        rm -f "/tmp/cc-watch-${name}.midwork.idle"   # saw mid-work → cancel any pending idle-reset
+        echo "$NOW [$name] skip: mid-work (dwell ${mwdwell}s)"
+        return
+    fi
+    # meta-grill HIGH #5: do NOT reset the runaway dwell timer on a SINGLE non-spinner tick — a real
+    # runaway (long DR / stuck turn) briefly shows non-spinner between tool calls, which used to wipe
+    # .midwork every time → the 75min dwell never accumulated → watchdog never fired. Require TWO
+    # consecutive idle ticks (a genuine return to idle) before clearing the dwell timer.
+    if [ -f "/tmp/cc-watch-${name}.midwork" ]; then
+        if [ -f "/tmp/cc-watch-${name}.midwork.idle" ]; then
+            rm -f "/tmp/cc-watch-${name}.midwork" "/tmp/cc-watch-${name}.midwork.idle"   # 2nd idle tick → genuinely idle, reset
+        else
+            touch "/tmp/cc-watch-${name}.midwork.idle"   # 1st non-spinner tick — could be a between-tool gap; wait one more
+        fi
+    fi
+
+    # ── Transient-API-stall re-poke ─────────────────────────────────────────────
+    # DISTINCT from the thinking-block 400 wedge above: a TRANSIENT API error
+    # ("temporarily limiting requests" / "Rate limited" / overloaded / 5xx / 429) KILLS
+    # the worker's in-flight turn and drops it to an EMPTY prompt mid-task. Claude Code
+    # does NOT auto-retry a turn killed this way — it just sits idle at the prompt. The
+    # /goal stays "active" so the worker LOOKS busy (cc-task in_progress) but nothing
+    # runs. The old "transient 5xx/429 self-recover" assumption (line ~166) is FALSE
+    # here: the turn is DEAD, not retrying. Observed once — a worker hit
+    # "temporarily limiting requests" mid-task, dropped to empty prompt, sat idle
+    # ~14min until the next cron tick (manager had to hand-nudge). FIX: re-emit
+    # the worker's LIVE goal (workers.json current_goal — the actual last direction sent,
+    # NOT cc-task goalfor which can return a stale first task; NO /clear, context is fine)
+    # to restart the dead turn. We are past the mid-work guard, so the worker is provably
+    # idle (not retrying). Gated on the transient signature near the pane BOTTOM (tail -15
+    # clears the ~7-line footer = the LAST turn died on it, not a stale scrollback hit)
+    # and throttled once/5min so a re-poke that itself rate-limits can't spin.
+    # Deterministic (no brain call): a dead turn must restart regardless of cc-decide.
+    if tail -15 "$pane" | grep -qiE "temporarily limiting requests|Rate limited|[Oo]verloaded|API Error: (429|5[0-9][0-9])"; then
+        local stall="/tmp/cc-watch-${name}.stallrepoke" snow sprev livegoal gf
+        snow=$(date +%s); sprev=0
+        sprev=$(_numread "$stall")
+        if [ "$((snow - sprev))" -gt 300 ]; then
+            livegoal=$(python3 - "$name" "$HOME/.cc-manager/workers.json" <<'PY' 2>/dev/null
+import json, sys
+from pathlib import Path
+name, regpath = sys.argv[1], sys.argv[2]
+p = Path(regpath); g = ""
+if p.exists():
+    for w in json.loads(p.read_text()).get("workers", []):
+        if w.get("name") == name:
+            g = w.get("current_goal", "") or ""
+            break
+sys.stdout.write(g)
+PY
+)
+            if [ -z "$livegoal" ]; then
+                gf=$(cc-task goalfor "$name" 2>/dev/null); livegoal="${gf#*|}"
+            fi
+            if [ -n "$livegoal" ]; then
+                cc-goal "$name" "$livegoal" >/dev/null 2>&1 \
+                    && echo "$NOW [$name] transient-stall: turn died on transient API error at idle prompt → re-goaled LIVE goal to restart" \
+                    || echo "$NOW [$name] err: transient-stall re-goal failed"
+            else
+                echo "$NOW [$name] transient-stall detected but no live goal to restart from"
+            fi
+            echo "$snow" > "$stall"
+        else
+            echo "$NOW [$name] skip: transient-stall re-poke throttled (<5min)"
+        fi
+        return
+    fi
+
+    # ── Proactive context recycle (operator lesson: "you need to compact workers more aggressively
+    # or they burn tokens too fast; a few requests exhaust the 5h limit — change the mechanism") ──
+    # Burn mechanism: workers carry 287-463k-token contexts while the prompt-cache TTL
+    # (5 min) is far shorter than the 20-min supervision cadence — so EVERY nudge
+    # re-reads the full context UNCACHED (observed: a worker at 83% context burned 89.1k
+    # tokens in ONE 14-min turn; a few such requests exhaust the 5h rolling limit).
+    # The /compact guard below only fires near auto-compact and still pays a fat
+    # summarize pass over the whole context. Cheaper fix: the moment a worker FINISHES
+    # its goal ("✔ Goal achieved" footer) while sitting on a fat context (Claude's own
+    # hint "new task? /clear to save NNNk tokens", N ≥ 150), recycle — /clear + re-goal
+    # from workers.json current_goal (the LIVE direction, same source as the
+    # transient-stall guard; deliverables are already committed per fleet rules, so the
+    # old context is dead weight). Only fires with a non-empty live goal (never strand
+    # a cleared worker with no direction); throttled once/30min per worker; mid-work
+    # guard above already proved the worker idle.
+    if tail -10 "$pane" | grep -qE "[✔✓] Goal achieved"; then
+        local savek
+        savek=$(tail -10 "$pane" | grep -oE '/clear to save [0-9]+(\.[0-9]+)?k tokens' | grep -oE '[0-9]+' | head -1)
+        if [ -n "$savek" ] && [ "$savek" -ge 150 ]; then
+            local rstamp="/tmp/cc-watch-${name}.recycle" rnow rprev rgoal
+            rnow=$(date +%s); rprev=0
+            rprev=$(_numread "$rstamp")
+            if [ "$((rnow - rprev))" -gt 1800 ]; then
+                rgoal=$(python3 - "$name" "$HOME/.cc-manager/workers.json" <<'PY' 2>/dev/null
+import json, sys
+from pathlib import Path
+name, regpath = sys.argv[1], sys.argv[2]
+p = Path(regpath); g = ""
+if p.exists():
+    for w in json.loads(p.read_text()).get("workers", []):
+        if w.get("name") == name:
+            g = w.get("current_goal", "") or ""
+            break
+sys.stdout.write(g)
+PY
+)
+                if [ -n "$rgoal" ]; then
+                    echo "$NOW [$name] context-recycle: goal achieved + ${savek}k reclaimable → /clear + re-goal (token-burn guard)"
+                    tmux send-keys -t "$name" C-u 2>/dev/null
+                    ts "$name" "/clear" >/dev/null 2>&1
+                    sleep 2
+                    cc-goal "$name" "$rgoal" >/dev/null 2>&1 \
+                        && echo "$NOW [$name] context-recycle: re-goaled live goal on fresh context" \
+                        || echo "$NOW [$name] err: context-recycle re-goal failed after /clear"
+                    echo "$rnow" > "$rstamp"
+                    return
+                fi
+                echo "$NOW [$name] context-recycle skipped: no live goal in workers.json (won't /clear without a re-goal path)"
+            else
+                echo "$NOW [$name] skip: context-recycle throttled (<30min)"
+                return
+            fi
+        fi
+    fi
+
+    # Context-pressure guard (a worker hit 100% / another 99% context with no recovery;
+    # a context-full worker can't think).
+    # FORMAT FIX: the LIVE footer shows "N% until auto-compact" (small N = high
+    # pressure), NOT "N% context used" (that string only appears in /context output in
+    # scrollback). The old regex matched the wrong format → dead guard. THRESHOLD
+    # WIDENED (operator lesson: "a few requests exhaust the 5h limit — change the
+    # mechanism"): [0-3]% fired only one breath before Claude's own auto-compact — by then
+    # the worker had already burned several near-full-context uncached turns. Now fires
+    # at <=15% until auto-compact so the summarize happens BEFORE the most expensive
+    # turns, plus keep the legacy "context used" string for safety. Mid-work guard
+    # above already returned on any active tool, so this only fires when idle.
+    # Throttled to once / 10min via a dedicated stamp; fires regardless of last-speaker.
+    if tail -8 "$pane" | grep -qE "(^|[^0-9])([0-9]|1[0-5])% until auto-compact|100% context used|9[5-9]% context used"; then
+        local clast="/tmp/cc-watch-${name}.compact"
+        local cnow cprev
+        cnow=$(date +%s); cprev=0
+        cprev=$(_numread "$clast")
+        if [ "$((cnow - cprev))" -gt 600 ]; then
+            echo "$NOW [$name] context-pressure: sending /compact"
+            tmux send-keys -t "$name" C-u 2>/dev/null
+            ts "$name" "/compact" >/dev/null 2>&1
+            echo "$cnow" > "$clast"
+        else
+            echo "$NOW [$name] skip: context high but /compact throttled"
+        fi
+        return
+    fi
+
+    # Modal guard — AskUserQuestion / list-picker / slash-cmd-picker / final-submit detection.
+    # All inner-Claude modals eat keystrokes — `ts "继续"` goes nowhere.
+    # Variants observed 2026-05-10:
+    #   - AskUserQuestion: "Enter to select · ↑/↓ to navigate · Esc to cancel"
+    #   - Slash command picker: "Enter to select · Tab/Arrow keys to navigate · Esc to cancel"
+    #   - Final-submit numbered list: "❯ 1. Submit answers / 2. Cancel"
+    #   - Submit/Cancel checkbox row: "← ☒ ... ✔ Submit →"
+    # Fix: dismiss modal with Esc (twice — outer + inner nested modals), brief sleep,
+    # re-capture pane, then proceed to normal send path so the brain's reply lands
+    # in the chat input box.
+    if tail -20 "$pane" | grep -qE "Enter to select.*Esc to cancel|Submit answers|✔ Submit|^[[:space:]]*Submit[[:space:]]*$"; then
+        echo "$NOW [$name] modal-dismiss: sending Esc"
+        tmux send-keys -t "$name" Escape 2>/dev/null
+        sleep 0.3
+        tmux send-keys -t "$name" Escape 2>/dev/null
+        sleep 0.5
+        # Re-capture pane after dismissal so downstream guards see fresh state
+        tp "$name" 200 > "$pane" 2>&1
+    fi
+
+    # Session-rating survey guard (observed blocking a worker).
+    # "How is Claude doing this session? 1: Bad 2: Fine 3: Good 0: Dismiss" eats the
+    # next keystroke, so the send path's C-u + ts never landed and a stale draft sat
+    # unsent. Esc is WRONG here: with a draft in the box, Esc opens the message-history
+    # navigator instead of dismissing. The correct dismiss is pressing "0" (Dismiss).
+    # Then C-a/C-k to flush any stale draft, re-capture, fall through to the send path.
+    if tail -12 "$pane" | grep -qE "How is Claude doing this session"; then
+        echo "$NOW [$name] survey-dismiss: sending 0 + clearing draft"
+        tmux send-keys -t "$name" "0" 2>/dev/null
+        sleep 0.3
+        tmux send-keys -t "$name" C-a 2>/dev/null
+        tmux send-keys -t "$name" C-k 2>/dev/null
+        sleep 0.4
+        tp "$name" 200 > "$pane" 2>&1
+    fi
+
+    # Last-speaker guard: only push "继续" when Claude (⏺) was the most recent speaker.
+    # If the user just submitted (❯) and Claude hasn't started thinking yet, skip — let Claude react.
+    local who
+    who=$(last_speaker "$pane")
+    if [ "$who" != "assistant" ]; then
+        echo "$NOW [$name] skip: last speaker = $who"
+        return
+    fi
+
+    # Monitor-loop guard: only fire when monitor is ACTIVELY running, not when only
+    # historical "Monitor event:" lines remain in the scrollback. Two checks must both pass:
+    #   1. Footer near the bottom shows the live monitor indicator ("· N monitor" or "N monitor ·")
+    #   2. ≥3 "Monitor event:" lines visible somewhere in the pane.
+    local mon_count
+    mon_count=$(grep -c "Monitor event:" "$pane" 2>/dev/null)
+    mon_count=${mon_count:-0}
+    local mon_active
+    mon_active=$(tail -10 "$pane" | grep -c -E "[0-9]+ monitor[^s]" 2>/dev/null)
+    mon_active=${mon_active:-0}
+    if [ "$mon_count" -ge 3 ] && [ "$mon_active" -ge 1 ]; then
+        echo "$NOW [$name] skip: monitor loop ($mon_count events visible)"
+        return
+    fi
+
+    # Throttle: don't fire more than once per 90s, even if all guards pass.
+    # Prevents spamming when our reply doesn't land (e.g. modal interrupt-state in inner Claude).
+    local now_epoch=$(date +%s)
+    if [ -f "$last" ]; then
+        local prev
+        prev=$(_numread "$last")
+        if [ -n "$prev" ] && [ "$((now_epoch - prev))" -lt 90 ]; then
+            echo "$NOW [$name] skip: throttled ($((now_epoch - prev))s since last send)"
+            return
+        fi
+    fi
+
+    # Brain: pre-fetched in stage 1 (parallel). Read from /tmp/cc-watch-<name>.decision.
+    # Distinguish brain SKIP from perl-alarm timeout via /tmp/cc-watch-<name>.exit
+    # (exit 142 = killed by SIGALRM, meaning brain didn't finish in 60s under
+    # parallel API contention — different fix than genuine SKIP).
+    local decision t_exit
+    decision=$(cat "/tmp/cc-watch-${name}.decision" 2>/dev/null)
+    t_exit=$(cat "/tmp/cc-watch-${name}.exit" 2>/dev/null)
+
+    if [ -z "$decision" ]; then
+        if [ "$t_exit" = "142" ]; then
+            # Brain timed out — NEVER touch the draft (worker may be mid-typing).
+            echo "$NOW [$name] skip: brain timeout (60s parallel API contention)"
+        else
+            # Genuine SKIP. A stale dead-end draft (e.g. a worker's stranded
+            # nudge) sits in the input box forever because SKIP never
+            # sends. Flush a non-empty draft ONLY if the SAME draft persisted 2
+            # consecutive cycles (1st cycle = record + leave alone; 2nd identical
+            # = it's stale, not actively-typed, so clear it). Tracked per worker.
+            local draftseen="/tmp/cc-watch-${name}.draftseen"
+            local cur_draft
+            cur_draft=$(grep -aE '^❯ .+' "$pane" 2>/dev/null | tail -1 | sed 's/^❯ //')
+            if [ -n "$cur_draft" ]; then
+                local prev_draft
+                prev_draft=$(cat "$draftseen" 2>/dev/null)
+                if [ "$cur_draft" = "$prev_draft" ]; then
+                    tmux send-keys -t "$name" C-a 2>/dev/null
+                    tmux send-keys -t "$name" C-k 2>/dev/null
+                    tmux send-keys -t "$name" C-u 2>/dev/null
+                    rm -f "$draftseen"
+                    echo "$NOW [$name] skip: brain said SKIP — flushed stale 2-cycle draft"
+                else
+                    echo "$cur_draft" > "$draftseen"
+                    echo "$NOW [$name] skip: brain said SKIP (draft seen 1st cycle, leaving)"
+                fi
+            else
+                rm -f "$draftseen"
+                echo "$NOW [$name] skip: brain said SKIP"
+            fi
+        fi
+        return
+    fi
+
+    # RETIRE control signal (operator lesson: "remove a worker once it's truly done or at a dead end").
+    # The brain emits "RETIRE: <reason>" ONLY when the whole mandate is terminal (done/dead).
+    # This is NEVER sent to the worker. Auto-retire is gated by a 2-consecutive-cycle
+    # confirm (your team's verify-before-retire rule — a worker's "exhausted" verdict
+    # was once FALSE, so a single brain call is not enough). tmux is KILLED (--kill)
+    # on auto-retire (operator lesson: "just auto-kill it ... worst case, rebuild from memory"):
+    # keeping hundreds of tmux+claude processes resident doesn't scale, and a retired
+    # worker is rebuildable from memory, so no grace period / reaper is needed.
+    case "$decision" in
+        RETIRE:*)
+            local reason retireseen prev_reason
+            reason=$(echo "$decision" | sed 's/^RETIRE *: *//')
+            retireseen="/tmp/cc-watch-${name}.retireseen"
+            prev_reason=$(cat "$retireseen" 2>/dev/null)
+            if [ -n "$prev_reason" ]; then
+                rm -f "$retireseen"
+                echo "$NOW [$name] RETIRE confirmed 2-cycle → cc-retire --kill: $reason"
+                cc-retire "$name" --verdict "[auto] $reason" --kill >/dev/null 2>&1 \
+                    && echo "$NOW [$name] retired (cron off, tmux killed — rebuildable from memory)" \
+                    || echo "$NOW [$name] err: cc-retire failed"
+            else
+                echo "$reason" > "$retireseen"
+                echo "$NOW [$name] RETIRE seen 1st cycle (need 2 to act): $reason"
+            fi
+            return
+            ;;
+    esac
+    # Not a RETIRE → any prior 1st-cycle RETIRE flag is stale, clear it.
+    rm -f "/tmp/cc-watch-${name}.retireseen"
+
+    # SAFETY (2026-05-29 self-audit): NEVER auto-send a destructive git command as a
+    # goal. The brain (cc-decide) echoes the worker's apparent next step; if that step
+    # is `git restore`/`reset --hard`/`checkout --`/`clean`/force-push/`branch -D`,
+    # auto-sending fires a destructive op on the SHARED working tree — one worker's
+    # restore discards ANOTHER worker's uncommitted work (observed: brain goaled one worker
+    # to `git restore` another worker's dirs; safe only because already committed + the
+    # worker happened to be careful). Destructive git intent must escalate to the hourly
+    # manager, not auto-fire. SKIP + log so the manager triages it.
+    if echo "$decision" | grep -qiE 'git[[:space:]]+(restore|reset[[:space:]]+--hard|checkout[[:space:]]+(--|\.)|clean[[:space:]]+-|push[[:space:]]+(--force|-f)|branch[[:space:]]+-D)'; then
+        echo "$NOW [$name] skip: brain emitted DESTRUCTIVE git op — NOT auto-sent (manager triage): $decision"
+        return
+    fi
+
+    # Clear any existing draft in the input box first, then send. C-u alone proved
+    # unreliable (a worker's stale draft survived C-u when cursor wasn't at
+    # line end); C-a (go to start) + C-k (kill to end) clears the whole line robustly.
+    tmux send-keys -t "$name" C-a 2>/dev/null
+    tmux send-keys -t "$name" C-k 2>/dev/null
+    tmux send-keys -t "$name" C-u 2>/dev/null
+    # HARD RULE (operator lesson: "make sure every message to a worker is a goal — this must hold"):
+    # EVERY worker message must be a persistent /goal, never a plain ts text. Route
+    # through cc-goal so the /goal command is sent AND workers.json current_goal is
+    # synced (so cc-roster reflects the live goal). If the brain already emitted a
+    # leading "/goal " or "/" slash-command, send it raw to avoid double-prefixing.
+    case "$decision" in
+        /goal\ *) send_payload="$decision" ;;
+        /*)       send_payload="$decision" ;;   # other slash-command, send as-is
+        *)        send_payload="/goal $decision" ;;
+    esac
+    # FIX #5 (meta-grill 2026-06-14): IDENTICAL-NUDGE CAP. The cron once re-sent a
+    # BYTE-IDENTICAL nudge 10× to a HEALTHY worker whose state never changed. State-
+    # machine doctrine: HEALTHY=silent, STUCK=nudge-once-then-MUTATE the ask. So if the
+    # payload is identical to the last one we sent this worker AND it has already been
+    # sent >=2 times, SKIP — re-sending the same words at an unchanged worker is noise;
+    # the manager must mutate the ask or diagnose. This is an EXTRA guard layered right
+    # before the ts send; it does not touch any existing guard above. Hard cap = 2.
+    local lastpf="/tmp/cc-watch-${name}.lastpayload"
+    local samecnt="/tmp/cc-watch-${name}.samepayloadcount"
+    local _prev_payload _same_n
+    _prev_payload=$(cat "$lastpf" 2>/dev/null)
+    if [ "$send_payload" = "$_prev_payload" ]; then
+        _same_n=$(_numread "$samecnt")
+        if [ "$_same_n" -ge 2 ]; then
+            echo "$NOW [$name] skip: identical nudge capped at 2 (worker state unchanged — mutate the ask or diagnose)"
+            return
+        fi
+        echo "$((_same_n + 1))" > "$samecnt"
+    else
+        # payload differs → reset the run-length counter and remember the new payload
+        printf '%s' "$send_payload" > "$lastpf"
+        echo 1 > "$samecnt"
+    fi
+    if ts "$name" "$send_payload" >/dev/null 2>&1; then
+        echo "$now_epoch" > "$last"
+        echo "$NOW [$name] sent: $send_payload"
+        # Sync registry current_goal when we sent a /goal (so roster isn't stale).
+        case "$send_payload" in
+            /goal\ *)
+                goal_text="${send_payload#/goal }"
+                python3 - "$name" "$goal_text" "$HOME/.cc-manager/workers.json" <<'PY' 2>/dev/null || true
+import json, sys
+from pathlib import Path
+name, goal, regpath = sys.argv[1], sys.argv[2], sys.argv[3]
+p = Path(regpath)
+if p.exists():
+    reg = json.loads(p.read_text())
+    for w in reg.get("workers", []):
+        if w.get("name") == name:
+            w["current_goal"] = goal
+            break
+    p.write_text(json.dumps(reg, indent=2, ensure_ascii=False))
+PY
+                ;;
+        esac
+    else
+        echo "$NOW [$name] err: ts failed"
+    fi
+}
+
+# Parallel cc-decide pre-fetch: spawn one brain call per session in background,
+# wait for all (or 45s perl alarm). Then process results serially for ts safety.
+# Cuts total time from sum(13-30s × N) to max(N) + overhead.
+sessions=()
+while IFS= read -r line || [ -n "$line" ]; do
+    name=$(echo "$line" | sed 's/#.*//' | xargs)
+    [ -z "$name" ] && continue
+    sessions+=("$name")
+done < "$CFG"
+
+# Stage 1 (parallel): capture pane + brain decision for each session.
+# Each background job writes to /tmp/cc-watch-<name>.decision so main loop
+# can pick them up serially in stage 2.
+# grill #6 fix: `${arr[@]+"${arr[@]}"}` expands to NOTHING (not an unbound-var abort) when sessions
+# is empty under bash 3.2 + set -u — a comment-only watch.list no longer kills the whole tick.
+for name in ${sessions[@]+"${sessions[@]}"}; do
+    # Per-worker gate: a worker with no open cc-task is paused — don't pay for its
+    # brain call and don't risk re-goaling it off stale pane state. Write an empty
+    # decision so stage 2's watch_one early-returns, and skip the 5s stagger.
+    if ! is_active "$name"; then
+        echo "" > "/tmp/cc-watch-${name}.decision"
+        echo "SKIP_IDLE" > "/tmp/cc-watch-${name}.exit"
+        echo "$NOW [$name] skip: no open cc-task — brain not invoked (per-worker cost-guard 省钱)"
+        continue
+    fi
+    (
+        pane="/tmp/cc-watch-${name}.pane"
+        tp "$name" 200 > "$pane" 2>&1 || {
+            echo "" > "/tmp/cc-watch-${name}.decision"
+            echo "ERR" > "/tmp/cc-watch-${name}.exit"
+            # Audit trail: distinguish a genuinely-vanished session (crash /
+            # manual kill, still in watch.list) from other capture failures.
+            # Silent vanish = observability gap (observed once on a worker).
+            if ! tmux has-session -t "$name" 2>/dev/null; then
+                echo "$NOW [$name] WARN: session not in tmux but still in watch.list — vanished (crash/manual-kill?); cc-rm $name to clear or investigate"
+            else
+                echo "$NOW [$name] WARN: pane capture failed but session exists — transient tp/tmux error, will retry next cycle"
+            fi
+            exit 0
+        }
+        # Run brain only if pane was captured. Mid-work / modal / last_speaker
+        # checks happen in stage 2 to keep this stage simple + safe.
+        # 90s alarm (bumped from 60s 2026-05-28) — under N-parallel Claude API
+        # load some calls queue; combined with the 5s stagger below this cuts
+        # exit-142 brain-timeout SKIPs. Exit code 142 = killed by SIGALRM; stored
+        # separately so stage 2 distinguishes brain-said-SKIP from brain-timeout.
+        decision=$(perl -e 'alarm 90; exec @ARGV' $HOME/.local/bin/cc-decide "$pane" 2>/dev/null)
+        echo $? > "/tmp/cc-watch-${name}.exit"
+        echo "$decision" > "/tmp/cc-watch-${name}.decision"
+    ) &
+    # Stagger launches 5s apart (anti-burst): firing all cc-decide brain calls at
+    # once overloaded the API and caused exit-142 timeouts. Spreading the spawns
+    # keeps each call inside its 90s window. (anti-burst spirit.)
+    sleep 5
+done
+wait
+
+# Stage 2 (serial): apply guards + send via ts.
+for name in ${sessions[@]+"${sessions[@]}"}; do
+    touch "$LOCKDIR" 2>/dev/null   # grill #3 fix: refresh lock mtime so a live (slow) tick is never age-stolen
+    watch_one "$name"
+done
+
+# Stage 3 — cc-monitor: deliverable detection + paid escalation (added 2026-05-27).
+# Runs after all brain decisions, so it sees the freshest pane state.
+# Output prefixed with [monitor] for log filtering.
+if [ -x "$HOME/.local/bin/cc-monitor" ]; then
+    touch "$LOCKDIR" 2>/dev/null || true   # FIX D: heartbeat the lock BEFORE a slow cc-monitor so it can't age past LOCK_MAX_AGE → second tick steals the lock
+    "$HOME/.local/bin/cc-monitor" 2>&1 | sed 's/^/[monitor] /'
+    touch "$LOCKDIR" 2>/dev/null || true   # FIX D: heartbeat AFTER cc-monitor (re-anchors lock mtime before Stage 4's Opus task-audit)
+fi
+
+# Stage 4 — gated task-audit (folds the retired standalone task-status-audit cron INTO cc-watch;
+# operator lesson: "fold the separate audit cron into cc-watch"). Mirrors cc-review's SAFE pattern: a read-only
+# `claude -p` EMITS JSON, bash ACTS on it — so the headless claude never needs write
+# permission and can't hang on a permission prompt. The standalone audit cron is REMOVED;
+# THIS Stage 4 IS the task-audit now — gated, runs after cc-monitor each tick (no separate cron).
+# Replicates your team's cron-prompt docs "Hourly task-status audit" Step 2/3 logic.
+_CC_TASK="$HOME/.local/bin/cc-task"
+if [ -x "$_CC_TASK" ]; then
+    # GATE (cheap, no spawn when clean): only proceed if there is >=1 PENDING cc-task WITH a
+    # deliverable. cc-task pending prints a 2-line header then `  <ID> <STATUS> <ASSIGNEE>
+    # <DESC(55)> <DELIVERABLE>`; the DELIVERABLE column begins at char 97 (2 + 11+1 + 13+1 +
+    # 11+1 + 55+1). Count data rows whose deliverable column holds a path / .md / .json.
+    _ta_pending=$("$_CC_TASK" pending 2>/dev/null)
+    _ta_count=$(printf '%s\n' "$_ta_pending" | awk '
+        NR>2 && /^  T-/ { d=substr($0,97); if (d ~ /\/|\.md|\.json/) c++ }
+        END { print c+0 }')
+    if [ "${_ta_count:-0}" -eq 0 ]; then
+        echo "[task-audit] skip (no pending task w/ deliverable)"
+    else
+        # GATED ON — spawn ONE headless READ-ONLY claude -p (mirror cc-review's
+        # _run_builtin_review invocation exactly: cd $REPO && claude -p --add-dir $REPO
+        # --output-format json, model claude-opus-4-8, NO write tools). It only READS each
+        # pending deliverable and EMITS the JSON envelope below.
+        _TA_REPO="${CC_REPO:-$HOME/your-repo}"
+        _ta_prompt="You are the cc-manager task-audit (read-only). Do NOT trust pane keywords — READ the actual deliverable files. Here are the PENDING tasks (cc-task pending output):
+${_ta_pending}
+
+For each PENDING task that has a deliverable (a path / .md / .json in the DELIVERABLE column), resolve and OPEN that deliverable and judge: is it GENUINELY CLOSED (the doc states a terminal ALIVE/DEAD/DELIVERED verdict), or still iterating? Also sanity-check any cc-monitor auto-flips that look wrong.
+
+Reply with ONE JSON object and NOTHING ELSE (no prose, no markdown fences):
+{\"flips\":[{\"id\":\"T-..\",\"verdict\":\"<one-line read FROM the doc's own verdict, not a guess>\",\"artifact\":\"<commit-sha-or-path>\"}],\"reopen\":[{\"id\":\"T-..\",\"reason\":\"why this cc-monitor auto-flip looks wrong\"}]}
+flips = tasks you confirmed genuinely closed (leave still-iterating ones OUT). reopen = cc-monitor auto-flips that look wrong (do NOT include tasks that are simply still open). Empty arrays are fine: {\"flips\":[],\"reopen\":[]}."
+        touch "$LOCKDIR" 2>/dev/null || true   # FIX D: heartbeat the lock BEFORE the unbounded Opus task-audit so it can't age past LOCK_MAX_AGE mid-run
+        # FIX D: bound the task-audit claude -p with a GENEROUS 300s alarm (mirror cc-decide:1539 /
+        # cc-review's perl-alarm) so an unbounded Opus call can't run past LOCK_MAX_AGE and let a
+        # second tick steal the lock. perl exec inherits the piped stdin, so the prompt still streams in.
+        _ta_raw=$(cd "$_TA_REPO" && printf '%s' "$_ta_prompt" | perl -e 'alarm 300; exec @ARGV' claude -p --add-dir "$_TA_REPO" --model "claude-opus-4-8" --output-format json 2>/dev/null) || _ta_raw=""
+        # Parse the envelope like cc-review does: .result holds the model text; pull the first
+        # {...} JSON object out of it. RAW passed via ENV (not a stdin pipe) so the heredoc-free
+        # `python3 -c` program isn't confused with the data.
+        _ta_json=$(RAW="$_ta_raw" python3 -c '
+import json,os,re
+raw=os.environ.get("RAW","")
+try:
+    env=json.loads(raw); txt=env.get("result","") if isinstance(env,dict) else ""
+except Exception:
+    txt=""
+m=re.search(r"\{.*\}", txt, re.S)
+print(m.group(0) if m else "")' 2>/dev/null)
+        # BASH acts on the parsed JSON: flips -> cc-task done; reopen -> LOG ONLY (no auto-reopen).
+        # Emit TSV (flip<TAB>id<TAB>verdict<TAB>artifact) / (reopen<TAB>id<TAB>reason) so the shell
+        # loop never has to re-parse JSON.
+        _ta_flipped=0; _ta_reopen=0
+        if [ -n "$_ta_json" ]; then
+            while IFS=$'\t' read -r _kind _id _f3 _f4; do
+                [ -z "${_id:-}" ] && continue
+                case "$_kind" in
+                    flip)
+                        "$_CC_TASK" done "$_id" --verdict "$_f3" --artifact "$_f4" >/dev/null 2>&1 \
+                            && _ta_flipped=$((_ta_flipped+1))
+                        ;;
+                    reopen)
+                        echo "[task-audit] reopen-flagged $_id: $_f3"
+                        _ta_reopen=$((_ta_reopen+1))
+                        ;;
+                esac
+            done < <(JSON="$_ta_json" python3 -c '
+import json,os
+try:
+    d=json.loads(os.environ.get("JSON","") or "{}")
+except Exception:
+    d={}
+def clean(s):
+    return str(s or "").replace("\t"," ").replace("\n"," ").strip()
+for f in (d.get("flips") or []):
+    i=clean(f.get("id"))
+    if i: print("flip\t%s\t%s\t%s" % (i, clean(f.get("verdict")), clean(f.get("artifact"))))
+for r in (d.get("reopen") or []):
+    i=clean(r.get("id"))
+    if i: print("reopen\t%s\t%s\t" % (i, clean(r.get("reason"))))')
+        fi
+        echo "[task-audit] flipped $_ta_flipped / reopen-flagged $_ta_reopen"
+    fi
+fi

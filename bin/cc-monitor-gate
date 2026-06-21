@@ -1,0 +1,70 @@
+#!/bin/bash
+# cc-monitor-gate — cost gate for the manager's monitor cron (2026-06-12).
+# Purpose: when the 5h token limit lifts, ALL queued cron firings replay into the
+# manager thread. This gate collapses them: the first firing does a real round and
+# stamps; every other backlogged firing exits here in ONE cheap Bash call.
+# Also skips full rounds when the whole fleet is quiescent (no pane changed),
+# which is what burned tokens overnight when all work was already done.
+#
+#   cc-monitor-gate          → prints cc-freeze-check lines + verdict (SKIP … | PROCEED)
+#   cc-monitor-gate --stamp  → record a completed full round (call at END of a real round)
+set -u
+DIR="$HOME/.cc-manager"
+STAMP="$DIR/.monitor_round.last"
+HASHF="$DIR/.monitor_pane_hashes"
+SKIPC="$DIR/.monitor_skip_count"
+OVERF="$DIR/.monitor_last_overall"
+WL="$DIR/watch.list"
+MIN_GAP=$((20*60))   # min seconds between full rounds (absorbs queued replays)
+MAX_IDLE_SKIPS=3     # force a full round after this many consecutive idle-skips (~75min cap)
+
+pane_hashes() {
+  while read -r s; do
+    [ -n "$s" ] || continue
+    h=$(tmux capture-pane -p -t "$s" 2>/dev/null | tail -12 | md5 -q 2>/dev/null || echo MISS)
+    echo "$s $h"
+  done < "$WL"
+}
+
+if [ "${1:-}" = "--stamp" ]; then
+  date +%s > "$STAMP"
+  pane_hashes > "$HASHF"
+  echo 0 > "$SKIPC"
+  exit 0
+fi
+
+now=$(date +%s); last=$(cat "$STAMP" 2>/dev/null || echo 0); gap=$((now-last))
+
+# 1) backlog collapse: a full round finished < MIN_GAP ago → this firing is a queued replay
+if [ "$gap" -lt "$MIN_GAP" ]; then
+  echo "SKIP backlog-collapse: last full round $((gap/60))min ago (<$((MIN_GAP/60))min)"
+  exit 0
+fi
+
+# 2) freeze gate (pane-checks every session via cc-freeze-check)
+fz=$("$HOME/.local/bin/cc-freeze-check")
+echo "$fz"
+prev_overall=$(cat "$OVERF" 2>/dev/null || echo ACTIVE)
+if echo "$fz" | grep -q "OVERALL: FROZEN"; then
+  echo FROZEN > "$OVERF"
+  echo "SKIP frozen"
+  exit 0
+fi
+echo ACTIVE > "$OVERF"
+
+# 3) first ACTIVE round after a freeze must run in full (resume verification)
+if [ "$prev_overall" = "FROZEN" ]; then
+  echo "PROCEED (first active round after freeze — verify resumes)"
+  exit 0
+fi
+
+# 4) idle-skip: no pane changed since the last full round → fleet quiescent, nothing to do
+skips=$(cat "$SKIPC" 2>/dev/null || echo 0)
+if [ -f "$HASHF" ] && [ "$skips" -lt "$MAX_IDLE_SKIPS" ]; then
+  if pane_hashes | diff -q - "$HASHF" >/dev/null 2>&1; then
+    echo $((skips+1)) > "$SKIPC"
+    echo "SKIP idle: no pane changed since last full round (skip $((skips+1))/$MAX_IDLE_SKIPS)"
+    exit 0
+  fi
+fi
+echo "PROCEED"

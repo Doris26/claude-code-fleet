@@ -1,0 +1,303 @@
+#!/bin/bash
+# cc-recruit — one-command worker recruit that ALWAYS sets /goal.
+# Per operator lesson "onboarding can also carry a goal" — codify "recruit always
+# anchors mandate via /goal" so the manager can't forget it.
+#
+# Flow: spawn tmux+claude → capture remote URL FIRST (halt if missing) → /effort
+#       ultracode → set /goal FIRST (verified, the persistent first directive) →
+#       paste onboarding (context) → cc-add (cron) → update workers.json → cc-task
+#
+# Usage:
+#   cc-recruit <name> <onboarding_file> "<goal mandate>" "<role>" "<task desc>" "<deliverable>"
+#
+# Example:
+#   cc-recruit demo_worker /tmp/onboard_demo.txt \
+#       "build three candidate baskets, research + score, explore-not-ship" \
+#       "candidate basket research" \
+#       "Build the candidate baskets + dimensional scoring" \
+#       "research/baskets/"
+set -e
+
+[ $# -ge 3 ] || { echo "Usage: cc-recruit <name> <onboarding_file> '<goal>' ['<role>'] ['<task>'] ['<deliverable>'] ['<agent_type|raw>']" >&2; exit 2; }
+
+NAME="$1"; ONBOARD_FILE="$2"; GOAL="$3"
+ROLE="${4:-worker}"; TASKDESC="${5:-$GOAL}"; DELIV="${6:-}"
+# $7 agent-type (operator lesson "decide base type from the task; raw if none fits"): the MANAGER picks
+# the persona that fits the task and passes it; empty => role-based default; "raw"/"none" => plain claude.
+AGENT_TYPE="${7:-}"
+
+LB="$HOME/.local/bin"
+
+# Name INFERENCE (operator lesson "infer the name from my instructions / no need to ask me"):
+# the session name no longer has to be supplied or user-confirmed. If NAME is a placeholder
+# (auto / infer / - / "" / name), derive a short slug from the GOAL/instruction text — first
+# salient lowercase token, stopwords stripped, <=14 chars, sanitized [a-z0-9_]. The caller
+# (manager) should normally just pass the name it inferred from the user's words; `auto` is the
+# zero-friction fallback so a recruit NEVER blocks on naming or asks the user. role=manager
+# infers to 'manager' when the goal mentions it. Collisions get a -2/-3 suffix below.
+case "$(printf '%s' "$NAME" | tr 'A-Z' 'a-z')" in
+  auto|infer|-|""|name)
+    if [ "$ROLE" = "manager" ]; then
+        INF="manager"
+    else
+        INF=$(printf '%s' "$GOAL" | tr 'A-Z' 'a-z' | tr -cs 'a-z0-9' ' ' | tr ' ' '\n' \
+            | grep -vxE 'the|a|an|to|of|for|on|in|and|or|is|are|be|new|build|run|re|bt|test|tests|explore|exploration|strategy|strat|worker|manager|find|with|via|using|that|this|do|task|goal|sleeve|leg|qc|free|data|vs|per|keeper|fix|add' \
+            | grep -E '^[a-z][a-z0-9]{2,}' | head -1 | cut -c1-14)
+    fi
+    NAME="${INF:-worker}"
+    echo "ℹ️  cc-recruit: inferred session name '$NAME' from ${ROLE} goal (no user prompt)" >&2
+    ;;
+esac
+# collision-safe: if a session of that name already exists, suffix -2/-3...
+if tmux has-session -t "$NAME" 2>/dev/null; then
+    base="$NAME"; n=2
+    while tmux has-session -t "${base}-${n}" 2>/dev/null; do n=$((n+1)); done
+    NAME="${base}-${n}"
+    echo "ℹ️  cc-recruit: '${base}' exists -> using '${NAME}'" >&2
+fi
+
+[ -f "$ONBOARD_FILE" ] || { echo "onboarding file not found: $ONBOARD_FILE" >&2; exit 1; }
+
+# Account guard ("Standard recruit flow"): ~/.claude.json's account can
+# silently switch on a shared machine — it once flipped to a colleague's account mid-session and 5
+# workers spawned under THEIR account+quota, unreachable by you. Verify BEFORE spawn; abort if not the
+# intended account. Override with CC_EXPECT_ACCT env if the intended account ever changes.
+EXPECT_ACCT="${CC_EXPECT_ACCT:-you@example.com}"
+CUR_ACCT=$(python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.claude.json')))['oauthAccount']['emailAddress'])" 2>/dev/null)
+if [ "$CUR_ACCT" != "$EXPECT_ACCT" ]; then
+    echo "✋ ABORT recruit '$NAME': CLI account is '${CUR_ACCT:-unknown}', not '$EXPECT_ACCT'." >&2
+    echo "   A worker spawned now runs under the WRONG account+quota and is unreachable by the user." >&2
+    echo "   Fix: /login to $EXPECT_ACCT (or set CC_EXPECT_ACCT) and re-run." >&2
+    exit 5
+fi
+echo "✓ account verified: $CUR_ACCT" >&2
+
+# Robust remote-control URL capture. Run FIRST — while the session is idle and
+# nothing else is redrawing the pane. Operator hard rule: "we need the remote
+# url first". Capturing BEFORE /effort + onboarding is what keeps the URL line
+# on-screen long enough to grep; once onboarding pastes, it scrolls out forever.
+_capture_url() {
+    local name="$1" url="" i attempt
+    for attempt in 1 2; do
+        "$LB/ts" "$name" "/remote-control" >/dev/null
+        for i in $(seq 1 30); do
+            sleep 1
+            url=$(tmux capture-pane -t "$name" -p -S -400 2>/dev/null \
+                  | grep -oE "https://claude.ai/code/session_[a-zA-Z0-9_-]+" | head -1)
+            [ -n "$url" ] && { printf '%s' "$url"; return 0; }
+        done
+        # Only re-send if remote control did NOT come up — re-sending an already
+        # ACTIVE session toggles it OFF.
+        tmux capture-pane -t "$name" -p | grep -qi "Remote Control active" && break
+    done
+    return 1
+}
+
+echo "1. spawning tmux session '$NAME'..."
+# Wrap claude in a shell (`; exec $SHELL`) so the SESSION SURVIVES claude exiting.
+# Root cause of "pane GONE" deaths: with `new-session "claude"` the session's
+# sole process is claude — when /loop ends / goal completes / claude exits, tmux destroys the
+# whole session (remain-on-exit is off by default) and it can never be re-nudged. Falling back
+# to a shell keeps the pane alive so cc-keepalive can restart claude in-place / state is inspectable.
+# role=manager: launch under the
+# cc-manager AGENT so the Tier-1 non-negotiables live in its SYSTEM PROMPT (persist in context, survive
+# compaction — not "read once at onboarding then drift", which is how the manager actually drifted).
+# Source is git-tracked at personas/cc-manager.agent.md; .claude/ is gitignored, so copy the def
+# into the user-level agents dir (found regardless of session CWD) at spawn — the tracked file stays truth.
+CLAUDE_CMD="claude"
+REPO_DIR="${CC_REPO:-$HOME/your-repo}"
+# claude-code-fleet install dir (parent of this bin/) — where personas/, docs/, plugins/ live
+CC_HOME="${CC_HOME:-$(cd "$(dirname "$0")/.." && pwd)}"
+# Every recruited agent boots under a PERSONA whose SYSTEM PROMPT carries the Tier-1 non-negotiables
+# (persist in context, not "read once & drift"). AGENT-TYPE SELECTION: the manager
+# picks the type that fits the TASK and passes it ($7); if it passes nothing we fall back to a role-based
+# default (manager->cc-manager, else->researcher); if no existing type fits the task the manager passes
+# "raw" => plain claude with no persona. Source defs are git-tracked in personas/<type>.agent.md;
+# .claude/ is gitignored, so copy into the user-level agents dir at spawn.
+if [ -z "$AGENT_TYPE" ]; then
+    if [ "$ROLE" = "manager" ]; then AGENT_TYPE="cc-manager"; else AGENT_TYPE="researcher"; fi
+fi
+# SANITIZE $7: AGENT_TYPE is interpolated into a file path AND into the tmux
+# command-STRING (`claude --agent $X; exec ...`, shell-interpreted). A `../` traversed outside the
+# agents dir (cp dest collapsed to ~/.claude/<x>.md) and a `;`/$()/backtick is a latent shell-injection
+# sink. $7 comes from the manager LLM (trusted-ish), so a garbled arg is the realistic threat. Reject
+# anything outside [a-z0-9_-] up-front → fall back to raw (plain claude) rather than spawn-corrupt.
+case "$AGENT_TYPE" in
+  raw|none) : ;;  # explicit raw passes the guard
+  *[!a-zA-Z0-9_-]*) echo "   ⚠️  agent-type '${AGENT_TYPE}' has invalid chars — falling back to raw (plain claude)" >&2; AGENT_TYPE="raw" ;;
+esac
+if [ "$AGENT_TYPE" = "raw" ] || [ "$AGENT_TYPE" = "none" ]; then
+    echo "   agent-type=raw -> plain claude (no persona; no existing type fit this task)"
+elif [ -f "$CC_HOME/personas/${AGENT_TYPE}.agent.md" ]; then
+    # --agent resolves by the def's `name:` FRONTMATTER field, not the filename. Use the frontmatter
+    # name so a future def whose name: differs from its filename doesn't silently boot persona-less.
+    AGENT_NAME=$(awk -F': *' '/^name:/{print $2; exit}' "$CC_HOME/personas/${AGENT_TYPE}.agent.md" | tr -d '[:space:]')
+    AGENT_NAME="${AGENT_NAME:-$AGENT_TYPE}"
+    if mkdir -p "$HOME/.claude/agents" && cp "$CC_HOME/personas/${AGENT_TYPE}.agent.md" "$HOME/.claude/agents/${AGENT_NAME}.md" 2>/dev/null; then
+        CLAUDE_CMD="claude --agent ${AGENT_NAME}"
+        echo "   agent-type='${AGENT_TYPE}' (name: ${AGENT_NAME}) -> launching under it (Tier-1 rules in system prompt)"
+    else
+        echo "   ⚠️  ${AGENT_TYPE} agent def copy failed — spawning plain claude" >&2
+    fi
+else
+    echo "   ⚠️  agent-type '${AGENT_TYPE}' has no def in personas/${AGENT_TYPE}.agent.md — falling back to raw (plain claude)" >&2
+fi
+tmux new-session -d -s "$NAME" "$CLAUDE_CMD; exec ${SHELL:-/bin/zsh}"
+tmux set-option -t "$NAME" history-limit 50000 2>/dev/null || true
+# Wait for the TUI to render (poll, not a blind sleep).
+for _ in $(seq 1 25); do
+    tmux capture-pane -p -t "$NAME" 2>/dev/null | grep -qE "Claude Code v|Try \"|❯ " && break
+    sleep 1
+done
+
+echo "2. capturing remote-control URL FIRST (before onboarding — operator rule)..."
+URL="$(_capture_url "$NAME")" || URL=""
+# Claude Code v2.1.170+: /remote-control connects but NO LONGER prints a URL into
+# the pane (empirically hit on a recruit — RC footer said
+# "Remote Control active" yet zero claude.ai/code lines in 2000-line scrollback).
+# Fall back to the /status Session ID so the registry still identifies the session
+# in the claude.ai/code list, and DON'T halt — RC itself is working.
+if [ -z "$URL" ] && tmux capture-pane -t "$NAME" -p | grep -qi "Remote Control active"; then
+    "$LB/ts" "$NAME" "/status" >/dev/null
+    sleep 5
+    SID=$(tmux capture-pane -t "$NAME" -p -S -150 2>/dev/null \
+          | grep -oE "Session ID:[[:space:]]+[a-f0-9-]{36}" | head -1 | awk '{print $NF}')
+    tmux send-keys -t "$NAME" Escape   # dismiss /status overlay before onboarding
+    sleep 1
+    if [ -n "$SID" ]; then
+        URL="remote-control ACTIVE (v2.1.170+ prints no URL); session-id $SID"
+        echo "   ✓ RC active, URL not printed (v2.1.170+) — recorded session-id $SID"
+    fi
+fi
+if [ -n "$URL" ]; then
+    echo "   ✓ URL: $URL"
+else
+    echo "   ✗ remote-control URL NOT captured after 2 attempts (and RC not active)." >&2
+    echo "     HALTING before onboarding so the URL isn't lost. Session '$NAME' is up + idle." >&2
+    echo "     Recover:  ts $NAME '/remote-control' ; tp $NAME 30 | grep claude.ai/code" >&2
+    echo "     Then continue manually (remaining recruit steps), or kill + re-run cc-recruit." >&2
+    exit 3
+fi
+
+# /effort ultracode — THIS SEND IS REQUIRED, do not remove. Verified empirically:
+# ultracode is NOT persistable via settings.json (`effortLevel` accepts
+# only low/medium/high/xhigh/max — "ultracode" silently falls back to "high"; the
+# `env.CLAUDE_CODE_EFFORT_LEVEL` value is ignored). Fresh sessions default to xhigh,
+# so this session-scoped `/effort ultracode` slash command is the ONLY enable path.
+echo "3. /effort ultracode..."
+# RETRY until the footer actually shows ultracode: a single send+grep
+# raced the TUI render and emitted a false "not visible" warning even though /effort had
+# landed. Send while the session is still idle (pre-goal) so it can't queue behind work;
+# verify up to 3 times. Footer shows "ultracode" once active.
+eff_ok=0
+for attempt in 1 2 3; do
+    "$LB/ts" "$NAME" "/effort ultracode" >/dev/null
+    sleep 3
+    if tmux capture-pane -t "$NAME" -p -S -20 | grep -qi "ultracode"; then eff_ok=1; break; fi
+    sleep 2
+done
+if [ "$eff_ok" = 1 ]; then
+    echo "   ✓ ultracode active (verified)"
+else
+    echo "   ⚠ ultracode still not visible after 3 tries — pane may be busy; re-run: ts $NAME '/effort ultracode'"
+fi
+
+# Set /goal FIRST — the recruit's first directive must be the PERSISTENT anchor,
+# not a scrolling onboarding message that the worker loses on scroll/compaction
+# (operator rule "the first message for the new recruit also needs to be a
+# goal"). Sent here while the session is still idle, so the slash command anchors
+# cleanly before onboarding work begins. Verify a NEW "Goal set:" line appeared —
+# "goal active" alone is a false positive (matches any/worker-set goal).
+echo "4. setting /goal FIRST (persistent first directive)..."
+_gcount() { tmux capture-pane -p -t "$NAME" -S -2000 2>/dev/null | grep -c "Goal set:" || true; }  # grep -c exits 1 on 0 matches; guard set -e
+_gb=$(_gcount); goal_ok=0
+for attempt in 1 2 3; do
+    "$LB/ts" "$NAME" "/goal $GOAL" >/dev/null
+    sleep 4
+    [ "$(_gcount)" -gt "$_gb" ] && { goal_ok=1; break; }
+    sleep 4
+done
+if [ "$goal_ok" = 1 ]; then
+    echo "   ✓ /goal anchored (verified new 'Goal set:' line)"
+else
+    echo "   ⚠ /goal did NOT anchor after 3 tries — fix manually: cc-goal $NAME '<goal>'"
+fi
+
+echo "5. sending onboarding (context: must-reads + rules + deliverable)..."
+tmux load-buffer -t "$NAME" "$ONBOARD_FILE"
+tmux paste-buffer -t "$NAME"
+sleep 3
+tmux send-keys -t "$NAME" Enter
+sleep 2
+tmux send-keys -t "$NAME" Enter
+sleep 4
+
+# Mandatory skills-read (operator lesson "make sure every new worker reads all the skills"): injected by
+# cc-recruit so EVERY worker reads the skills/rules library regardless of what onboarding file was passed —
+# the manager can't forget it. Skills = the accumulated ALIVE/DEAD lessons; not reading them = repeating
+# dead angles. Sent as a goal-prefixed nudge so it survives as a standing instruction.
+"$LB/ts" "$NAME" "必读(开工前):你团队的 skills/rules docs(全部索引,Tier-1 硬规则必读)+ <CC_HOME>/docs/MECHANISM_INDEX.md(机制总览)+ docs/MANAGER_RULES.md。这些是积累的 ALIVE/DEAD 教训和制度;不读 = 重复已死的角度。读完再开工。" >/dev/null 2>&1
+sleep 2
+
+# CCDR prompt-quality (operator lesson "make sure workers have a high-quality ccdr prompt"): CCDR is
+# GIGO — a worker's exploration is only as good as its /deep-research prompt. Inject the prompt template
+# so workers don't free-form a weak prompt (the #1 failure is skipping the DEAD-list → re-exploring
+# refuted angles).
+if [ "$ROLE" != "manager" ]; then
+    "$LB/ts" "$NAME" "跑 /deep-research(CCDR)前 MUST 按团队的 DR-prompt 模板组 prompt(别 free-form 弱 prompt):(1) goal+metric+acceptance(精确到要打的数);(2) DEAD-list——从本任务的 PROGRESS doc + memory 粘已死角度,明确叫它别再提(漏这条 = 最大浪费源);(3) novelty/orthogonality bar(机制上有因果、corr<0.4);(4) deliverable = ranked candidates,每个带 mechanism / expected-result / free-data 可得性(或需哪个付费 feed)/ 一个 \$0 falsification test;(5) cite-required;(6) free-first + 尊重 excluded scope。" >/dev/null 2>&1
+    sleep 2
+fi
+
+# Manager handover — kill predecessor's crons (operator lesson "a new manager needs to kill the old
+# manager's cron"): a new manager TAKES OVER from a predecessor. The :17/:41/:13 supervision crons are
+# per-session IN-MEMORY — they die only when that Claude session exits and CANNOT be CronDelete'd from
+# another session. Two live managers => double-firing crons (duplicate audits, conflicting auto-fixes,
+# 2x API load). On takeover the NEW manager MUST ensure the predecessor's crons are dead BEFORE recreating its own.
+if [ "$ROLE" = "manager" ]; then
+    "$LB/ts" "$NAME" "你在接管旧 manager。开工前 MUST 杀掉旧 manager 的 cron:旧 manager 的 supervision cron(:17 self-audit/:41 task-audit/:13 mechanism-grill)是 per-session in-memory,只能由它自己 CronDelete 或随它 claude 退出清空,你从本 session 删不到它的。步骤:(1) 找出旧 manager session(cc-roster / tmux ls + 看哪个 pane 跑过 cc-watch/cc-recruit);(2) ts 它 'CronList→CronDelete 所有 supervision cron,提交 WIP,退出 claude';(3) 它若赖着不退就 tmux kill-session(in-memory cron 随之清);(4) 确认旧 cron 死了。然后【第一要务】按 cron-prompts.md 重建你自己的全部 4 个 Claude cron —— launchd 已 DISABLED(operator『只保留 claude cron』),这 4 个是唯一的监督、随 session 死,忘建=零监督(没人 cc-review commit、没 freeze、没 keepalive、没 task-audit、没 memory consolidation):(1) cc-watch backbone『4,34 * * * *』跑 <CC_HOME>/bin/cc-watch(cc-review-on-每个commit + freeze + keepalive + cc-monitor + task-audit LLM 兜底)—— 最关键;(2) skill-capture『12 */4 * * *』跑 auto_skill_capture.py --hours 24 --commit(治 skill rot);(3) :13 mechanism-grill(不 gated,machinery audit,subagent-driven,12h);(4) dream『27 */6 * * *』跑 /dream skill 做 memory consolidation、重建 memory 索引(治 memory rot,~/.claude/skills/dream),不 gated。每个 recurring work-cron(cc-watch/skill-capture/dream)的 prompt 必须 SPAWN 一个 subagent(Agent tool, general-purpose)去跑命令、只回传那一行结果 —— 绝不在 manager 自己 context 里跑(operator 强调『use subagent to do the cron so do not occupy your heavy context!!!!』);grill 本身就是 fan-out workflow。直接照 cron-prompts.md『How to recreate』里的 CronCreate prompt 原样重建,别退回 bare run:。建完用 CronList 核对 4 个都在。(已删::17 self-audit 不要了;:41 task-audit 折进了 cc-watch)。绝不两个 manager 同跑 supervision cron。" >/dev/null 2>&1
+    sleep 2
+fi
+
+if [ "$ROLE" = "manager" ]; then
+    echo "6. role=manager -> SKIP cc-add (the manager RUNS cc-watch; it must NOT be on its own watch.list as a supervised worker)"
+    echo "   ⚠️  OLD MANAGER (you, the caller): you just spawned a replacement manager. STAND DOWN cleanly —"
+    echo "      run CronList -> CronDelete ALL your supervision crons (:17/:41/:13) so they don't double-fire"
+    echo "      with the new manager, commit any WIP (explicit pathspec), then exit this claude session"
+    echo "      (in-memory crons die only on exit; a lingering old manager keeps double-supervising)."
+else
+    echo "6. cc-add (cron watch)..."
+    "$LB/cc-add" "$NAME" >/dev/null
+fi
+
+echo "7. registry + cc-task..."
+python3 - "$NAME" "$URL" "$ROLE" "$GOAL" <<'PY'
+import json, sys
+from datetime import datetime
+from pathlib import Path
+name, url, role, goal = sys.argv[1:5]
+p = Path.home() / ".cc-manager" / "workers.json"
+d = json.loads(p.read_text()) if p.exists() else {"workers": []}
+now = datetime.now()
+# replace if exists
+d["workers"] = [w for w in d["workers"] if w["name"] != name]
+# goal_updated stamped at recruit too (cc-recruit sets /goal but does NOT route
+# through cc-goal) so cc-monitor's check_goal_stale doesn't false-flag a fresh hire.
+d["workers"].append({"name": name, "tmux": name, "url": url,
+                     "recruited": now.strftime("%Y-%m-%d"),
+                     "role": role, "status": "active", "watch": role != "manager",
+                     "current_goal": goal, "goal_updated": now.isoformat()})
+d["updated"] = now.strftime("%Y-%m-%d")
+p.write_text(json.dumps(d, indent=2))
+print("   registry updated")
+PY
+
+if [ -n "$DELIV" ]; then
+    TID=$("$LB/cc-task" add "$TASKDESC" --assignee "$NAME" --deliverable "$DELIV")
+    echo "   cc-task: $TID"
+else
+    TID=$("$LB/cc-task" add "$TASKDESC" --assignee "$NAME")
+    echo "   cc-task: $TID"
+fi
+
+echo ""
+echo "recruited: $NAME  [$URL]  /goal set, cron on, registry+task done"

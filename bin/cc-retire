@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""cc-retire — full teardown of a completed worker session.
+
+When a worker finishes its exploration mandate (signal class exhausted,
+direction closed, deliverables done), retire it cleanly:
+  1. Mark all its active cc-tasks done (with verdict)
+  2. cc-rm from watch.list (stop cron nudges)
+  3. Update workers.json status → "completed"
+  4. tmux kill-session (ONLY with --kill; by default keeps tmux for inspection
+     — kill needs explicit flag)
+  5. Append retire event to ~/.cc-manager/events.jsonl
+
+Usage:
+  cc-retire <name> --verdict "<one-line why done>"            # cron off, tmux KEPT
+  cc-retire <name> --verdict "..." --kill                     # full teardown incl tmux kill
+
+Per operator lesson "when it's done you can clear both the agent and its cron" → use --kill for
+full clear. Default (no --kill) preserves tmux for inspection.
+"""
+import argparse
+import json
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+WORKERS_FILE = Path.home() / ".cc-manager" / "workers.json"
+EVENTS_FILE = Path.home() / ".cc-manager" / "events.jsonl"
+CC_RM = Path.home() / ".local" / "bin" / "cc-rm"
+CC_TASK = Path.home() / ".local" / "bin" / "cc-task"
+TS = Path.home() / ".local" / "bin" / "ts"
+CC_KEEPALIVE = Path.home() / ".local" / "bin" / "cc-keepalive"
+KEEPALIVE_DIR = Path.home() / ".cc-manager" / "keepalive"
+
+
+def materialize_tasks() -> list:
+    tf = Path.home() / ".cc-manager" / "tasks.jsonl"
+    if not tf.exists():
+        return []
+    tasks = {}
+    for line in tf.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        tid = e["id"]
+        if tid not in tasks:
+            tasks[tid] = {"id": tid, "assignee": e.get("assignee", ""), "status": "assigned"}
+        ev = e.get("event")
+        if ev == "done":
+            tasks[tid]["status"] = "completed"
+        elif ev == "cancel":
+            tasks[tid]["status"] = "cancelled"
+        elif ev in ("start", "unblock"):
+            tasks[tid]["status"] = "in_progress"
+        elif ev == "block":
+            tasks[tid]["status"] = "blocked"
+    return list(tasks.values())
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("name")
+    ap.add_argument("--verdict", required=True, help="one-line reason for retirement")
+    ap.add_argument("--kill", action="store_true", help="also tmux kill-session (full teardown)")
+    args = ap.parse_args()
+    name = args.name
+
+    # 1. Mark active tasks done
+    active = [t for t in materialize_tasks()
+              if t["assignee"] == name and t["status"] in ("assigned", "in_progress", "blocked")]
+    for t in active:
+        subprocess.run([str(CC_TASK), "done", t["id"], "--verdict", f"[retire] {args.verdict}"],
+                       check=False, capture_output=True, timeout=10)
+        print(f"  task {t['id']} → done")
+
+    # 2. cc-rm from watch.list
+    subprocess.run([str(CC_RM), name], check=False, capture_output=True, timeout=10)
+    print(f"  cron: removed from watch.list")
+
+    # 3. workers.json status → completed
+    if WORKERS_FILE.exists():
+        d = json.loads(WORKERS_FILE.read_text())
+        for w in d.get("workers", []):
+            if w["name"] == name:
+                w["status"] = "completed"
+                w["retired_at"] = datetime.now().isoformat()
+                w["retire_verdict"] = args.verdict
+                w["watch"] = False
+        d["updated"] = datetime.now().strftime("%Y-%m-%d")
+        WORKERS_FILE.write_text(json.dumps(d, indent=2))
+        print(f"  registry: {name} → completed")
+
+    # 3b. Neutralize the /goal + keepalive engine BEFORE the tmux step (even when --kill is
+    # omitted) so a non-killed retired worker IDLES instead of self-restarting into closed-
+    # frontier work (observed 3rd occurrence: workers auto-drifted post-retire).
+    # (a) clear/neutralize the goal anchor; (b) disarm keepalive so /loop doesn't re-arm it.
+    subprocess.run([str(TS), name, "/goal (retired — no further work; awaiting manager)"],
+                   check=False, capture_output=True, timeout=15)
+    print(f"  goal: neutralized (retired anchor)")
+    if CC_KEEPALIVE.exists():
+        subprocess.run([str(CC_KEEPALIVE), "disarm", name], check=False, capture_output=True, timeout=10)
+    else:
+        (KEEPALIVE_DIR / name).unlink(missing_ok=True)
+    print(f"  keepalive: disarmed")
+
+    # 4. tmux kill (only with --kill)
+    if args.kill:
+        subprocess.run(["tmux", "kill-session", "-t", name], check=False, capture_output=True, timeout=10)
+        print(f"  tmux: session killed (full teardown)")
+    else:
+        print(f"  tmux: KEPT (use --kill for full teardown; default preserves for inspection)")
+
+    # 5. event log
+    EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with EVENTS_FILE.open("a") as f:
+        f.write(json.dumps({"ts": datetime.now().isoformat(), "event": "retire", "worker": name,
+                            "verdict": args.verdict, "killed": args.kill,
+                            "tasks_closed": [t["id"] for t in active]}) + "\n")
+    print(f"\nretired: {name} ({len(active)} task(s) closed){'  [tmux killed]' if args.kill else '  [tmux kept]'}")
+
+
+if __name__ == "__main__":
+    main()

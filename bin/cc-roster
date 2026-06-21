@@ -1,0 +1,92 @@
+#!/bin/bash
+# cc-roster — list all managed worker sessions + their state.
+# Cross-checks ~/.cc-manager/workers.json (registry) with live tmux + watch.list.
+#
+# Usage:
+#   cc-roster              # pretty-print active workers
+#   cc-roster --all        # include archived
+#   cc-roster --json       # raw registry
+set -u
+
+REGISTRY="$HOME/.cc-manager/workers.json"
+WATCH_LIST="$HOME/.cc-manager/watch.list"
+
+[ -f "$REGISTRY" ] || { echo "no registry at $REGISTRY" >&2; exit 1; }
+
+if [ "${1:-}" = "--json" ]; then
+    cat "$REGISTRY"
+    exit 0
+fi
+
+show_all=false
+[ "${1:-}" = "--all" ] && show_all=true
+
+# Get live tmux sessions
+live_tmux=$(tmux ls 2>/dev/null | awk -F: '{print $1}')
+
+# Get watched sessions
+watched=""
+[ -f "$WATCH_LIST" ] && watched=$(grep -v '^\s*#' "$WATCH_LIST" | grep -v '^\s*$')
+
+printf "\n  %-15s %-9s %-7s %-7s  %s\n" "NAME" "STATUS" "TMUX" "CRON" "CURRENT GOAL / ROLE"
+printf "  %s\n" "─────────────────────────────────────────────────────────────────────────────────"
+
+python3 <<PY
+import json
+from pathlib import Path
+
+reg = json.loads(Path("$REGISTRY").read_text())
+live_tmux = """$live_tmux""".strip().split("\n")
+watched = """$watched""".strip().split("\n")
+
+# Read LIVE active cc-task per assignee (fixes stale workers.json current_goal)
+import json as _j
+tasks_file = Path.home() / ".cc-manager" / "tasks.jsonl"
+live_task = {}  # assignee -> latest active task description
+if tasks_file.exists():
+    st = {}
+    for line in tasks_file.read_text().splitlines():
+        line = line.strip()
+        if not line: continue
+        try: e = _j.loads(line)
+        except: continue
+        tid = e["id"]
+        if tid not in st:
+            st[tid] = {"assignee": e.get("assignee",""), "desc": e.get("description",""), "status":"assigned"}
+        ev = e.get("event")
+        if ev=="done": st[tid]["status"]="completed"
+        elif ev=="cancel": st[tid]["status"]="cancelled"
+        elif ev in ("start","unblock"): st[tid]["status"]="in_progress"
+        elif ev=="block": st[tid]["status"]="blocked"
+    for t in st.values():
+        if t["status"] in ("assigned","in_progress","blocked"):
+            live_task[t["assignee"]] = f"{t['status'][:4]}: {t['desc'][:60]}"
+
+show_all = "$show_all" == "true"
+for w in reg.get("workers", []):
+    status = w.get("status", "?")
+    if not show_all and status != "active":
+        continue
+    name = w["name"]
+    tmux = "✓" if name in live_tmux else "✗"
+    cron = "✓" if name in watched else "—"
+    # Prefer registry current_goal (now synced to the LIVE /goal by cc-goal)
+    # over cc-task, which can show a cancelled/stale task. Fall back to
+    # cc-task, then role.
+    goal = (w.get("current_goal") or live_task.get(name) or w.get("role", ""))[:70]
+    print(f"  {name:<12} {status:<8} {tmux:<5} {cron:<5}  {goal}")
+PY
+
+echo
+echo "  Total active: $(python3 -c "import json; r=json.load(open('$REGISTRY')); print(sum(1 for w in r['workers'] if w.get('status')=='active'))")"
+echo "  Tmux live: $(echo "$live_tmux" | grep -c .)"
+echo "  Cron watched: $(echo "$watched" | grep -c .)"
+echo
+echo "  Manage:"
+echo "    cc-add <name>       → enable cron monitoring"
+echo "    cc-rm  <name>       → disable cron (keep tmux)"
+echo "    tp <name> N         → peek last N lines of pane"
+echo "    ts <name> '<msg>'   → send message"
+echo "    cc-recruit <name>   → recruit new worker (auto cc-add to watch.list)"
+echo "    cc-retire <name>    → mark worker completed (updates registry)"
+echo

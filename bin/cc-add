@@ -1,0 +1,17 @@
+#!/bin/bash
+# cc-add: add a tmux session name to the watch list (idempotent)
+# Usage: cc-add <name>
+set -e
+[ $# -eq 1 ] || { echo "Usage: cc-add <name>" >&2; exit 2; }
+NAME="$1"
+CFG="$HOME/.cc-manager/watch.list"
+mkdir -p "$(dirname "$CFG")"
+touch "$CFG"
+if grep -qxF "$NAME" "$CFG"; then
+    echo "already watching: $NAME"
+else
+    echo "$NAME" >> "$CFG"
+    echo "added: $NAME"
+fi
+echo "--- watch list ---"
+grep -v '^\s*#' "$CFG" | grep -v '^\s*$' || echo "(empty)"

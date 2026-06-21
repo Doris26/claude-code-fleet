@@ -1,0 +1,19 @@
+#!/bin/bash
+# tp: peek (read-only) the visible pane of a tmux session
+# Usage: tp <name> [history_lines]
+set -e
+
+if [ $# -lt 1 ]; then
+    echo "Usage: tp <name> [history_lines]" >&2
+    exit 2
+fi
+
+NAME="$1"
+HIST="${2:-0}"
+
+if ! tmux has-session -t "$NAME" 2>/dev/null; then
+    echo "Session '$NAME' not found" >&2
+    exit 1
+fi
+
+tmux capture-pane -t "$NAME" -p -S -"$HIST"

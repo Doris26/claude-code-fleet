@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""cc-paidblock — registry of research lines BLOCKED on paid data the user gated.
+
+Separate append-only db at ~/.cc-manager/paid_blocks.jsonl. Every entry records a
+research line we could NOT pursue because it needs a paid feed the user declined
+(or has not yet approved), plus WHY — the price, which free sources were already
+checked and found insufficient, and the verdict. Purpose: never re-propose the
+same paid lever, and keep an auditable trail of cost-gated decisions.
+
+Usage:
+  cc-paidblock add --line <主线> --data "<what paid data>" \
+      [--task <T-id>] [--worker <name>] [--price "<$/mo>"] \
+      [--providers "<a,b>"] [--free-checked "<what free was tried + why short>"] \
+      [--reason "<why blocked>"] [--status gated|declined|pending|approved]
+  cc-paidblock list [--status ...] [--line ...]
+  cc-paidblock resolve <id> --status <approved|declined> [--note "..."]
+
+Statuses:
+  gated    — needs user $ approval, not yet decided (default)
+  declined — user said no (don't re-propose)
+  pending  — purchased/approved but creds/feed not yet wired
+  approved — live, data available
+"""
+import argparse
+import json
+import sys
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+DB = Path.home() / ".cc-manager" / "paid_blocks.jsonl"
+DB.parent.mkdir(parents=True, exist_ok=True)
+DB.touch(exist_ok=True)
+
+
+def load() -> list[dict]:
+    out = []
+    for ln in DB.read_text().splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            out.append(json.loads(ln))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def materialize() -> dict[str, dict]:
+    """Replay events: a `resolve` event mutates the matching record's status/note."""
+    recs: dict[str, dict] = {}
+    for e in load():
+        i = e["id"]
+        if e.get("event") == "resolve":
+            if i in recs:
+                recs[i]["status"] = e.get("status", recs[i]["status"])
+                if e.get("note"):
+                    recs[i]["resolve_note"] = e["note"]
+                recs[i]["resolved_at"] = e["ts"]
+        else:
+            recs[i] = e
+    return recs
+
+
+def append(e: dict):
+    e["ts"] = datetime.now().isoformat()
+    with DB.open("a") as f:
+        f.write(json.dumps(e, ensure_ascii=False) + "\n")
+
+
+def cmd_add(a):
+    rec = {
+        "id": f"PB-{uuid.uuid4().hex[:8]}",
+        "event": "block",
+        "line": a.line,
+        "task": a.task,
+        "worker": a.worker,
+        "data": a.data,
+        "price": a.price,
+        "providers": a.providers,
+        "free_checked": a.free_checked,
+        "reason": a.reason,
+        "status": a.status,
+    }
+    append(rec)
+    print(f"registered {rec['id']}  [{a.status}]  {a.line} — {a.data}")
+
+
+def cmd_resolve(a):
+    recs = materialize()
+    if a.id not in recs:
+        print(f"no such block {a.id}", file=sys.stderr)
+        sys.exit(1)
+    append({"id": a.id, "event": "resolve", "status": a.status, "note": a.note})
+    print(f"{a.id} → {a.status}")
+
+
+def cmd_list(a):
+    recs = list(materialize().values())
+    if a.status:
+        recs = [r for r in recs if r.get("status") == a.status]
+    if a.line:
+        recs = [r for r in recs if r.get("line") == a.line]
+    recs.sort(key=lambda r: r.get("ts", ""), reverse=True)
+    if not recs:
+        print("(no paid blocks)")
+        return
+    icon = {"gated": "💰", "declined": "🚫", "pending": "⏳", "approved": "✅"}
+    for r in recs:
+        st = r.get("status", "?")
+        print(f"\n{icon.get(st,'•')} {r['id']}  [{st}]  主线={r.get('line')}"
+              f"  {('task='+r['task']) if r.get('task') else ''}"
+              f"  {('@'+r['worker']) if r.get('worker') else ''}")
+        print(f"   数据: {r.get('data')}")
+        if r.get("price"):
+            print(f"   价格: {r['price']}"
+                  + (f"  ({r['providers']})" if r.get("providers") else ""))
+        if r.get("free_checked"):
+            print(f"   免费已查: {r['free_checked']}")
+        if r.get("reason"):
+            print(f"   原因: {r['reason']}")
+        if r.get("resolve_note"):
+            print(f"   裁决: {r['resolve_note']}")
+        print(f"   登记: {r.get('ts','')[:16]}"
+              + (f"  裁决于 {r['resolved_at'][:16]}" if r.get("resolved_at") else ""))
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    pa = sub.add_parser("add", help="register a paid-data block")
+    pa.add_argument("--line", required=True, help="research line (lineA/lineB/...)")
+    pa.add_argument("--data", required=True, help="what paid data is needed")
+    pa.add_argument("--task", help="related cc-task id")
+    pa.add_argument("--worker")
+    pa.add_argument("--price", help="e.g. ~$30-100/mo")
+    pa.add_argument("--providers", help="comma list of vendors")
+    pa.add_argument("--free-checked", dest="free_checked",
+                    help="what free sources were tried + why insufficient")
+    pa.add_argument("--reason", help="why this is blocked / the cost-gate call")
+    pa.add_argument("--status", default="gated",
+                    choices=["gated", "declined", "pending", "approved"])
+    pa.set_defaults(func=cmd_add)
+
+    pr = sub.add_parser("resolve", help="update a block's decision")
+    pr.add_argument("id")
+    pr.add_argument("--status", required=True,
+                    choices=["gated", "declined", "pending", "approved"])
+    pr.add_argument("--note")
+    pr.set_defaults(func=cmd_resolve)
+
+    pl = sub.add_parser("list", help="show registered blocks")
+    pl.add_argument("--status",
+                    choices=["gated", "declined", "pending", "approved"])
+    pl.add_argument("--line")
+    pl.set_defaults(func=cmd_list)
+
+    a = p.parse_args()
+    a.func(a)
+
+
+if __name__ == "__main__":
+    main()

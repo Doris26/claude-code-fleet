@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""generic verify-claim — the default, domain-agnostic verification provider.
+
+It does NOT have a ground-truth backend. Instead it surfaces every result-artifact
+the commit *cites* in its added lines (URLs, long hex/uuid ids, run/build/job ids)
+so a human reviewer can eyeball them, and returns verdict SKIP (non-blocking).
+
+Swap in a real backend (e.g. plugins/quant-qc, or your own GitHub-Actions /
+artifact-store resolver) via CC_VERIFY_PLUGIN to turn these citations into a
+PASS/FAIL gate. See plugins/README.md for the interface contract.
+
+Usage:  verify-claim <sha> [--repo <path>]
+Output: {"verdict": "SKIP", "checked": N, "issues": [...]}
+"""
+import json, os, re, subprocess, sys
+from pathlib import Path
+
+REPO = os.environ.get("CC_REPO") or str(Path.home() / "your-repo")
+args = sys.argv[1:]
+sha = None
+i = 0
+while i < len(args):
+    if args[i] == "--repo":
+        REPO = args[i + 1]; i += 2
+    else:
+        sha = args[i]; i += 1
+if not sha:
+    print(json.dumps({"verdict": "SKIP", "note": "no sha"})); sys.exit(0)
+
+try:
+    diff = subprocess.run(["git", "-C", REPO, "show", "--format=", sha],
+                          capture_output=True, text=True, timeout=30).stdout
+except Exception:
+    print(json.dumps({"verdict": "SKIP", "note": "git show failed"})); sys.exit(0)
+
+added = "\n".join(l[1:] for l in diff.splitlines()
+                  if l.startswith("+") and not l.startswith("+++"))
+
+# Tokens that commonly denote a cited result-artifact a worker might fabricate.
+PATTERNS = {
+    "url":     re.compile(r"https?://[^\s)'\"]+"),
+    "hex-id":  re.compile(r"\b[0-9a-f]{16,64}\b"),
+    "run-id":  re.compile(r"\b(?:run|build|job|backtest|bt)[-_ ]?id[\"'= :]+([A-Za-z0-9-]{6,})", re.I),
+}
+cited = []
+for kind, rx in PATTERNS.items():
+    for m in rx.findall(added):
+        val = m if isinstance(m, str) else m[0]
+        cited.append(f"{kind}: {val}")
+
+cited = sorted(set(cited))
+issues = ([f"cited but UNVERIFIED (generic provider has no backend): {c}" for c in cited]
+          if cited else [])
+print(json.dumps({"verdict": "SKIP", "checked": len(cited), "issues": issues}))

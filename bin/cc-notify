@@ -1,0 +1,59 @@
+#!/bin/bash
+# cc-notify — LOCAL user-notify primitive for cc-manager escalations (self-audit #5).
+#
+# WHY: every "escalate to user" in the mechanism was previously ONLY a print to a cron log nobody
+# watches. This makes an escalation actually REACH the user: a macOS notification (best-effort) +
+# a durable append to ~/.cc-manager/escalations.log. Per-topic dedup so it fires ONCE, not every tick.
+#
+# Usage:  cc-notify "<topic>" "<msg>"
+#   <topic> — short stable key (e.g. "premature-exhaust:lineA", "paid:research_dr", "terminal:lineB").
+#             Dedup is per-topic: the SAME topic fires once until the sent-stamp is cleared/ages out.
+#   <msg>   — one-line human-readable escalation text.
+#
+# Dedup stamp: /tmp/cc-notify-<topic-hash>.sent  (re-fires after DEDUP_TTL so a still-open escalation
+# resurfaces ~daily instead of going silent forever).
+#
+# OUTWARD COMMS (e.g. chat/Slack to your approver) are DELIBERATELY NOT wired here — outward comms are
+# a manager decision (an operator-facing send), so see the clearly-commented OPTIONAL stub at the
+# bottom, default OFF. This primitive is LOCAL-only by design.
+set -uo pipefail
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/sbin"
+
+topic="${1:-}"; msg="${2:-}"
+[ -n "$topic" ] && [ -n "$msg" ] || { echo "Usage: cc-notify '<topic>' '<msg>'" >&2; exit 2; }
+
+ESCLOG="$HOME/.cc-manager/escalations.log"
+mkdir -p "$(dirname "$ESCLOG")"
+DEDUP_TTL=86400   # 24h — re-fire a still-open topic about once a day, not every 30min tick
+
+# Stable per-topic dedup stamp (hash so arbitrary topic text is filename-safe).
+thash=$(printf '%s' "$topic" | shasum 2>/dev/null | cut -c1-16)
+[ -n "$thash" ] || thash=$(printf '%s' "$topic" | tr -c 'a-zA-Z0-9' '_' | cut -c1-32)
+stamp="/tmp/cc-notify-${thash}.sent"
+
+# Fire only if no fresh sent-stamp for this topic.
+now=$(date +%s)
+prev=0
+[ -f "$stamp" ] && prev=$(cat "$stamp" 2>/dev/null | tr -cd '0-9'); prev=${prev:-0}
+if [ "$((now - prev))" -lt "$DEDUP_TTL" ]; then
+    exit 0   # already notified this topic recently — stay quiet
+fi
+
+# 1) macOS notification (best-effort; guarded so a headless/non-mac host just skips it).
+if command -v osascript >/dev/null 2>&1; then
+    osascript -e "display notification \"${msg//\"/\'}\" with title \"cc-manager\" subtitle \"${topic//\"/\'}\"" >/dev/null 2>&1 || true
+fi
+
+# 2) Durable escalation log (the manager reads this).
+printf '%s [notify:%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$topic" "$msg" >> "$ESCLOG"
+
+# 3) Record the sent-stamp so the per-topic dedup holds.
+printf '%s' "$now" > "$stamp"
+
+# --- OPTIONAL outward chat send to your approver (DEFAULT OFF — outward comms = manager decision) ---
+# Intentionally a no-op stub. Outward operator-facing comms are a manager call, NOT something this
+# mechanism should auto-fire. To enable, a manager would set CC_NOTIFY_SLACK=1 and wire a send here
+# (e.g. a chat CLI to your approver's channel). Left disabled on purpose.
+# if [ "${CC_NOTIFY_SLACK:-0}" = "1" ]; then : ; fi
+
+exit 0

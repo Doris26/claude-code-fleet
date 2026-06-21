@@ -1,0 +1,94 @@
+#!/bin/bash
+# cc-goal — set a worker's PERSISTENT session goal via Claude Code /goal command.
+# Updated (operator lesson "don't use a GOAL: text prefix, use the /goal cmd"):
+#   DEFAULT now uses the /goal slash command (persistent, status-bar anchored),
+#   NOT a "GOAL: " text prefix. The literal-prefix approach is deprecated.
+#
+# Usage:
+#   cc-goal <session> "<persistent objective>"
+#       → ts "<session>" "/goal <objective>"  (sets status-bar-anchored goal)
+#   cc-goal <session> --nudge "<tactical next-step>"
+#       → ts "<session>" "<msg>"  (plain tactical message, NO prefix)
+#
+# /goal for persistent anchoring; plain ts for tactical per-cycle nudges.
+# No "GOAL:" text tag anymore.
+
+set -e
+
+[ $# -ge 2 ] || { echo "Usage: cc-goal <session> [--nudge] '<message>'" >&2; exit 2; }
+
+NAME="$1"; shift
+TS="$HOME/.local/bin/ts"
+
+if [ "$1" = "--nudge" ]; then
+    shift
+    MSG="$*"
+    "$TS" "$NAME" "$MSG"            # plain tactical nudge, no prefix
+    echo "nudge sent -> $NAME: ${MSG:0:60}" >&2
+else
+    MSG="$*"
+    # FIX #1: READ-THEN-SET advisory guard. When a goal asserts a
+    # hard ceiling / scope switch / bar-raise it SHOULD cite the ledger evidence it is
+    # overriding. Heuristic assertion = a metric target (a metric name + a number) OR pivot/ceiling
+    # words. If such an assertion appears
+    # but the text carries NO run-id and NO ledger/verdict reference, emit a
+    # NON-BLOCKING stderr warning and still SEND (CC_GOAL_FORCE=1 silences nothing — the workflow
+    # is never broken; this is advisory only). `|| true` guards every grep so `set -e` can't abort.
+    _asserts=0
+    echo "$MSG" | grep -qiE 'Sharpe[^0-9]{0,12}[0-9]' && _asserts=1 || true
+    echo "$MSG" | grep -qiE '天花板|ceiling|不可达|换|crypto|shorts|部署|deploy' && _asserts=1 || true
+    if [ "$_asserts" = 1 ]; then
+        _has_evidence=0
+        echo "$MSG" | grep -qiE '[0-9a-f]{32}' && _has_evidence=1 || true       # run-id (32-hex)
+        echo "$MSG" | grep -qiE 'PERF_CARD|verdict|\bbt\b' && _has_evidence=1 || true
+        if [ "$_has_evidence" = 0 ]; then
+            echo "⚠ cc-goal: this goal asserts a ceiling/target/pivot but cites no run-id/ledger/verdict — per READ-THEN-SET, quote the ledger evidence you're overriding (set CC_GOAL_FORCE=1 to send anyway)" >&2
+        fi
+    fi
+    # Reliable /goal: VERIFY the new goal actually anchored before stamping the
+    # registry. The worker echoes a fresh "Goal set: <text>" line every time /goal
+    # lands; just grepping "goal active" is a FALSE positive (true for ANY prior
+    # goal — including one the WORKER set on itself, which silently overwrites the
+    # manager mandate). Observed bug: registry showed the new goal while the
+    # session anchor was stale/worker-hijacked → roster lied (observed bug).
+    # grep -c exits 1 on zero matches → would trip set -e; `|| true` guards it.
+    _gcount() { tmux capture-pane -p -t "$NAME" -S -2000 2>/dev/null | grep -c "Goal set:" || true; }
+    before=$(_gcount); landed=0
+    for attempt in 1 2 3; do
+        "$TS" "$NAME" "/goal $MSG"
+        sleep 4
+        if [ "$(_gcount)" -gt "$before" ]; then landed=1; break; fi
+        sleep 4   # maybe still mid-stream; give it a beat, then retry
+    done
+    LAST=$(tmux capture-pane -p -t "$NAME" -S -400 2>/dev/null | grep "Goal set:" | tail -1)
+    if [ "$landed" = 1 ]; then
+        echo "/goal set+verified -> $NAME: ${MSG:0:50}" >&2
+        echo "   anchor now: ${LAST#*Goal set: }" >&2
+    else
+        echo "⚠ /goal did NOT anchor on $NAME after 3 tries — registry NOT stamped." >&2
+        echo "   (worker may be swallowing the command mid-stream; re-run cc-goal when calmer.)" >&2
+        exit 4
+    fi
+
+    # Stamp registry current_goal ONLY after verified landing (no more lying roster).
+    REGISTRY="$HOME/.cc-manager/workers.json"
+    if [ -f "$REGISTRY" ]; then
+        python3 - "$NAME" "$MSG" "$REGISTRY" <<'PY' 2>/dev/null || true
+import json, sys
+from datetime import datetime
+from pathlib import Path
+name, goal, regpath = sys.argv[1], sys.argv[2], sys.argv[3]
+p = Path(regpath)
+reg = json.loads(p.read_text())
+for w in reg.get("workers", []):
+    if w.get("name") == name:
+        w["current_goal"] = goal
+        # goal_updated stamps WHEN the persistent /goal anchor was last refreshed.
+        # cc-monitor's check_goal_stale compares this to each open task's created_at
+        # to catch "manager only --nudged, never set a fresh /goal" drift.
+        w["goal_updated"] = datetime.now().isoformat()
+        break
+p.write_text(json.dumps(reg, indent=2, ensure_ascii=False))
+PY
+    fi
+fi

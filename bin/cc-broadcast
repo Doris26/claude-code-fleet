@@ -1,0 +1,48 @@
+#!/bin/bash
+# cc-broadcast: send the same message to every session in ~/.cc-manager/watch.list.
+# Skips sessions that are missing, mid-work, or in a Monitor loop, so we don't barge in.
+# Does NOT respect the cc-watch 90s throttle (broadcasts are infrequent and stand on their own).
+# Usage: cc-broadcast "message body here"
+set -uo pipefail
+
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/sbin"
+
+[ $# -ge 1 ] || { echo "Usage: cc-broadcast \"<message>\"" >&2; exit 2; }
+MSG="$*"
+CFG="$HOME/.cc-manager/watch.list"
+NOW=$(date '+%Y-%m-%d %H:%M:%S')
+
+[ -f "$CFG" ] || { echo "$NOW err: $CFG missing" >&2; exit 0; }
+
+while IFS= read -r line || [ -n "$line" ]; do
+    name=$(echo "$line" | sed 's/#.*//' | xargs)
+    [ -z "$name" ] && continue
+
+    pane="/tmp/cc-broadcast-${name}.pane"
+    if ! tp "$name" 60 > "$pane" 2>&1; then
+        echo "$NOW [$name] skip: session not present"
+        continue
+    fi
+
+    # Mid-work guard
+    if grep -qE "[✶✻✽] [A-Z][a-z]+ing|still thinking|⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|↓ [0-9]+(\.[0-9]+)?k tokens" "$pane"; then
+        echo "$NOW [$name] skip: mid-work"
+        continue
+    fi
+
+    # Monitor-loop guard
+    mon_count=$(grep -c "Monitor event:" "$pane" 2>/dev/null)
+    mon_count=${mon_count:-0}
+    if [ "$mon_count" -ge 3 ]; then
+        echo "$NOW [$name] skip: monitor loop"
+        continue
+    fi
+
+    # Clear any draft, then send
+    tmux send-keys -t "$name" C-u 2>/dev/null
+    if ts "$name" "$MSG" >/dev/null 2>&1; then
+        echo "$NOW [$name] sent broadcast"
+    else
+        echo "$NOW [$name] err: ts failed"
+    fi
+done < "$CFG"

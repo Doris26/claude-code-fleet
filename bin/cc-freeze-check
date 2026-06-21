@@ -1,0 +1,91 @@
+#!/bin/bash
+# cc-freeze-check: fleet spend-limit freeze detector (operator lesson: fix the
+# mechanism rather than pausing by hand).
+#
+# THE BLIND SPOT THIS FIXES: the "You've hit your monthly spend limit" banner in
+# a worker pane only refreshes when a NEW turn renders. During a freeze the
+# manager (correctly) stops messaging frozen sessions — so after the limit reset,
+# every pane keeps showing the stale banner and the fleet sits needlessly idle
+# for hours. Pane state alone CANNOT distinguish "still frozen" from "unfroze but
+# nobody spoke since". A 1-token headless probe on the same CLI auth as the
+# workers gives ground truth.
+#
+# Output (one line per watch.list session + verdict — every session is checked):
+#   <name>: WORKING | FROZEN(banner) | IDLE | MISSING
+#   OVERALL: FROZEN|ACTIVE (<n>/<m> banner, probe=ok|frozen|unknown|skip)
+#
+# Verdict logic:
+#   no banners anywhere            -> ACTIVE  (probe skipped, zero spend)
+#   banners present -> headless probe decides (authoritative; banners may be stale)
+#   probe unknown (timeout/error)  -> fall back to panes: all-frozen=FROZEN else ACTIVE
+#
+# Modes: --panes-only   skip the probe (pure pane grep, zero spend)
+# Exit 0 always — callers grep "OVERALL:"; no set -e / rc traps.
+set -uo pipefail
+
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/sbin"
+
+CFG="$HOME/.cc-manager/watch.list"
+# Match BOTH banner forms — this build's mislabeled "monthly spend limit"
+# AND the classic "usage limit reached … resets <time>" / "/usage-credits".
+BANNER='hit your monthly spend limit|spend limit|usage-credits|usage limit reached|limit will reset|resets [0-9]{1,2}(:[0-9]{2})?[[:space:]]*(am|pm)'
+# 'esc to interrupt' REMOVED — it persists while bg shells run but Claude is
+# IDLE (cc-watch's own mid-work guard distrusts it for the same reason), so it falsely flipped a
+# frozen fleet to WORKING. Keep only signals that prove an ACTIVE model turn.
+MIDWORK_RE='(✶|✻|✽) [A-Z][a-z]+ing|still thinking|⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|[↑↓] [0-9]+(\.[0-9]+)?k tokens|[0-9]+/[0-9]+ agents done|Waiting for .*workflow|[0-9]+ local agent'
+
+panes_only=0
+[ "${1:-}" = "--panes-only" ] && panes_only=1
+
+frozen=0
+total=0
+if [ -f "$CFG" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+        name=$(echo "$line" | sed 's/#.*//' | xargs)
+        [ -z "$name" ] && continue
+        total=$((total + 1))
+        if ! pane=$(tp "$name" 30 2>/dev/null); then
+            echo "$name: MISSING"
+            continue
+        fi
+        # WORKING outranks a banner in scrollback: an active turn proves unfrozen.
+        if echo "$pane" | tail -10 | grep -qE "$MIDWORK_RE"; then
+            echo "$name: WORKING"
+        elif echo "$pane" | tail -25 | grep -qE "$BANNER"; then
+            echo "$name: FROZEN(banner)"
+            frozen=$((frozen + 1))
+        else
+            echo "$name: IDLE"
+        fi
+    done < "$CFG"
+fi
+
+# Headless probe — only when banners were seen (steady-state active fleet never
+# pays for it). claude -p shares the workers' CLI auth: a spend-limit error here
+# means the fleet is really frozen; "ok" means banners are stale and tokens flow.
+probe="skip"
+if [ "$panes_only" -eq 0 ] && [ "$frozen" -gt 0 ]; then
+    out=$(perl -e 'alarm 60; exec @ARGV' claude -p "reply with exactly: ok" --model claude-haiku-4-5 2>&1)
+    if echo "$out" | grep -qiF "spend limit"; then
+        probe="frozen"
+    elif echo "$out" | grep -qiE '(^|[^a-z])ok([^a-z]|$)'; then
+        probe="ok"
+    else
+        probe="unknown"
+    fi
+fi
+
+if [ "$probe" = "frozen" ]; then
+    verdict="FROZEN"
+elif [ "$probe" = "ok" ]; then
+    verdict="ACTIVE"
+elif [ "$total" -gt 0 ] && [ "$frozen" -gt 0 ]; then
+    # ANY banner (not unanimous frozen==total) → FROZEN in the panes-only /
+    # probe-unknown fallback. The old frozen==total let a partial freeze (e.g. 7/8) fall through to
+    # ACTIVE → cc-watch then kept pinging/spending. cc-watch's authoritative hourly haiku probe is
+    # the real arbiter; a single stale banner here only triggers that cheap probe, which resumes if ok.
+    verdict="FROZEN"
+else
+    verdict="ACTIVE"
+fi
+echo "OVERALL: $verdict (${frozen}/${total} banner, probe=$probe)"

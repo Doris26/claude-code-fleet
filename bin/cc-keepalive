@@ -1,0 +1,232 @@
+#!/bin/bash
+# cc-keepalive — time-boxed "run until the METRIC is hit OR the deadline" enforcer.
+#
+# WHY (operator lesson "how do you make it stop without hitting the goal / a dead end short of the
+# goal should /deep-research and keep exploring"): a worker was given an 8h target-metric goal, judged
+# "free internal levers exhausted" a DEAD at ~3.5h, and STOPPED. That was wrong: the GOAL is the
+# number (the target metric), not "explore the free levers". A DEAD on ONE approach family is NOT
+# goal completion — named alternatives remained (a paid path, an alternate book, CCDR for a genuinely
+# NEW mechanism).
+#
+# DOCTRINE (the THREE valid stops):
+#   1. the goal METRIC is achieved (e.g. target metric >= target), OR
+#   2. the DEADLINE is reached, OR
+#   3. CERTIFIED-TERMINAL — the worker has EXHAUSTIVELY proven the metric unreachable on available
+#      (free) resources AND escalated the only remaining path to the operator, signalled by marking
+#      its cc-task done. (Without this, keepalive forced the worker to re-derive a settled answer
+#      forever — burning huge thinking turns / multi-hour DRs.)
+# A DEAD on any single approach NEVER stops the worker — it must `/deep-research` (CCDR) for the
+# NEXT mechanism, escalate paid/alt paths, and keep exploring. A single DEAD is NOT certified-terminal.
+# cc-watch's runaway watchdog (75min max mid-work dwell) is the backstop against a stuck/looping turn.
+#
+# State: ~/.cc-manager/keepalive/<name>  = "<end_epoch>\t<goal>"  (one file per kept worker)
+#
+# Usage:
+#   cc-keepalive arm <name> <hours> "<goal>"   # keep <name> running for <hours>, re-goal text = <goal>
+#   cc-keepalive disarm <name>                 # release (worker may go idle/closed normally)
+#   cc-keepalive list                          # show armed workers + time remaining
+#   cc-keepalive tick                          # (called by cc-watch) enforce all armed workers
+#
+# `tick` is the engine: for each armed worker with now < end →
+#   - tmux session MISSING → respawn (account-guarded) + /effort + /goal + /loop
+#   - session idle (no active turn) → re-nudge "continue, next angle, don't stop on one DEAD"
+#   - now >= end → disarm + log "deadline reached, releasing"
+set -uo pipefail
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/sbin"
+
+KADIR="$HOME/.cc-manager/keepalive"
+mkdir -p "$KADIR"
+APX="${CC_REPO:-$HOME/your-repo}"
+CC_HOME="${CC_HOME:-$(cd "$(dirname "$0")/.." && pwd)}"
+TS="$HOME/.local/bin/ts"
+EXPECT_ACCT="${CC_EXPECT_ACCT:-you@example.com}"
+NOW_EPOCH=$(date +%s)
+MIDWORK_RE='(✶|✻|✽) [A-Z][a-z]+ing|still thinking|⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|[↑↓] [0-9]+(\.[0-9]+)?k tokens|esc to interrupt|[0-9]+/[0-9]+ agents done|Waiting for .*workflow|[0-9]+ local agent|Press up to edit queued'
+
+_acct() { python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.claude.json')))['oauthAccount']['emailAddress'])" 2>/dev/null; }
+
+# self-audit #5: route an escalation to the LOCAL user-notify primitive (cc-notify: macOS
+# notification + durable escalations.log, per-topic dedup). Falls back to the in-repo path if the
+# ~/.local/bin symlink isn't installed yet. Best-effort — never let a notify failure abort the tick.
+_CC_NOTIFY="$HOME/.local/bin/cc-notify"; [ -x "$_CC_NOTIFY" ] || _CC_NOTIFY="$CC_HOME/bin/cc-notify"
+_notify_user() { [ -x "$_CC_NOTIFY" ] && "$_CC_NOTIFY" "$1" "$2" >/dev/null 2>&1 || true; }
+
+# self-audit ultracode FIX: a bare "$TS $name /effort ultracode" raced the TUI render — the respawned
+# worker silently stayed on "high". Send THEN read the pane footer back for "ultracode"; retry up to 3x
+# (mirrors cc-recruit's verify-until-ultracode step). $1=session name. Returns 0 if verified.
+_verify_effort() {
+    local name="$1" attempt
+    for attempt in 1 2 3; do
+        "$TS" "$name" "/effort ultracode" >/dev/null 2>&1
+        sleep 3
+        if tmux capture-pane -p -t "$name" -S -20 2>/dev/null | grep -qi "ultracode"; then return 0; fi
+        sleep 2
+    done
+    echo "[keepalive] $name: ⚠ ultracode NOT verified after 3 tries (may be on 'high') — re-send: ts $name '/effort ultracode'"
+    return 1
+}
+
+# spend guard — never respawn/restart claude into a spend-limited account
+# (would burn an Opus boot for nothing). True if ANY live pane shows a limit banner.
+_fleet_limited() {
+    local s
+    for s in $(tmux ls -F '#{session_name}' 2>/dev/null); do
+        tmux capture-pane -p -t "$s" -S -15 2>/dev/null | grep -qiE "spend limit|usage-credits|usage limit reached|resets [0-9]{1,2}(:[0-9]{2})?[[:space:]]*(am|pm)" && return 0
+    done
+    return 1
+}
+
+_respawn() {  # $1=name $2=goal — recreate a dead time-boxed worker (account-guarded)
+    local name="$1" goal="$2" acct
+    acct=$(_acct)
+    if [ "$acct" != "$EXPECT_ACCT" ]; then
+        echo "[keepalive] ABORT respawn $name — account is '$acct' not $EXPECT_ACCT"; return 1
+    fi
+    # shell-wrap so the session survives claude exiting (same fix as cc-recruit)
+    tmux new-session -d -s "$name" -c "$APX" "claude --dangerously-skip-permissions; exec ${SHELL:-/bin/zsh}" 2>/dev/null || return 1
+    tmux set-option -t "$name" history-limit 50000 2>/dev/null || true
+    local i
+    for i in $(seq 1 20); do tmux capture-pane -p -t "$name" 2>/dev/null | grep -qE "❯ |Try \"" && break; sleep 1; done
+    "$TS" "$name" "/remote-control" >/dev/null 2>&1; sleep 8   # URL-first (registers to user's UI)
+    _verify_effort "$name"   # /effort ultracode, read-back verified (was raced/unverified)
+    "$TS" "$name" "/model claude-opus-4-8" >/dev/null 2>&1; sleep 2
+    "$TS" "$name" "/goal $goal" >/dev/null 2>&1; sleep 3
+    "$TS" "$name" "/loop 跑到 deadline 或指标达成才停(二者之一):每轮一个具体实质步骤(改逻辑/验证 run/算结果/验 out-of-sample)。一个 DEAD 绝不等于停——立刻 /deep-research 找一个全新机制,或把付费/替代路径(新数据/替代方案)写成 escalation 提案给 manager,然后继续探下一个角度。只有指标达成或到 deadline 才允许 idle,否则一直探。每步 commit 记 ALIVE/DEAD。但若已穷尽证明指标在免费资源下不可达(全证死)且唯一剩余路径已 escalate 给 operator,就跑 cc-task done <id> 标记终局——这是 keepalive 的合法停止信号,别再循环重推已定论的结论烧 token。每次 /deep-research 前必查 metric ledger 的 ALIVE/DEAD 账本:绝不重跑已 DEAD 的角度,每个 DR 必须针对账本里没试过的全新机制;若新 DR 也没返回可用的新机制,就是 certified-exhausted。" >/dev/null 2>&1
+    echo "[keepalive] RESTARTED dead time-boxed worker $name (re-goaled + /loop)"
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  arm)
+    name="$2"; hours="$3"; goal="$4"
+    end=$(( NOW_EPOCH + $(python3 -c "print(int(float('$hours')*3600))") ))
+    # FIX C: the record is one TSV line "<end_epoch>\t<goal>". A goal containing a NEWLINE used to
+    # split the record across lines → the read-back `cut -f1` on line 2 echoed the goal tail (no
+    # delimiter), corrupting the deadline-epoch field. Flatten any newline/tab in the goal to a single
+    # space on WRITE so the record stays exactly one line. (Read-back is also hardened defensively below.)
+    goal=$(printf '%s' "$goal" | tr '\n\t' '  ')
+    printf '%s\t%s\n' "$end" "$goal" > "$KADIR/$name"
+    echo "armed: $name until $(date -r "$end" '+%Y-%m-%d %H:%M') (${hours}h), re-goal stored"
+    ;;
+  disarm)
+    rm -f "$KADIR/$2" && echo "disarmed: $2"
+    ;;
+  list)
+    shopt -s nullglob 2>/dev/null || true
+    for f in "$KADIR"/*; do
+      [ -f "$f" ] || continue
+      # FIX C: parse the epoch defensively — FIRST line, FIRST tab-field only — so a legacy record
+      # whose goal contains a newline can't leak the goal tail into $end and crash the arithmetic.
+      n=$(basename "$f"); end=$(head -n1 "$f" | cut -f1); end=${end//[^0-9]/}; rem=$(( (${end:-0} - NOW_EPOCH) / 60 ))
+      printf '  %-12s deadline %s  (%s min left)\n' "$n" "$(date -r "$end" '+%H:%M')" "$rem"
+    done
+    ;;
+  tick)
+    shopt -s nullglob 2>/dev/null || true
+    for f in "$KADIR"/*; do
+      [ -f "$f" ] || continue
+      # FIX C: parse the epoch defensively from the FIRST line / FIRST tab-field, scrubbed to digits,
+      # so a legacy multi-line goal record can't corrupt the deadline-epoch (and crash the `-ge`/`rem`
+      # arithmetic). The goal is taken from that same first line's f2- (records are single-line now).
+      name=$(basename "$f"); end=$(head -n1 "$f" | cut -f1); end=${end//[^0-9]/}; end=${end:-0}; goal=$(head -n1 "$f" | cut -f2-)
+      if [ "$NOW_EPOCH" -ge "$end" ]; then
+        rm -f "$f"; echo "[keepalive] $name DEADLINE reached — releasing (normal rules resume)"; continue
+      fi
+      # CERTIFIED-TERMINAL handling (operator lesson): keepalive's job is
+      # to stop PREMATURE/silent stops, NOT to force a worker to re-derive a settled answer forever.
+      # A worker marking its cc-task done (the "certified-exhausted + escalated" signal) clears its
+      # open task → goalfor is empty.
+      #
+      # self-audit #6 FIX: the OLD code auto-released on the worker's OWN word the instant goalfor went
+      # empty — and release did NOT disarm /loop or clear /goal, so the worker kept self-driving
+      # (a worker committed scope-violating work ~40min AFTER being retired, had to be hand-killed).
+      # cc-task done is UNAUTHENTICATED (any worker runs it from its own skip-perms shell), so a
+      # worker-authored "last task done" is now CANDIDATE-terminal, not auto-release:
+      #   (1) on FIRST detection: HALT the worker so it can't keep self-driving — /loop-stop +
+      #       neutralize the /goal anchor (mirror cc-retire:97-108) — escalate as candidate-terminal,
+      #       and HOLD keepalive armed one more cycle for manager confirm (do NOT rm the watch file).
+      #   (2) on the NEXT cycle still-empty: confirmed → release keepalive (disarm + rm).
+      if [ -x "$HOME/.local/bin/cc-task" ] && [ -z "$("$HOME/.local/bin/cc-task" goalfor "$name" 2>/dev/null)" ]; then
+        _candstamp="$KADIR/.cand-terminal.$name"
+        if [ ! -f "$_candstamp" ]; then
+          # FIRST detection — candidate-terminal: halt the worker (so 'done' actually stops it) but HOLD.
+          tmux send-keys -t "$name" C-u 2>/dev/null || true
+          "$TS" "$name" "/loop-stop" >/dev/null 2>&1 || true
+          "$TS" "$name" "/goal (candidate-terminal — cc-task done closed your last task; HALTED pending manager confirm. Do NOT /loop, do NOT start new work, do NOT commit. Wait.)" >/dev/null 2>&1 || true
+          date +%s > "$_candstamp"
+          echo "[keepalive] $name CANDIDATE-terminal (worker closed its LAST cc-task) — HALTED (/loop-stop + goal-neutralized), holding 1 cycle for manager confirm (NOT released)"
+          _notify_user "cand-terminal:$name" "$name marked its LAST cc-task done (candidate-terminal). HALTED its /loop + goal pending your confirm — re-open the task to resume, or cc-retire to finalize. Will auto-release next cycle if still empty."
+          echo "$(date '+%Y-%m-%d %H:%M:%S') [keepalive] $name CANDIDATE-terminal (worker self-closed last task) — halted + held for manager confirm" >> "$HOME/.cc-manager/escalations.log" 2>/dev/null || true
+          continue
+        fi
+        # SECOND consecutive cycle still empty → confirm release. Worker already halted last cycle.
+        rm -f "$_candstamp"
+        rm -f "$f"; echo "[keepalive] $name confirmed certified-terminal (still no open cc-task after 1 hold cycle) — releasing keepalive"
+        # self-audit #5 (c): a certified-terminal release is a real escalation — surface it once.
+        _notify_user "terminal:$name" "$name keepalive RELEASED (certified-terminal confirmed: cc-task done + 1 hold cycle, worker halted) — verify the escalated path"
+        continue
+      fi
+      # Worker has an open task again (manager re-opened, or it never went empty) → clear any stale
+      # candidate-terminal hold so a future self-close starts the 2-cycle confirm fresh.
+      rm -f "$KADIR/.cand-terminal.$name"
+      rem=$(( (end - NOW_EPOCH) / 60 ))
+      # #5 spend guard: if the account is limited, don't spawn/restart claude (burns an Opus boot
+      # for nothing). Skip this tick — the worker resumes when tokens return (deadline unchanged).
+      if _fleet_limited; then echo "[keepalive] $name: fleet spend-limited — respawn/restart deferred (${rem}min left)"; continue; fi
+      if ! tmux has-session -t "$name" 2>/dev/null; then
+        echo "[keepalive] $name session DEAD with ${rem}min left → respawning"
+        _respawn "$name" "$goal"
+        continue
+      fi
+      # claude EXITED but the shell-wrap kept the pane alive (no claude TUI markers) →
+      # restart claude IN-PLACE + re-onboard, rather than ts-ing into a bare shell.
+      if ! tmux capture-pane -p -t "$name" 2>/dev/null | grep -qE "bypass permissions|esc to interrupt|/rc active|until auto-compact"; then
+        echo "[keepalive] $name claude EXITED (pane at shell), ${rem}min left → restarting claude in-place"
+        tmux send-keys -t "$name" C-u 2>/dev/null || true
+        # FIX D: account guard mirroring _respawn:79-81 — the in-place restart launched
+        # claude with NO account check, so account drift would boot the wrong account's claude. Abort
+        # this worker if the active account != EXPECT_ACCT (continue → next watch file unaffected).
+        acct=$(_acct); [ "$acct" != "$EXPECT_ACCT" ] && { echo "[keepalive] ABORT in-place restart $name — account is '$acct' not $EXPECT_ACCT"; continue; }
+        tmux send-keys -t "$name" "claude --dangerously-skip-permissions; exec ${SHELL:-/bin/zsh}" Enter 2>/dev/null
+        sleep 12
+        _verify_effort "$name"   # /effort ultracode, read-back verified (was raced/unverified)
+        "$TS" "$name" "/model claude-opus-4-8" >/dev/null 2>&1; sleep 2
+        "$TS" "$name" "/goal $goal" >/dev/null 2>&1; sleep 3
+        "$TS" "$name" "/loop 跑到 deadline 或指标达成才停(二者之一):每轮一个具体实质步骤(改逻辑/验证 run/算结果/验 out-of-sample)。一个 DEAD 绝不等于停——立刻 /deep-research 找一个全新机制,或把付费/替代路径(新数据/替代方案)写成 escalation 提案给 manager,然后继续探下一个角度。只有指标达成或到 deadline 才允许 idle,否则一直探。每步 commit 记 ALIVE/DEAD。但若已穷尽证明指标在免费资源下不可达(全证死)且唯一剩余路径已 escalate 给 operator,就跑 cc-task done <id> 标记终局——这是 keepalive 的合法停止信号,别再循环重推已定论的结论烧 token。每次 /deep-research 前必查 metric ledger 的 ALIVE/DEAD 账本:绝不重跑已 DEAD 的角度,每个 DR 必须针对账本里没试过的全新机制;若新 DR 也没返回可用的新机制,就是 certified-exhausted。" >/dev/null 2>&1
+        echo "[keepalive] $name claude restarted in-place + re-goaled"
+        continue
+      fi
+      # alive: re-nudge only if idle (not mid-work), throttled 1/15min via a stamp
+      if tmux capture-pane -p -t "$name" 2>/dev/null | tail -10 | grep -qE "$MIDWORK_RE"; then
+        echo "[keepalive] $name working (${rem}min left) — no nudge"
+      else
+        kstamp="/tmp/cc-keepalive-${name}.nudge"; kprev=0
+        [ -f "$kstamp" ] && kprev=$(cat "$kstamp" 2>/dev/null)
+        if [ "$((NOW_EPOCH - kprev))" -gt 840 ]; then
+          knudge="还有 ${rem} 分钟到 deadline。指标没达成就绝不能停:一个 DEAD 不是终点——立刻 /deep-research 找全新机制,或写付费/替代路径(新数据/替代方案)的 escalation 提案给 manager,再继续下一个角度深挖。不到 deadline 不许 idle。每步 commit 记 ALIVE/DEAD。但若已穷尽证明指标在免费资源下不可达(全证死)且唯一剩余路径已 escalate 给 operator,就跑 cc-task done <id> 标记终局——这是 keepalive 的合法停止信号,别再循环重推已定论的结论烧 token。每次 /deep-research 前必查 metric ledger 的 ALIVE/DEAD 账本:绝不重跑已 DEAD 的角度,每个 DR 必须针对账本里没试过的全新机制;若新 DR 也没返回可用的新机制,就是 certified-exhausted。"
+          # FIX C: identical-payload cap (port of cc-watch's .lastpayload/.samecount). NORMALIZE
+          # out the changing ${rem} countdown so the run-length isn't reset by the minute number;
+          # if the normalized payload is identical AND already sent >=2 times, SKIP the re-send and
+          # _notify_user ONCE (date+worker-keyed) instead of re-walling the same ~400 chars to deadline.
+          knorm="${knudge/还有 ${rem} 分钟/还有 _ 分钟}"
+          klastpf="/tmp/cc-keepalive-${name}.lastpayload"; ksamecnt="/tmp/cc-keepalive-${name}.samecount"
+          kprev_pl=$(cat "$klastpf" 2>/dev/null); ksame_n=$(cat "$ksamecnt" 2>/dev/null); ksame_n=${ksame_n//[^0-9]/}; ksame_n=${ksame_n:-0}
+          if [ "$knorm" = "$kprev_pl" ] && [ "$ksame_n" -ge 2 ]; then
+            _notify_user "idle-nudge-cap:$name:$(date +%Y-%m-%d)" "$name idle-nudge capped at 2 identical sends (state unchanged, ${rem}min left) — diagnose or mutate the ask instead of re-nudging"
+            echo "[keepalive] $name idle but identical-nudge capped at 2 (state unchanged) — notified once, skipping re-send"
+          else
+            tmux send-keys -t "$name" C-u 2>/dev/null || true
+            "$TS" "$name" "$knudge" >/dev/null 2>&1
+            echo "$NOW_EPOCH" > "$kstamp"
+            if [ "$knorm" = "$kprev_pl" ]; then echo "$((ksame_n + 1))" > "$ksamecnt"; else printf '%s' "$knorm" > "$klastpf"; echo 1 > "$ksamecnt"; fi
+            echo "[keepalive] $name idle (${rem}min left) → re-nudged to continue"
+          fi
+        else
+          echo "[keepalive] $name idle but nudge throttled (<15min)"
+        fi
+      fi
+    done
+    ;;
+  *)
+    echo "Usage: cc-keepalive {arm <name> <hours> '<goal>' | disarm <name> | list | tick}" >&2; exit 2 ;;
+esac
