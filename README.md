@@ -19,6 +19,29 @@ The core is domain-agnostic; the part that knows what a "real result" looks like
 
 ---
 
+## Point it at a hard goal and walk away
+
+claude-code-fleet turns a fleet of Claude Code agents into an **autonomous, long-running research
+engine**. Give it one open-ended, high-level goal and leave — it runs **for days, unattended, with
+no human in the loop**: proposing ideas, building and testing them, killing the dead ends, and
+self-reviewing every step. Because every result is **independently verified against ground truth**,
+you can trust what it hands back instead of re-checking it.
+
+> **Worked example** — the bundled
+> [case study](tutorial/case-studies/find-a-sharpe-2-crypto-alpha.md):
+>
+> > *"Find a crypto trading strategy with out-of-sample Sharpe > 2 over the last 3 years."*
+>
+> You set that single goal and walk away. The fleet hunts on its own — proposing candidates,
+> backtesting each on QuantConnect, deflating the overfit ones, and **refusing to call anything a
+> Sharpe-2 result until the cited backtest is verified to actually exist.** You come back to
+> ALIVE/DEAD verdicts you can trust — not a pile of unchecked claims.
+
+**Built to run long, unattended.** Keepalive drives it round after round until it hits the metric or
+a deadline — one dead end never ends the goal; the freeze gate rides out the 5-hour usage limit and
+auto-resumes; the runaway watchdog kills a stuck turn; the account guard catches a drifted login. A
+multi-day hunt survives limits, stalls, and restarts **without you watching**.
+
 ## Why
 
 Spawning a fleet of autonomous coding agents is easy. Keeping them **honest and unstuck** without
@@ -68,43 +91,39 @@ directory with one executable — see [`plugins/README.md`](plugins/README.md).
 
 ## Install
 
+**Quick (recommended):**
+
 ```bash
-git clone <your-fork> claude-code-fleet && cd claude-code-fleet
+git clone https://github.com/Doris26/claude-code-fleet && cd claude-code-fleet
+./install.sh                 # checks deps, symlinks the cc-* commands onto PATH, writes your config
+```
 
-# 1. configure
-cp claude-code-fleet.env.example claude-code-fleet.env
-$EDITOR claude-code-fleet.env          # set CC_REPO (the repo your fleet commits to) and CC_EXPECT_ACCT
-source claude-code-fleet.env           # or export these in your shell profile
+Or via **npm** *(once published to the registry)* — puts the `cc-*` commands on your PATH:
 
-# 2. put the tools on PATH (or run them from bin/ in place)
-ln -s "$PWD"/bin/* ~/.local/bin/       # tmux + claude must already be installed & authenticated
+```bash
+npm install -g claude-code-fleet      # or run ad-hoc: npx claude-code-fleet --help
+```
 
-# 3. start a worker, supervise it
-ta worker1                    # opens tmux session "worker1" running claude
-cc-add worker1                # add it to ~/.cc-manager/watch.list
+Then configure and go:
 
-# 4. run the supervisor — either the launchd backbone…
+```bash
+$EDITOR claude-code-fleet.env   # set CC_REPO (the repo your fleet commits to) + CC_EXPECT_ACCT
+source claude-code-fleet.env
+
+ta worker1 && cc-add worker1    # start a worker + put it under supervision
+
+# run the supervisor — the always-on launchd backbone…
 sed "s|__HOME__|$HOME|g" launchd/com.user.cc-manager.plist.template \
     > ~/Library/LaunchAgents/com.user.cc-manager.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.cc-manager.plist
-#    …or drive cc-watch from Claude in-session crons (see docs/cron-prompts.md). Linux: swap
-#    launchd for a systemd-user timer or a plain cron entry calling bin/cc-watch.
+# …or drive cc-watch from Claude in-session crons (docs/cron-prompts.md). Linux: systemd-user/cron.
 ```
+
+Needs `bash`, `python3`, `tmux`, `git`, and the `claude` CLI on your machine — npm and `install.sh`
+distribute the scripts, they don't install those runtime deps.
 
 Start with [`docs/MECHANISM_INDEX.md`](docs/MECHANISM_INDEX.md) (what each script does and how they
 chain) and [`docs/MANAGER_RULES.md`](docs/MANAGER_RULES.md) (the operator contract).
-
-## Honest scope
-
-- **This supervises Claude Code *CLI* sessions.** It assumes `claude`, `tmux`, and (for the
-  always-on backbone) macOS `launchd` — Linux works via systemd-user/cron. It is **not** a
-  from-scratch agent runtime; it's a thin, opinionated supervisor wrapped around off-the-shelf
-  Claude Code. That's the design, not a limitation.
-- The review gate is **post-hoc advisory** — workers push to a shared branch, so a FAILing commit
-  is already landed when review catches it and re-pokes the owner to fix-forward. To make it a hard
-  pre-merge block, add a pre-push hook that rejects on a prior FAIL verdict (not wired by default).
-- The operator notes and reply tokens carry the lessons of the fleet they grew in; treat them as a
-  starting contract to adapt, not gospel.
 
 ## How this relates to other agent-orchestration tools
 

@@ -106,8 +106,11 @@ echo "1. spawning tmux session '$NAME'..."
 # into the user-level agents dir (found regardless of session CWD) at spawn — the tracked file stays truth.
 CLAUDE_CMD="claude"
 REPO_DIR="${CC_REPO:-$HOME/your-repo}"
-# claude-code-fleet install dir (parent of this bin/) — where personas/, docs/, plugins/ live
-CC_HOME="${CC_HOME:-$(cd "$(dirname "$0")/.." && pwd)}"
+# claude-code-fleet install dir (parent of this bin/) — where personas/, docs/, plugins/ live.
+# Follow symlinks so it resolves correctly under `ln -s` / `npm i -g` (CC_HOME env wins if set).
+_self="$0"
+while [ -L "$_self" ]; do _ln="$(readlink "$_self")"; case "$_ln" in /*) _self="$_ln" ;; *) _self="$(dirname "$_self")/$_ln" ;; esac; done
+CC_HOME="${CC_HOME:-$(cd "$(dirname "$_self")/.." && pwd)}"
 # Every recruited agent boots under a PERSONA whose SYSTEM PROMPT carries the Tier-1 non-negotiables
 # (persist in context, not "read once & drift"). AGENT-TYPE SELECTION: the manager
 # picks the type that fits the TASK and passes it ($7); if it passes nothing we fall back to a role-based

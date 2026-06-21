@@ -39,7 +39,11 @@ REPO="${CC_REPO:-$HOME/your-repo}"
 ARTDIR="$REPO/.cc-review"
 
 # Resolve the claude-code-fleet install dir (parent of this bin/) and the active verification plugin.
-SELF="$(cd "$(dirname "$0")" && pwd)"
+# Follow symlinks so plugins/ + personas/ are found even when a cc-* command was symlinked onto PATH
+# (`ln -s` / `npm i -g`) instead of run from inside the repo. (CC_HOME env always wins if set.)
+_self="$0"
+while [ -L "$_self" ]; do _ln="$(readlink "$_self")"; case "$_ln" in /*) _self="$_ln" ;; *) _self="$(dirname "$_self")/$_ln" ;; esac; done
+SELF="$(cd "$(dirname "$_self")" && pwd)"
 CC_HOME="${CC_HOME:-$(dirname "$SELF")}"
 CC_VERIFY_PLUGIN="${CC_VERIFY_PLUGIN:-plugins/generic}"
 case "$CC_VERIFY_PLUGIN" in

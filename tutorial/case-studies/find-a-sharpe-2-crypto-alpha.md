@@ -1,7 +1,7 @@
-# Case study: finding a Sharpe-2.0 crypto trading algo — end-to-end
+# Case study: finding a Sharpe-2 crypto trading algo — end-to-end
 
 > ⭐ **The headline:** point a supervised claude-code-fleet at the markets and let it hunt — autonomously,
-> around the clock — until it lands a crypto strategy at **out-of-sample Sharpe ≈ 2.0**, *and won't
+> around the clock — until it lands a crypto strategy at **out-of-sample Sharpe > 2 over the last 3 years**, *and won't
 > let itself fake it*. Every candidate is PIT-checked, cost-stressed, DSR-deflated, and its cited
 > backtest is verified against ground truth before it's allowed to call itself a Sharpe-2 result.
 > That last part is the magic: an unsupervised agent will happily *claim* Sharpe 2; claude-code-fleet makes it
@@ -82,9 +82,9 @@ Read the quant-qc persona + the claude-code-fleet MANAGER_RULES before you start
 TXT
 
 cc-recruit cryptoalpha /tmp/onboard_crypto.txt \
-  "Find a crypto trading strategy with OUT-OF-SAMPLE Sharpe >= 2.0. \
+  "Find a crypto trading strategy with OUT-OF-SAMPLE Sharpe > 2 over the last 3 years. \
    ARTIFACT: committed strategy file + a real QuantConnect backtest id + a PERF_CARDS.md row. \
-   METRIC: OOS Sharpe >= 2.0 (and IS within ~80% of OOS, MaxDD < thesis tolerance). \
+   METRIC: OOS Sharpe > 2 (and IS within ~80% of OOS, MaxDD < thesis tolerance). \
    ACCEPTANCE: hit the bar OOS, OR prove it unreachable on free data and record DEAD + the \
    number that killed it. Explore, do not ship." \
   "crypto alpha research" \
@@ -196,7 +196,7 @@ Every reviewed commit writes `CC_REPO/.cc-review/<sha>.json`:
 Healthy end-states:
 
 - **ALIVE at the bar:** a committed strategy + a `verify-claim`-PASS backtest id + a `PERF_CARDS.md`
-  row showing OOS Sharpe ≥ 2.0 net of cost, surviving the overfit grill. *That's* a result — because
+  row showing OOS Sharpe > 2 net of cost, surviving the overfit grill. *That's* a result — because
   it was independently verified, not because the worker said so.
 - **Certified DEAD:** the worker proves the bar is unreachable on free data and records the killing
   number, having exhausted the research ladder. A DEAD with a reason is a real outcome — not a

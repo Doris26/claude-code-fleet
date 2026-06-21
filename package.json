@@ -1,0 +1,66 @@
+{
+  "name": "claude-code-fleet",
+  "version": "0.1.0",
+  "description": "Run a fleet of self-improving Claude Code agents indefinitely — super-lite, with no drift, no stalls, and no human in the loop.",
+  "keywords": [
+    "claude-code",
+    "claude",
+    "ai-agents",
+    "multi-agent",
+    "agent-supervision",
+    "code-review",
+    "tmux",
+    "fleet",
+    "autonomous-agents"
+  ],
+  "homepage": "https://github.com/Doris26/claude-code-fleet#readme",
+  "bugs": "https://github.com/Doris26/claude-code-fleet/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Doris26/claude-code-fleet.git"
+  },
+  "license": "MIT",
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "cc-watch": "bin/cc-watch",
+    "cc-review": "bin/cc-review",
+    "cc-recruit": "bin/cc-recruit",
+    "cc-keepalive": "bin/cc-keepalive",
+    "cc-freeze-check": "bin/cc-freeze-check",
+    "cc-monitor": "bin/cc-monitor",
+    "cc-monitor-gate": "bin/cc-monitor-gate",
+    "cc-paidblock": "bin/cc-paidblock",
+    "cc-decide": "bin/cc-decide",
+    "cc-goal": "bin/cc-goal",
+    "cc-task": "bin/cc-task",
+    "cc-add": "bin/cc-add",
+    "cc-rm": "bin/cc-rm",
+    "cc-roster": "bin/cc-roster",
+    "cc-broadcast": "bin/cc-broadcast",
+    "cc-notify": "bin/cc-notify",
+    "cc-retire": "bin/cc-retire",
+    "cc-self-audit": "bin/cc-self-audit",
+    "ta": "bin/ta",
+    "tl": "bin/tl",
+    "tp": "bin/tp",
+    "ts": "bin/ts"
+  },
+  "files": [
+    "bin/",
+    "plugins/",
+    "docs/",
+    "personas/",
+    "launchd/",
+    "tutorial/",
+    "install.sh",
+    "claude-code-fleet.env.example",
+    "README.md",
+    "LICENSE"
+  ]
+}

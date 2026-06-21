@@ -7,3 +7,5 @@ __pycache__/
 .cc-review/
 # editor / OS cruft
 .DS_Store
+# npm
+node_modules/
