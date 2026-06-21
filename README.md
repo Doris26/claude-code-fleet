@@ -1,11 +1,11 @@
 # claude-code-fleet
 
-**A lite operating loop for a fleet of Claude Code agents — supervision-first.**
+**Run a fleet of Claude Code agents — without babysitting them.**
 
 Think [OpenClaw](https://github.com/openclaw/openclaw) / [Hermes](https://hermes-agent.ai), **but
 lite.** Where those are full multi-agent *runtimes*, claude-code-fleet is the thin **supervisor**
 you bolt onto the Claude Code CLI you already run. You start a few `claude` sessions in tmux on a
-shared repo; it watches them so you don't have to babysit: it independently reviews **every commit**
+shared repo; it watches them so you don't have to hover over every pane: it independently reviews **every commit**
 (the worker can't skip it), **refuses a result a worker *cites* but can't prove**, keeps stalled
 sessions moving, freezes cleanly on the spend-limit, and interrupts runaway turns.
 
