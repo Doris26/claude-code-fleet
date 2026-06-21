@@ -1,7 +1,7 @@
 {
   "name": "claude-code-fleet",
   "version": "0.1.0",
-  "description": "Run a fleet of self-improving Claude Code agents indefinitely — super-lite, with no drift, no stalls, and no human in the loop.",
+  "description": "Run a fleet of self-improving Claude Code agents indefinitely — super-lite, no drift, no stalls, runs with or without a human in the loop.",
   "keywords": [
     "claude-code",
     "claude",
