@@ -58,6 +58,11 @@ bash, call any MCP tool, and see its own history. It accumulates codebase knowle
 and can be retargeted without being re-briefed from scratch. That's why long-running, multi-day
 research hunts are feasible at all.
 
+<p align="center">
+  <img src="demo/fleet-ui-native.png" alt="Each worker is a persistent Claude Code session — manager supervises worker-1 through worker-4, all visible in the Recents sidebar" width="780">
+</p>
+<p align="center"><sub><em>100% Claude Code native — each worker is a real <code>claude</code> session visible in Recents. Full env: bash · files · web · MCP. No extra server, no separate UI.</em></sub></p>
+
 Spawning a fleet of long-running agents is then the easy part. Keeping them **honest and unstuck**
 without hovering over every pane is the hard part:
 
