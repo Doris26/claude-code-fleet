@@ -50,8 +50,16 @@ multi-day hunt survives limits, stalls, and restarts **without you watching**.
 
 ## Why
 
-Spawning a fleet of autonomous coding agents is easy. Keeping them **honest and unstuck** without
-hovering over every pane is the hard part:
+**The model choice matters first.** Most agent orchestration frameworks call the LLM via API and
+discard context between calls — workers are ephemeral, stateless, and blind to what they just did.
+claude-code-fleet takes the opposite approach: each worker is a **persistent, remote Claude Code
+session** (one tmux pane) with **full environment visibility** — it can read the whole repo, run
+bash, call any MCP tool, and see its own history. It accumulates codebase knowledge across tasks
+and can be retargeted without being re-briefed from scratch. That's why long-running, multi-day
+research hunts are feasible at all.
+
+Spawning a fleet of long-running agents is then the easy part. Keeping them **honest and unstuck**
+without hovering over every pane is the hard part:
 
 - An agent **can't be trusted to review its own work** — "the judge can't be the party being
   judged." Review has to be driven from the outside.
@@ -94,6 +102,13 @@ The split is the whole point: **`bin/` knows nothing about your domain.** What c
 result" to verify, and any domain-specific review criteria, live in a plugin. The bundled
 `quant-qc` plugin is one example (it knows about QuantConnect backtests); writing your own is a
 directory with one executable — see [`plugins/README.md`](plugins/README.md).
+
+**No extra server required.** Each worker is a real `claude` CLI session — the same process you
+already run — inside a tmux pane. Put it on any remote machine (VM, VPS, local server), `ssh` in,
+and the entire fleet is managed through the Claude Code interface alone. There is no backend
+orchestration server, no API gateway, no separate dashboard to stand up. The cron supervisor
+(`cc-watch`) is a shell script; the workers talk back via git commits. Other frameworks bolt on a
+server of their own; claude-code-fleet rides entirely on the Claude Code CLI you already have.
 
 ## Install
 
