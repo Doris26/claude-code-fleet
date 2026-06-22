@@ -239,7 +239,16 @@ sleep 4
 # cc-recruit so EVERY worker reads the skills/rules library regardless of what onboarding file was passed —
 # the manager can't forget it. Skills = the accumulated ALIVE/DEAD lessons; not reading them = repeating
 # dead angles. Sent as a goal-prefixed nudge so it survives as a standing instruction.
-"$LB/ts" "$NAME" "必读(开工前):你团队的 skills/rules docs(全部索引,Tier-1 硬规则必读)+ <CC_HOME>/docs/MECHANISM_INDEX.md(机制总览)+ docs/MANAGER_RULES.md。这些是积累的 ALIVE/DEAD 教训和制度;不读 = 重复已死的角度。读完再开工。" >/dev/null 2>&1
+if [ "$ROLE" = "manager" ]; then
+    # CONTEXT-FLOOD FIX: a fresh manager must NOT bulk-read the big docs into its own context. The
+    # cc-manager persona system prompt already carries the MANAGER_RULES hard-rule subset, and the
+    # skills/rules library is worker-oriented — telling the manager to read MANAGER_RULES + the whole
+    # skills index at startup is what floods a new manager to the context limit before it does any
+    # work (then /compact fails and it wedges). Read only the light overview; pull the rest on demand.
+    "$LB/ts" "$NAME" "Read first (keep context light): your cc-manager persona system prompt already carries the MANAGER_RULES hard-rule subset — do NOT read MANAGER_RULES.md / the full skills index / every skill into your own context (that is exactly what floods a new manager to the context limit, after which /compact fails and the session wedges). Read ONLY docs/MECHANISM_INDEX.md (~60-line overview). Pull MANAGER_RULES detail / cron-prompts / a specific skill on demand, or have a subagent read it and return just a summary — never bulk-load docs." >/dev/null 2>&1
+else
+    "$LB/ts" "$NAME" "必读(开工前):你团队的 skills/rules docs(全部索引,Tier-1 硬规则必读)+ <CC_HOME>/docs/MECHANISM_INDEX.md(机制总览)+ docs/MANAGER_RULES.md。这些是积累的 ALIVE/DEAD 教训和制度;不读 = 重复已死的角度。读完再开工。" >/dev/null 2>&1
+fi
 sleep 2
 
 # CCDR prompt-quality (operator lesson "make sure workers have a high-quality ccdr prompt"): CCDR is
@@ -257,7 +266,7 @@ fi
 # another session. Two live managers => double-firing crons (duplicate audits, conflicting auto-fixes,
 # 2x API load). On takeover the NEW manager MUST ensure the predecessor's crons are dead BEFORE recreating its own.
 if [ "$ROLE" = "manager" ]; then
-    "$LB/ts" "$NAME" "你在接管旧 manager。开工前 MUST 杀掉旧 manager 的 cron:旧 manager 的 supervision cron(:17 self-audit/:41 task-audit/:13 mechanism-grill)是 per-session in-memory,只能由它自己 CronDelete 或随它 claude 退出清空,你从本 session 删不到它的。步骤:(1) 找出旧 manager session(cc-roster / tmux ls + 看哪个 pane 跑过 cc-watch/cc-recruit);(2) ts 它 'CronList→CronDelete 所有 supervision cron,提交 WIP,退出 claude';(3) 它若赖着不退就 tmux kill-session(in-memory cron 随之清);(4) 确认旧 cron 死了。然后【第一要务】按 cron-prompts.md 重建你自己的全部 4 个 Claude cron —— launchd 已 DISABLED(operator『只保留 claude cron』),这 4 个是唯一的监督、随 session 死,忘建=零监督(没人 cc-review commit、没 freeze、没 keepalive、没 task-audit、没 memory consolidation):(1) cc-watch backbone『4,34 * * * *』跑 <CC_HOME>/bin/cc-watch(cc-review-on-每个commit + freeze + keepalive + cc-monitor + task-audit LLM 兜底)—— 最关键;(2) skill-capture『12 */4 * * *』跑 auto_skill_capture.py --hours 24 --commit(治 skill rot);(3) :13 mechanism-grill(不 gated,machinery audit,subagent-driven,12h);(4) dream『27 */6 * * *』跑 /dream skill 做 memory consolidation、重建 memory 索引(治 memory rot,~/.claude/skills/dream),不 gated。每个 recurring work-cron(cc-watch/skill-capture/dream)的 prompt 必须 SPAWN 一个 subagent(Agent tool, general-purpose)去跑命令、只回传那一行结果 —— 绝不在 manager 自己 context 里跑(operator 强调『use subagent to do the cron so do not occupy your heavy context!!!!』);grill 本身就是 fan-out workflow。直接照 cron-prompts.md『How to recreate』里的 CronCreate prompt 原样重建,别退回 bare run:。建完用 CronList 核对 4 个都在。(已删::17 self-audit 不要了;:41 task-audit 折进了 cc-watch)。绝不两个 manager 同跑 supervision cron。" >/dev/null 2>&1
+    "$LB/ts" "$NAME" "You are taking over from a previous manager. (1) Make sure the old manager's in-memory supervision crons are dead: find it (cc-roster / tmux ls) -> tell it 'CronList -> CronDelete all crons, commit WIP, exit claude'; if it lingers, tmux kill-session (in-memory crons die with it). (2) FIRST PRIORITY: recreate your supervision crons (launchd is off, so these are the ONLY supervision — forget them and there is none). KEEP CONTEXT LIGHT: do NOT read cron-prompts.md into your own context -- spawn a subagent to read docs/cron-prompts.md 'How to recreate' and return just the CronCreate calls, then run them yourself; run each recurring work-cron's actual job via a subagent too (it returns one line, so the heavy output never lands in your context). Verify with CronList. Never run two managers' supervision crons at once." >/dev/null 2>&1
     sleep 2
 fi
 
