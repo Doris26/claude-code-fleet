@@ -72,6 +72,30 @@ if [ "$CUR_ACCT" != "$EXPECT_ACCT" ]; then
 fi
 echo "✓ account verified: $CUR_ACCT" >&2
 
+# Single-manager guard (operator lesson "only one manager at a time"): two managers =
+# double-firing supervision crons (duplicate reviews, conflicting auto-fixes, 2x API load).
+# ABORT if an active manager is already in the registry.
+# Override with CC_FORCE_MANAGER=1 to recover a dead session.
+if [ "$ROLE" = "manager" ] && [ "${CC_FORCE_MANAGER:-0}" != "1" ]; then
+    _EXISTING_MGR=$(python3 - <<'PY'
+import json, os
+p = os.path.expanduser("~/.cc-manager/workers.json")
+d = json.load(open(p)) if os.path.exists(p) else {"workers": []}
+print(next((w.get("tmux", w.get("name", "?")) for w in d.get("workers", [])
+            if w.get("role") == "manager" and w.get("status") == "active"), ""))
+PY
+)
+    if [ -n "$_EXISTING_MGR" ]; then
+        echo "✋ ABORT recruit '$NAME': active manager '${_EXISTING_MGR}' already exists." >&2
+        echo "   Only ONE manager at a time — two = double-firing supervision crons." >&2
+        echo "   Kill it first:" >&2
+        echo "     ts ${_EXISTING_MGR} 'CronList -> CronDelete all, exit'" >&2
+        echo "     (if it lingers: tmux kill-session -t ${_EXISTING_MGR})" >&2
+        echo "   Then re-run cc-recruit. Override with CC_FORCE_MANAGER=1 if the old session is dead." >&2
+        exit 6
+    fi
+fi
+
 # Robust remote-control URL capture. Run FIRST — while the session is idle and
 # nothing else is redrawing the pane. Operator hard rule: "we need the remote
 # url first". Capturing BEFORE /effort + onboarding is what keeps the URL line
