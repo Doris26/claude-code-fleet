@@ -269,21 +269,30 @@ new commits / holds the freeze gate, so it stays always-on.
 # logs, skill-capture diff, dream's transcript scan) stays in the subagent's context; the manager
 # keeps a light context. The wording below already encodes this — do NOT revert to bare `run: ...`.
 
-# 1. BACKBONE (replaces launchd com.user.cc-manager) — cc-watch: freeze-gate + keepalive + cc-review on
-#    NEW commits + cc-monitor + TASK-AUDIT (LLM backstop, folded from the retired :41). MOST CRITICAL.
-#    Not gated (commit-review is worker-independent). DELEGATED to a subagent.
+# 1. BACKBONE — cc-watch: freeze-gate + keepalive + cc-review on NEW commits + cc-monitor + TASK-AUDIT.
+#    ⚠ ON-DEMAND, NOT 24/7 — this is the EXCEPTION to "RECREATE ALL 4" above.
+#    WHY cc-watch exists: catch workers who STOP EARLY / slack (declare done or go idle when there is
+#    genuinely MORE to do; DEAD != done). The manager VERIFIES genuine completion, never accepts a
+#    premature "done". BUG it caused: an always-on 30min cron has NO "fleet genuinely-done -> stop
+#    watching" off-switch, so it idle-spins a ~30k subagent EVERY tick even when all work is genuinely
+#    complete or held-pending-user = ~1.4M tok/day pure waste. NEW MODEL: CREATE this cron ONLY when a
+#    worker is ACTIVELY working (dispatch / cutover / research producing commits needing cc-review or with
+#    runaway risk); DELETE it the moment the manager VERIFIES genuine completion OR the work is held
+#    pending a USER decision. Idle/standby/held fleet = NO cc-watch (run cc-review manually on any one-off
+#    important commit meanwhile). At takeover, do NOT blindly recreate this if the fleet is idle — only run
+#    it around genuinely-active work. DELEGATED to a subagent (template below = create when active).
 CronCreate(cron="4,34 * * * *",  durable=True, prompt="[cc-watch backbone — every 30min · launchd OFF · USE A SUBAGENT (keep manager context light)] Do NOT run cc-watch in your own context. SPAWN a subagent (Agent tool, general-purpose) with task: 'Run: bash <CC_HOME>/bin/cc-watch 2>&1 | tail -20. This does cc-review on new commits + freeze-gate + keepalive + cc-monitor + task-audit. Report ONE line: commits reviewed / freeze state / anything that needs the manager.' Relay ONLY the subagent's one line.")
 # 2. SKILL-CAPTURE — [OPTIONAL companion: needs `auto_skill_capture.py`, a separate tool NOT bundled
 #    with claude-code-fleet]. Mines landed commits into a reusable skills library. DELEGATED to a subagent.
-CronCreate(cron="12 */4 * * *",  durable=True, prompt="[skill-capture — every 4h · USE A SUBAGENT (keep manager context light)] Do NOT run it in your own context. SPAWN a subagent (Agent tool, general-purpose) with task: 'Run: python3 ${CC_REPO}/bin/auto_skill_capture.py --hours 24 --commit. Report ONE line: skills captured/updated + commit sha, or none.' Relay ONLY the subagent's one line.")
+CronCreate(cron="12 5 * * *",  durable=True, prompt="[skill-capture — DAILY · USE A SUBAGENT (keep manager context light)] Do NOT run it in your own context. SPAWN a subagent (Agent tool, general-purpose) with task: 'Run: python3 ${CC_REPO}/bin/auto_skill_capture.py --hours 24 --commit. Report ONE line: skills captured/updated + commit sha, or none.' Relay ONLY the subagent's one line.")
 # 3. MECHANISM-GRILL — 12h adversarial fan-out of the machinery; NOT gated. Already subagent-driven
 #    (the workflow IS the fan-out); the cron prompt just launches it.
 CronCreate(cron="13 6,18 * * *", durable=True, prompt="<paste prompt 5 above>")
 # 4. DREAM — [OPTIONAL companion: needs the `/dream` memory-consolidation skill, NOT bundled with
-#    claude-code-fleet]. Memory consolidation every 6h: the /dream skill scans transcripts →
+#    claude-code-fleet]. Memory consolidation DAILY: the /dream skill scans transcripts →
 #    consolidates memory → rebuilds MEMORY.md lean (<200 lines). Fights "memory rot" (counterpart to
 #    skill-capture's "skill rot"). NOT gated. Transcript scanning is heavy → DELEGATED to a subagent.
-CronCreate(cron="27 */6 * * *", durable=True, prompt="[dream — memory consolidation every 6h · USE A SUBAGENT (memory scanning is heavy)] Do NOT run it in your own context. SPAWN a subagent (Agent tool, general-purpose) with task: 'Invoke the /dream skill on the project memory; if not loaded, read ~/.claude/skills/dream/SKILL.md and run its 4 phases (Orient → Gather Signal → Consolidate → Prune & rebuild MEMORY.md lean). Report ONE line: memories consolidated/pruned + MEMORY.md line count.' Relay ONLY the subagent's one line.")
+CronCreate(cron="27 5 * * *", durable=True, prompt="[dream — memory consolidation DAILY · USE A SUBAGENT (memory scanning is heavy)] Do NOT run it in your own context. SPAWN a subagent (Agent tool, general-purpose) with task: 'Invoke the /dream skill on the project memory; if not loaded, read ~/.claude/skills/dream/SKILL.md and run its 4 phases (Orient → Gather Signal → Consolidate → Prune & rebuild MEMORY.md lean). Report ONE line: memories consolidated/pruned + MEMORY.md line count.' Relay ONLY the subagent's one line.")
 # REMOVED: :17 self-audit (deleted by operator — not needed); :41 task-audit (folded into the
 # cc-watch backbone above as a gated LLM backstop after cc-monitor — no separate cron).
 

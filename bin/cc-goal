@@ -20,6 +20,62 @@ set -e
 NAME="$1"; shift
 TS="$HOME/.local/bin/ts"
 
+# ── _cc_goal_stamp: LOCKED + ATOMIC registry update ──────────────────────────
+# The old inline `reg = json.loads(p.read_text()); ...; p.write_text(...)` was an
+# UNLOCKED read-modify-write. Two concurrent cc-goal calls (cc-watch keepalive shells
+# out to cc-goal per stalled worker while the manager may run cc-goal by hand) race:
+# the slower writer's snapshot is stale → the other worker's update is SILENTLY LOST.
+# Worse, write_text() truncates-then-writes (non-atomic); a kill mid-write (cc-watch
+# SIGALRM) leaves a PARTIAL/empty workers.json that crashes EVERY downstream
+# json.loads reader (cc-watch / cc-monitor / cc-roster go blind).
+# Fix: exclusive lock (O_EXCL, stale-steal >15s so no deadlock) → re-read under lock →
+# write to a temp file → os.replace() atomic rename. goal == __CLEAR__ sentinel writes
+# "". `|| true` keeps set -e from aborting on a missing/corrupt registry (degrade to
+# stale roster, never crash the caller).
+_cc_goal_stamp() {
+    python3 - "$1" "$2" "$3" <<'PY' 2>/dev/null || true
+import json, sys, os, time, tempfile
+from datetime import datetime
+from pathlib import Path
+name, goal, regpath = sys.argv[1], sys.argv[2], sys.argv[3]
+clear = (goal == "__CLEAR__")
+p = Path(regpath)
+lock = Path(regpath + ".lock")
+fd = None
+for _ in range(50):                       # ~5s of retries
+    try:
+        fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        break
+    except FileExistsError:
+        try:
+            if time.time() - lock.stat().st_mtime > 15:   # steal a crashed writer's stale lock
+                lock.unlink(); continue
+        except FileNotFoundError:
+            continue
+        time.sleep(0.1)
+try:
+    reg = json.loads(p.read_text())       # RE-READ under lock → no lost update
+    for w in reg.get("workers", []):
+        if w.get("name") == name:
+            w["current_goal"] = "" if clear else goal
+            w["goal_updated"] = datetime.now().isoformat()
+            break
+    data = json.dumps(reg, indent=2, ensure_ascii=False)
+    tf = tempfile.NamedTemporaryFile("w", dir=str(p.parent), prefix=".workers.",
+                                     suffix=".tmp", delete=False, encoding="utf-8")
+    try:
+        tf.write(data); tf.flush(); os.fsync(tf.fileno()); tf.close()
+        os.replace(tf.name, str(p))       # atomic rename → readers never see a partial file
+    except BaseException:
+        os.unlink(tf.name); raise
+finally:
+    if fd is not None:
+        os.close(fd)
+        try: lock.unlink()
+        except FileNotFoundError: pass
+PY
+}
+
 if [ "$1" = "--nudge" ]; then
     shift
     MSG="$*"
@@ -71,24 +127,12 @@ else
     fi
 
     # Stamp registry current_goal ONLY after verified landing (no more lying roster).
+    # LOCKED + ATOMIC (see _cc_goal_stamp): concurrent cc-goal / cc-watch keepalive can't
+    # lose this update or leave a half-written workers.json. goal_updated stamps WHEN the
+    # persistent /goal anchor was last refreshed — cc-monitor's check_goal_stale compares it
+    # to each open task's created_at to catch "only --nudged, never re-/goal" drift.
     REGISTRY="$HOME/.cc-manager/workers.json"
     if [ -f "$REGISTRY" ]; then
-        python3 - "$NAME" "$MSG" "$REGISTRY" <<'PY' 2>/dev/null || true
-import json, sys
-from datetime import datetime
-from pathlib import Path
-name, goal, regpath = sys.argv[1], sys.argv[2], sys.argv[3]
-p = Path(regpath)
-reg = json.loads(p.read_text())
-for w in reg.get("workers", []):
-    if w.get("name") == name:
-        w["current_goal"] = goal
-        # goal_updated stamps WHEN the persistent /goal anchor was last refreshed.
-        # cc-monitor's check_goal_stale compares this to each open task's created_at
-        # to catch "manager only --nudged, never set a fresh /goal" drift.
-        w["goal_updated"] = datetime.now().isoformat()
-        break
-p.write_text(json.dumps(reg, indent=2, ensure_ascii=False))
-PY
+        _cc_goal_stamp "$NAME" "$MSG" "$REGISTRY"
     fi
 fi

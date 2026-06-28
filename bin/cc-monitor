@@ -892,9 +892,13 @@ def check_repeated_nudge():
             continue
         # Compare last 3 msgs: if they share a long common keyword signature → loop
         last3 = msgs[-3:]
-        # crude similarity: shared 8-char tokens across all 3
+        # crude similarity: shared 6+-char tokens across all 3.
+        # CASE-FOLD first: cc-watch's hard-cap-2 only blocks BYTE-identical re-sends; a nudge
+        # re-sent with only case tweaks (e.g. AI_DAG→ai_dag, BLOCKED→blocked) slips PAST the cap
+        # AND, without folding, past this detector — the case-only tokens never intersect
+        # (set('AI_DAG') ∩ set('ai_dag') = ∅) so a real deadlock loop is silently missed.
         def toks(m):
-            return set(w for w in re.split(r"[\s,，。()（）]", m) if len(w) >= 6)
+            return set(w for w in re.split(r"[\s,，。()（）]", m.lower()) if len(w) >= 6)
         common = toks(last3[0]) & toks(last3[1]) & toks(last3[2])
         if len(common) >= 3:  # 3+ shared long tokens across 3 consecutive = likely same nudge
             flagged.append((sess, sorted(common)[:5]))
@@ -1328,11 +1332,18 @@ def check_session_health():
         return
     sessions = [l.strip() for l in WATCH_LIST.read_text().splitlines() if l.strip() and not l.startswith("#")]
     goals = {}
+    goal_set_at = {}  # {name: datetime} — when cc-goal last VERIFIED-anchored a /goal (durable)
     try:
         for w in json.loads(WORKERS_FILE.read_text()).get("workers", []):
             g = (w.get("current_goal") or "").strip()
             if g:
                 goals[w["name"]] = g
+            gu = w.get("goal_updated")
+            if gu:
+                try:
+                    goal_set_at[w["name"]] = datetime.fromisoformat(gu)
+                except (ValueError, TypeError):
+                    pass
     except Exception:
         pass
     stamps = _load_stamp_map(SESSION_HEALTH_SEEN_FILE)
@@ -1385,6 +1396,33 @@ def check_session_health():
         if "⏵⏵" not in tail and "❯" not in tail:
             continue  # alt screen / non-claude frame → footer absence proves nothing
         if "/goal active" in tail:
+            continue
+        # FALSE-POSITIVE GUARD: a worker can be flagged goal-lost WHILE actively working its
+        # correct, freshly-set goal, then auto-re-anchored — eroding signal + risking goal-drift.
+        # The footer '◎ /goal active (Xm)' marker is a VIEWPORT-RENDER artifact, not a durable
+        # state: it legitimately drops out of the last-25-line window for a HEALTHY worker whenever
+        # (a) the worker is mid-turn/thinking (footer not yet re-rendering the marker), or (b) a
+        # transient overlay occupies or pushes out the footer slot. The DURABLE truth lives in
+        # workers.json goal_updated, which cc-goal stamps ONLY after VERIFYING the anchor landed
+        # ('Goal set:' echo). Two guards add the missing "actively-working / fresh-anchor" gate
+        # WITHOUT loosening into a bypass: a genuinely abandoned anchor (old/missing goal_updated,
+        # no overlay) STILL flags.
+        #
+        # (a) overlay SUPPRESSES the '◎ /goal active' footer line even though the anchor is fine.
+        #     Two observed overlays: the 'How is Claude doing this session?' feedback survey (same
+        #     hazard class as the 'Enter to confirm' dialog above: auto-ts would type a rating INTO
+        #     the survey), and the '/rc active' RC-draft statusline state (RC mode only exists on an
+        #     anchored session, so its presence is positive proof the anchor is NOT lost). Marker-
+        #     absence under either overlay proves nothing — skip this cycle.
+        if "How is Claude doing this session" in tail or "/rc active" in tail:
+            continue
+        # (b) FRESH durable anchor: cc-goal verified-anchored a /goal within the recency window →
+        #     the missing footer marker is a render artifact, not a lost anchor. A genuinely-lost
+        #     anchor has a STALE (or absent) goal_updated and still falls through. Window =
+        #     COOLDOWN_MIN so at most one cycle can slip past a real loss that happened to follow a
+        #     recent set; the next cycle (anchor still missing, goal_updated now older) catches it.
+        gset = goal_set_at.get(sess)
+        if gset is not None and (now - gset).total_seconds() / 60 < COOLDOWN_MIN:
             continue
         if throttled(f"{sess}:goal-lost"):
             continue

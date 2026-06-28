@@ -435,7 +435,16 @@ print(",".join(out))' 2>/dev/null || echo ""
     # the headless cc-review spawns if any pane is now limited — cursor not advanced, retries next tick.
     _cr_limited=0
     for _s in $(tmux ls -F '#{session_name}' 2>/dev/null); do
-        tmux capture-pane -p -t "$_s" -S -12 2>/dev/null | grep -qiE "spend limit|usage-credits|usage limit reached|resets [0-9]{1,2}(:[0-9]{2})?[[:space:]]*(am|pm)" && { _cr_limited=1; break; }
+        # SKIP the manager's own pane (manager/mgrtest). This loop scans ALL sessions, so the manager
+        # scanning ITSELF re-tripped on its own logs/diagnostics — the manager pane legitimately echoes
+        # these banner UI-strings as cc-watch output and detector-regex source text. A manager is never a
+        # worker hitting a 5h banner, so its pane must not gate worker review spawns.
+        case "$_s" in manager|mgrtest) continue ;; esac
+        # TIGHTENED: anchor to the REAL live limit BANNER, never bare prose. The old bare `spend limit`
+        # alternation matched a worker's CONVERSATIONAL mention of a spend/usage limit (stale narration from
+        # a long-resolved task) → cc-review deferred forever. The real banner ALWAYS co-occurs "spend limit"
+        # with "/usage-credits" (mislabeled 5h form) OR is one of the specific UI strings below.
+        tmux capture-pane -p -t "$_s" -S -12 2>/dev/null | grep -qiE "usage-credits|usage limit reached|approaching usage limit|[0-9]+-hour limit reached|limit will reset|resets [0-9]{1,2}(:[0-9]{2})?[[:space:]]*(am|pm)|spend limit[^|]*usage-credits" && { _cr_limited=1; break; }
     done
     head_sha=$(git -C "$REPO_CR" rev-parse --short HEAD 2>/dev/null || echo "")
     last_sha=""; [ -f "$STAMP" ] && last_sha=$(cat "$STAMP" 2>/dev/null)
@@ -447,7 +456,13 @@ print(",".join(out))' 2>/dev/null || echo ""
             # commits (--max-count truncates the default newest-first walk, THEN --reverse flips
             # display order) — so with a >3 backlog the OLDER commits were silently never reviewed
             # while the cursor jumped to HEAD. Take the OLDEST 3: full reverse, then head -3.
-            new_shas=$(git -C "$REPO_CR" rev-list --reverse "${last_sha}..HEAD" 2>/dev/null | head -3)
+            # FIX (merge-oscillation): WITHOUT --first-parent, a MERGE commit makes
+            # `last_sha..HEAD` re-interleave both parent-lines, so the cursor advances to a sha that
+            # doesn't dominate the other line → the oldest-3 re-includes already-reviewed commits and
+            # the cursor OSCILLATES, never reaching HEAD (a consolidation merge wedges it, re-reviewing
+            # the same 3 every tick). --first-parent drains the linear mainline monotonically; merged-in
+            # commits were already reviewed on their branch pre-merge.
+            new_shas=$(git -C "$REPO_CR" rev-list --reverse --first-parent "${last_sha}..HEAD" 2>/dev/null | head -3)
         else
             new_shas=$(git -C "$REPO_CR" rev-list --reverse --max-count=1 HEAD 2>/dev/null)  # first run: just HEAD, no history backlog
         fi
@@ -689,7 +704,8 @@ print(top+' '+(hashlib.sha1(t.encode()).hexdigest()[:10]))
             _limited=0
             for owner in $owners; do
                 tmux has-session -t "$owner" 2>/dev/null || continue
-                if tmux capture-pane -p -t "$owner" -S -12 2>/dev/null | grep -qiE "spend limit|usage-credits|usage limit reached|limit will reset|resets [0-9]{1,2}(:[0-9]{2})?\s*(am|pm)"; then _limited=1; break; fi
+                # TIGHTENED: real-banner anchor only — bare "spend limit" matched stale worker prose.
+                if tmux capture-pane -p -t "$owner" -S -12 2>/dev/null | grep -qiE "usage-credits|usage limit reached|approaching usage limit|[0-9]+-hour limit reached|limit will reset|resets [0-9]{1,2}(:[0-9]{2})?[[:space:]]*(am|pm)|spend limit[^|]*usage-credits"; then _limited=1; break; fi
             done
             if [ "$_limited" = 1 ]; then echo "$NOW [cc-review] $ss FAIL but an owner pane is usage-limited — repoke + cursor deferred (retry next tick)"; break; fi
             # grill #5: repoke EVERY owner of a cross-owner FAIL (was: only most_common(1))
@@ -1033,7 +1049,12 @@ watch_one() {
     # match the bare phrase "usage limit" alone — the transient-stall error line literally
     # says "(not your usage limit)", a NEGATION that would false-trigger; require "reached"
     # or "resets <time>" or the spend-limit/usage-credits wording instead.
-    if tail -12 "$pane" | grep -qiE "spend limit|usage-credits|usage limit reached|limit will reset|resets [0-9]{1,2}(:[0-9]{2})?\s*(am|pm)"; then
+    # TIGHTENED: the bare "spend limit" alternation ALSO matched a worker's CONVERSATIONAL prose (stale
+    # narration from a long-resolved task) — an idle pane with no live banner re-tripped this every tick.
+    # Require a real banner anchor: "spend limit" only counts when it CO-OCCURS with "/usage-credits" (the
+    # mislabeled 5h banner literally reads "monthly spend limit. /usage-credits to adjust"); the other
+    # alternations are already banner-specific UI strings. A worker merely TALKING about a limit can't trip it.
+    if tail -12 "$pane" | grep -qiE "usage-credits|usage limit reached|approaching usage limit|[0-9]+-hour limit reached|limit will reset|resets [0-9]{1,2}(:[0-9]{2})?[[:space:]]*(am|pm)|spend limit[^|]*usage-credits"; then
         # grill #1 fix (stale-banner circular trap): if the freeze gate's authoritative probe just
         # proved tokens flow THIS tick (.freeze_resume fresh), the banner is STALE (panes don't refresh
         # on their own). Re-freezing here would send nothing → no turn renders → banner stays → fleet
