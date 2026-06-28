@@ -42,6 +42,7 @@ PAID_REVIEW_SLA_SEEN_FILE = Path.home() / ".cc-manager" / "paid_review_sla_seen.
 LANDING_REOPEN_SEEN_FILE = Path.home() / ".cc-manager" / "landing_reopen_seen.json"
 SESSION_HEALTH_SEEN_FILE = Path.home() / ".cc-manager" / "session_health_seen.json"
 DELIV_NUDGE_SEEN_FILE = Path.home() / ".cc-manager" / "deliv_nudge_seen.json"
+DR_CANDIDATES_SEEN_FILE = Path.home() / ".cc-manager" / "dr_candidates_seen.json"
 WORKERS_FILE = Path.home() / ".cc-manager" / "workers.json"
 REPO_ROOT = Path(os.environ.get("CC_REPO") or str(Path.home() / "your-repo"))
 LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
@@ -914,6 +915,182 @@ def check_repeated_nudge():
         print(f"repeated-nudge-detection: {len(flagged)} worker(s) deadlock — auto-GRILL sent + flagged")
     else:
         print("repeated-nudge-detection: no deadlock loops")
+
+
+# --- check_dr_candidates_verified (RULE A — no cherry-picking) regexes/helpers ---
+# A research round is NOT complete until EVERY ranked candidate has a verdict: a real
+# verification-backend run id, an explicit ALIVE/DEAD, or a needs-paid-data:<feed> flag.
+# A verdict cell that is empty / `pending` / `-` / `TBD` = un-verified → round NOT done.
+DR_RESEARCH_GOAL_REGEX = re.compile(
+    r"research|deep[ _-]?research|\bDR\b|\bCCDR\b|explore|exploration|survey|literature"
+    r"|find\s+(?:a\s+)?(?:new\s+)?(?:alpha|signal|edge|mechanism|angle|direction|candidate)",
+    re.IGNORECASE)
+# A verdict cell counts as VERIFIED iff it carries a run id (>=8-hex backtest/run id),
+# an ALIVE/DEAD verdict, or a needs-paid-data flag.
+DR_RUNID_REGEX = re.compile(r"\b[0-9a-f]{8,}\b")
+DR_VERDICT_TOKEN_REGEX = re.compile(r"\bALIVE\b|\bDEAD\b", re.IGNORECASE)
+DR_NEEDS_PAID_REGEX = re.compile(r"needs[ _-]?paid[ _-]?data\s*:?\s*\S+", re.IGNORECASE)
+DR_PENDING_CELL_REGEX = re.compile(r"^\s*(?:|-|–|—|\.{1,3}|n/?a|tbd|pending|todo|\?+)\s*$", re.IGNORECASE)
+
+
+def _parse_candidates_ledger(text: str):
+    """Parse a `## Candidates` markdown table out of a research doc.
+
+    CONSERVATIVE (RULE A must NOT false-positive on the idle fleet):
+      - None if no `## Candidates` heading, or no parseable table, or no `verdict` column
+        → caller treats None as 'no ledger, do NOT flag';
+      - else (verified[], unverified[]). A row is unverified iff its verdict cell is
+        present-but-empty/pending OR carries none of {run id, ALIVE/DEAD, needs-paid-data}.
+    Never raises — any structural surprise returns None (no flag)."""
+    if not text:
+        return None
+    lines = text.splitlines()
+    start = None
+    for i, ln in enumerate(lines):
+        if re.match(r"^\s{0,3}#{1,6}\s+candidates\b", ln, re.IGNORECASE):
+            start = i + 1
+            break
+    if start is None:
+        return None
+    table = []
+    for ln in lines[start:]:
+        if re.match(r"^\s{0,3}#{1,6}\s", ln):  # next heading → section end
+            break
+        if "|" in ln:
+            table.append(ln)
+        elif table:
+            break
+    if len(table) < 2:
+        return None
+
+    def cells(row):
+        return [c.strip() for c in row.strip().strip("|").split("|")]
+
+    header = [h.lower() for h in cells(table[0])]
+    vcol = next((idx for idx, h in enumerate(header) if "verdict" in h), None)
+    if vcol is None:
+        return None
+    verified, unverified = [], []
+    for row in table[1:]:
+        if re.match(r"^\s*\|?[\s:\-|]+\|?\s*$", row):  # markdown separator row
+            continue
+        c = cells(row)
+        if vcol >= len(c):
+            continue  # ragged row — skip, don't crash/flag on a parse artifact
+        name = next((x for x in c if x and not re.fullmatch(r"\d+", x)), None) or "(unnamed)"
+        verdict = c[vcol]
+        if DR_RUNID_REGEX.search(verdict) or DR_VERDICT_TOKEN_REGEX.search(verdict) or DR_NEEDS_PAID_REGEX.search(verdict):
+            verified.append(name)
+        elif DR_PENDING_CELL_REGEX.match(verdict) or not verdict:
+            unverified.append(name)
+        else:
+            unverified.append(name)  # non-empty but not a real verdict → un-verified (RULE A)
+    if not verified and not unverified:
+        return None
+    return (verified, unverified)
+
+
+def _recent_research_docs(window_hours: int = 48):
+    """Most-recently-committed research .md docs (newest first) in the last window. Shared
+    tree → can't git-attribute to a worker by author; returns repo-wide recent research-shaped
+    docs and the caller scopes to active research workers. Returns repo-relative paths, never
+    raises (git failure → [])."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "log", f"--since={window_hours} hours ago",
+             "--name-only", "--pretty=format:", "--diff-filter=AM"],
+            capture_output=True, text=True, timeout=20)
+    except Exception:
+        return []
+    if out.returncode != 0:
+        return []
+    seen = []
+    for p in out.stdout.splitlines():
+        p = p.strip()
+        if not p or p in seen or not p.endswith(".md"):
+            continue
+        low = p.lower()
+        if not any(k in low for k in ("research", "candidates", "deep-research", "_dr.md", "/dr_")):
+            continue
+        seen.append(p)
+    return seen
+
+
+def check_dr_candidates_verified():
+    """Pass (RULE A — no cherry-picking): a research round is NOT complete until EVERY ranked
+    candidate has a verdict — a real verification-backend run id + ALIVE/DEAD, OR an explicit
+    `needs-paid-data:<feed>` flag. Catches: a worker runs DR, gets N ranked candidates, verifies
+    only the 1-2 it likes, commits a 'DEAD' verdict, silently drops the rest (never falsified).
+
+    For each ACTIVE research worker, find the most-recent committed research doc with a
+    `## Candidates` ledger, parse it, and FLAG (naming the candidates) if any row's verdict cell
+    is un-verified. CONSERVATIVE — only a CLEAR table WITH a verdict column AND a verdict-less row
+    trips it; no ledger → no flag; per-(worker,doc) cooldown; all parsing exception-guarded."""
+    COOLDOWN_MIN = 120
+    try:
+        reg = json.loads(WORKERS_FILE.read_text())
+    except Exception:
+        print("dr-candidates: no workers.json — skip")
+        return
+    docs = _recent_research_docs(window_hours=48)
+    if not docs:
+        print("dr-candidates: no recent research docs committed — skip")
+        return
+    stamps = _load_stamp_map(DR_CANDIDATES_SEEN_FILE)
+    now = datetime.now()
+    flagged = []
+    for w in reg.get("workers", []):
+        if w.get("status") != "active":
+            continue
+        name = w.get("name")
+        if not name or w.get("role") == "manager":
+            continue
+        goal = (w.get("current_goal") or "").strip()
+        if not goal or not DR_RESEARCH_GOAL_REGEX.search(goal):
+            continue
+        if not session_alive(name):
+            continue
+        ledger, doc_path = None, None
+        for rel in docs:
+            try:
+                txt = (REPO_ROOT / rel).read_text(errors="replace")
+            except Exception:
+                continue
+            parsed = _parse_candidates_ledger(txt)
+            if parsed is not None:
+                ledger, doc_path = parsed, rel
+                break  # newest-first
+        if ledger is None:
+            continue  # no ledger → do NOT flag (conservative)
+        verified, unverified = ledger
+        if not unverified:
+            continue  # every candidate has a verdict → RULE A satisfied
+        key = f"{name}|{doc_path}"
+        last = stamps.get(key)
+        if last:
+            try:
+                if (now - datetime.fromisoformat(last)).total_seconds() / 60 < COOLDOWN_MIN:
+                    continue
+            except (ValueError, TypeError):
+                pass
+        flagged.append((name, doc_path, unverified, len(verified)))
+        stamps[key] = now.isoformat()
+        names = ", ".join(unverified[:6]) + (" …" if len(unverified) > 6 else "")
+        try:
+            subprocess.run([str(TS), name,
+                f"[manager RULE A] you ran DR but candidates aren't all verified — in {doc_path} the "
+                f"## Candidates rows with no run-id/verdict: {names}. A DR round is NOT done until EVERY "
+                f"candidate has a run id + ALIVE/DEAD, or needs-paid-data:<feed>. Don't cherry-pick the top 1-2."],
+                check=False, capture_output=True, timeout=10)
+        except Exception:
+            pass
+    if flagged:
+        _save_stamp_map(DR_CANDIDATES_SEEN_FILE, stamps)
+        print(f"dr-candidates: {len(flagged)} research worker(s) ran DR but left candidates un-verified (RULE A) — repoked:")
+        for name, doc, unver, nv in flagged:
+            print(f"  [dr-candidates] {name}: {doc} — {len(unver)} un-verified ({', '.join(unver[:6])}), {nv} verified → repoked (no cherry-picking).")
+    else:
+        print("dr-candidates: no un-verified DR candidate ledgers (RULE A satisfied / no ledger)")
 
 
 CRYPTO_LANE_WORKERS = {"crypto_dr", "crypto_breadth", "data_pipe", "crypto_fix"}
@@ -2006,6 +2183,7 @@ def main():
         _run_pass(check_ship_drift)
         _run_pass(check_premature_exhaustion)
         _run_pass(check_repeated_nudge)
+        _run_pass(check_dr_candidates_verified)
         _run_pass(check_excluded_scope)
         _run_pass(check_dropped_tasks)
         _run_pass(check_uncommitted)
