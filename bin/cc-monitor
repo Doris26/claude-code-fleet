@@ -931,6 +931,22 @@ DR_RUNID_REGEX = re.compile(r"\b[0-9a-f]{8,}\b")
 DR_VERDICT_TOKEN_REGEX = re.compile(r"\bALIVE\b|\bDEAD\b", re.IGNORECASE)
 DR_NEEDS_PAID_REGEX = re.compile(r"needs[ _-]?paid[ _-]?data\s*:?\s*\S+", re.IGNORECASE)
 DR_PENDING_CELL_REGEX = re.compile(r"^\s*(?:|-|–|—|\.{1,3}|n/?a|tbd|pending|todo|\?+)\s*$", re.IGNORECASE)
+# A doc CARRIES a deep-research marker (it is the output of a DR/CCDR round, not an unrelated note).
+# Used to gate the no-ledger evasion check so a plain non-DR markdown file can never trip it.
+DR_DOC_MARKER_REGEX = re.compile(r"deep[ _-]?research|\bCCDR\b|\bDR\b|## Candidates|candidate ledger", re.IGNORECASE)
+# A doc READS LIKE a DR-round CONCLUSION (a round-verdict / closure / "explored N → DEAD" framing).
+# Paired with a DR marker, a doc that matches this but has NO `## Candidates` ledger is the
+# cherry-pick-by-omission evasion of RULE A (run DR, verify the 1-2 you like, write a prose
+# 'all DEAD / closing lane' close, emit no ledger). DELIBERATELY anchored to round-CLOSURE language
+# (not bare 'DEAD' in a result table) so an in-progress / stub research note never trips it.
+DR_CONCLUSION_DOC_REGEX = re.compile(
+    r"all\s+(?:candidates\s+|directions\s+|angles\s+)?DEAD"
+    r"|every\s+(?:candidate|direction|angle)\s+(?:is\s+)?DEAD"
+    r"|explored\s+\d+|\d+\s+(?:candidates?|directions?|angles?|mechanisms?|leads?)\s+(?:all\s+)?(?:explored|DEAD|tested)"
+    r"|round\s+(?:is\s+)?(?:DEAD|complete|concluded|closed)|DR\s+round\s+(?:DEAD|complete|done)"
+    r"|clos(?:e|ing|ed)\s+(?:this\s+)?(?:lane|direction|line|exploration)"
+    r"|exploration\s+(?:concluded|complete|closed|exhausted)|direction\s+(?:DEAD|exhausted|closed)",
+    re.IGNORECASE)
 
 
 def _parse_candidates_ledger(text: str):
@@ -1039,6 +1055,7 @@ def check_dr_candidates_verified():
     stamps = _load_stamp_map(DR_CANDIDATES_SEEN_FILE)
     now = datetime.now()
     flagged = []
+    no_ledger_flagged = []  # DR-conclusion docs that emitted NO `## Candidates` ledger (RULE A)
     for w in reg.get("workers", []):
         if w.get("status") != "active":
             continue
@@ -1051,6 +1068,7 @@ def check_dr_candidates_verified():
         if not session_alive(name):
             continue
         ledger, doc_path = None, None
+        no_ledger_doc = None  # a DR-conclusion doc that carries NO parseable ledger
         for rel in docs:
             try:
                 txt = (REPO_ROOT / rel).read_text(errors="replace")
@@ -1060,8 +1078,47 @@ def check_dr_candidates_verified():
             if parsed is not None:
                 ledger, doc_path = parsed, rel
                 break  # newest-first
+            # NO-LEDGER EVASION: the parser returns None for a doc with no `## Candidates` section
+            # — but a worker can CHERRY-PICK BY OMISSION: run DR, verify the 1-2 it likes, and write
+            # a prose "explored N, all DEAD / closing lane" conclusion with NO ledger at all. The old
+            # code treated every None as "no DR ran → don't flag", so the easiest evasion of RULE A
+            # was to emit no ledger. Record the FIRST (newest) recent doc that READS LIKE A DR
+            # CONCLUSION (a DR/CCDR marker AND a round-verdict / closure phrase) yet has no ledger —
+            # that omission is itself a RULE-A violation. Stays conservative: a stub/in-progress note
+            # (no conclusion language) or a non-DR doc never trips it, and a real ledger anywhere
+            # recent (loop continues, ledger set above) wins over this.
+            if (no_ledger_doc is None
+                    and DR_CONCLUSION_DOC_REGEX.search(txt)
+                    and DR_DOC_MARKER_REGEX.search(txt)):
+                no_ledger_doc = rel
         if ledger is None:
-            continue  # no ledger → do NOT flag (conservative)
+            # No parseable ledger anywhere recent. If the worker committed a DR-CONCLUSION doc
+            # (DR was run + a verdict was drawn) but emitted NO `## Candidates` ledger, that is the
+            # cherry-pick-by-omission evasion — flag it (RULE A requires the auditable ledger).
+            # Otherwise (no DR-conclusion doc) stay silent: the worker may simply not have run DR.
+            if no_ledger_doc is None:
+                continue
+            key = f"{name}|{no_ledger_doc}|noledger"
+            last = stamps.get(key)
+            if last:
+                try:
+                    if (now - datetime.fromisoformat(last)).total_seconds() / 60 < COOLDOWN_MIN:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            no_ledger_flagged.append((name, no_ledger_doc))
+            stamps[key] = now.isoformat()
+            try:
+                subprocess.run([str(TS), name,
+                    f"[manager RULE A] {no_ledger_doc} reads like a DR conclusion (DR ran + a verdict was "
+                    f"drawn) but has NO `## Candidates` ledger — a DR round is NOT done until EVERY ranked "
+                    f"candidate lands in the ledger with a run id + ALIVE/DEAD, or needs-paid-data:<feed>. "
+                    f"No ledger = cherry-pick by omission (you verified only the 1-2 you liked). Emit the "
+                    f"`## Candidates` table for every candidate."],
+                    check=False, capture_output=True, timeout=10)
+            except Exception:
+                pass
+            continue
         verified, unverified = ledger
         if not unverified:
             continue  # every candidate has a verdict → RULE A satisfied
@@ -1084,12 +1141,17 @@ def check_dr_candidates_verified():
                 check=False, capture_output=True, timeout=10)
         except Exception:
             pass
-    if flagged:
+    if flagged or no_ledger_flagged:
         _save_stamp_map(DR_CANDIDATES_SEEN_FILE, stamps)
+    if flagged:
         print(f"dr-candidates: {len(flagged)} research worker(s) ran DR but left candidates un-verified (RULE A) — repoked:")
         for name, doc, unver, nv in flagged:
             print(f"  [dr-candidates] {name}: {doc} — {len(unver)} un-verified ({', '.join(unver[:6])}), {nv} verified → repoked (no cherry-picking).")
-    else:
+    if no_ledger_flagged:
+        print(f"dr-candidates: {len(no_ledger_flagged)} DR-conclusion doc(s) with NO `## Candidates` ledger (cherry-pick-by-omission) — repoked:")
+        for name, doc in no_ledger_flagged:
+            print(f"  [dr-candidates] {name}: {doc} — DR concluded but emitted no ledger → repoked (RULE A: every candidate must land in `## Candidates`).")
+    if not flagged and not no_ledger_flagged:
         print("dr-candidates: no un-verified DR candidate ledgers (RULE A satisfied / no ledger)")
 
 
