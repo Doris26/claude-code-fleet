@@ -34,6 +34,19 @@ reading them = repeating already-DEAD angles.
    DEAD-list to avoid, a novelty/orthogonality bar, a ranked-falsifiable-candidates deliverable, and
    cites. A DEAD ≠ done → research a NEW mechanism. Free-data ceiling → escalate a paid/alt-data
    proposal to the operator, don't go idle.
+   - **RULE A (completeness — no cherry-picking).** A DR round is NOT done until EVERY ranked candidate
+     has a QC verdict: a real 32-hex QC bt-id + ALIVE/DEAD, OR an explicit `needs-paid-data:<feed>`
+     flag. Never QC-test only the "top 1-2" and silently drop the rest — the dropped candidates were
+     never falsified, so the round's verdict is unearned.
+   - **RULE B (forced novelty).** After reading DR, don't converge on the literature-standard,
+     mostly-DEAD ideas. Treat momentum / OFI / value / plain MR / vanilla carry / PEAD as
+     presumed-DEAD; demand contrarian / cross-domain / non-obvious mechanisms; RANK by
+     orthogonality/novelty (not plausibility); self-critique "is this just the obvious literature
+     idea? what assumption is everyone making that might be wrong?" Use the diverse-lens exploration
+     workflow (diverse-lens → novelty-critic → per-candidate QC verify) for a thorough round.
+   - **Emit the `## Candidates` ledger** (table: candidate/mechanism + a `verdict` cell = 32-hex
+     bt-id, ALIVE/DEAD, or `needs-paid-data:<feed>`) in your DR doc. A DR is NOT done with un-verified
+     candidates — the cc-monitor `check_dr_candidates_verified` pass flags any bt-id-less row.
 8. **Every goal must LAND**: artifact (committed file / backtest id / metric-ledger row) + metric (a
    number vs an explicit bar) + acceptance (hit it, or prove it unreachable + record DEAD + the
    killing number).
