@@ -38,15 +38,26 @@ reading them = repeating already-DEAD angles.
      has a QC verdict: a real 32-hex QC bt-id + ALIVE/DEAD, OR an explicit `needs-paid-data:<feed>`
      flag. Never QC-test only the "top 1-2" and silently drop the rest — the dropped candidates were
      never falsified, so the round's verdict is unearned.
+   - **NUMBERED-TREE scheme (hierarchical decimal ids).** DR directions form a NUMBERED TREE; decimal
+     depth = DR-round depth. A 1st-round DR proposing 3 big directions → ids `1`,`2`,`3`. A 2nd round
+     drilling into `2` → `2.1`,`2.2`,`2.3`. A 3rd into `2.1` → `2.1.1`,`2.1.2`,… (one more dot per
+     deeper round). EVERY node — every proposed direction at every level — MUST get its OWN QC
+     backtest → a real bt-id + ALIVE/DEAD (or `needs-paid-data:<feed>`). A node with no bt-id = an
+     un-run direction = a gap. Example: 3 big + 3 sub-of-`2` = 6 nodes ⇒ exactly 6 QC runs must exist.
+     The ledger must be GAP-FREE: if `2.3` exists then `2.1`,`2.2` and parent `2` must exist too.
    - **RULE B (forced novelty).** After reading DR, don't converge on the literature-standard,
      mostly-DEAD ideas. Treat momentum / OFI / value / plain MR / vanilla carry / PEAD as
      presumed-DEAD; demand contrarian / cross-domain / non-obvious mechanisms; RANK by
      orthogonality/novelty (not plausibility); self-critique "is this just the obvious literature
      idea? what assumption is everyone making that might be wrong?" Use the diverse-lens exploration
      workflow (diverse-lens → novelty-critic → per-candidate QC verify) for a thorough round.
-   - **Emit the `## Candidates` ledger** (table: candidate/mechanism + a `verdict` cell = 32-hex
-     bt-id, ALIVE/DEAD, or `needs-paid-data:<feed>`) in your DR doc. A DR is NOT done with un-verified
-     candidates — the cc-monitor `check_dr_candidates_verified` pass flags any bt-id-less row.
+   - **Emit the `## Candidates` ledger** in your DR doc — a markdown table whose FIRST column is `id`
+     (the dotted-decimal tree-node number). Each row = `id | direction/mechanism | bt-id | verdict |
+     3yr·5yr·10yr Sharpe | MaxDD`; the `verdict` cell = 32-hex bt-id, ALIVE/DEAD, or
+     `needs-paid-data:<feed>`. Every numbered node → a QC bt-id; the ledger is the COMPLETE accounting
+     of all DR rounds. A DR is NOT done with un-run nodes OR tree gaps — the cc-monitor
+     `check_dr_candidates_verified` pass parses the `id` column and flags un-run nodes BY ID
+     ("direction 2.2 proposed, no QC run") and any tree gap (missing sibling/parent).
 8. **Every goal must LAND**: artifact (committed file / backtest id / metric-ledger row) + metric (a
    number vs an explicit bar) + acceptance (hit it, or prove it unreachable + record DEAD + the
    killing number).

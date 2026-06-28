@@ -332,20 +332,41 @@ dedup → novelty-critic (drop literature-standard/known-DEAD, rank by orthogona
 verify (RULE A) → synthesis emitting the `## Candidates` ledger. Invoke it for a thorough round
 instead of free-forming one DR prompt and cherry-picking its output.
 
+### RULE A-tree — hierarchical decimal numbering (the numbered DR tree)
+
+DR directions form a **NUMBERED TREE**, and decimal DEPTH = DR-round depth. A 1st-round DR that
+proposes 3 big directions → ids `1`, `2`, `3`. A 2nd-round DR that drills into direction `2` and
+proposes 3 sub-directions → `2.1`, `2.2`, `2.3`. A 3rd round into `2.1` → `2.1.1`, `2.1.2`, … —
+one more dot per deeper round. **EVERY node in the tree (every proposed direction at every level)
+MUST get its OWN verification run → a real run id + ALIVE/DEAD, or `needs-paid-data:<feed>`.** A node
+with no run id = an un-run direction = a gap to flag. Worked example: 3 big + 3 sub-of-one = 6 nodes
+⇒ exactly **6 verification runs must exist**. Two completeness properties the `check_dr_candidates_verified`
+pass enforces off the `id` column:
+- **no un-run node** — every numbered id has a run id / ALIVE-DEAD / needs-paid-data (it names the
+  un-run ids: "direction 2.2 proposed, no run");
+- **no tree gap** — if `2.3` exists then its earlier siblings `2.1`,`2.2` AND parent `2` must exist
+  too (a missing sibling/parent = a dropped direction). Malformed / non-numeric ids are ignored
+  (tree-checking only fires when the ledger actually carries well-formed dotted-decimal ids).
+
 ### The `## Candidates` ledger format (MANDATORY — the round's auditable output)
 
 Every DR-research doc MUST contain a section headed exactly `## Candidates` with a markdown table whose
-columns include the candidate name/mechanism and a `verdict` cell. Each row's `verdict` is one of: a
-run id (e.g. a 32-hex backtest id), `ALIVE` / `DEAD`, or `needs-paid-data:<feed>`. An EMPTY / `pending`
-/ `-` verdict = an un-verified candidate → the round is NOT complete (RULE A). Example:
+FIRST column is `id` (the dotted-decimal tree-node number), plus the candidate name/mechanism and a
+`verdict` cell. Each row's `verdict` is one of: a run id (e.g. a 32-hex backtest id), `ALIVE` / `DEAD`,
+or `needs-paid-data:<feed>`. An EMPTY / `pending` / `-` verdict = an un-verified candidate → the round
+is NOT complete (RULE A). The ledger is the COMPLETE accounting of all DR rounds. Example (`1/2/3` =
+round-1 directions; `2.1/2.2/2.3` = round-2 drill into direction `2`):
 
 ```
 ## Candidates
-| # | mechanism (domain)                    | corr | novelty-critique (1-line)        | verdict                     |
-|---|---------------------------------------|------|----------------------------------|-----------------------------|
-| 1 | dispersion-of-beliefs reversal (behav)| 0.18 | not OFI; bets crowd is overconf.  | 32a1...f9 DEAD              |
-| 2 | cross-asset credit->equity lead       | 0.31 | contrarian: lead not lag           | 9c0b...4e ALIVE            |
-| 3 | dealer-gamma flow-structural overlay  | 0.22 | needs dealer positioning feed     | needs-paid-data:dealer-gex |
+| id  | mechanism (domain)                    | corr | novelty-critique (1-line)        | verdict                     |
+|-----|---------------------------------------|------|----------------------------------|-----------------------------|
+| 1   | dispersion-of-beliefs reversal (behav)| 0.18 | not OFI; bets crowd is overconf.  | 32a1...f9 DEAD              |
+| 2   | cross-asset credit->equity lead       | 0.31 | contrarian: lead not lag           | 9c0b...4e ALIVE            |
+| 3   | dealer-gamma flow-structural overlay  | 0.22 | needs dealer positioning feed     | needs-paid-data:dealer-gex |
+| 2.1 | credit-lead × vol-degross overlay     | 0.12 | drill: does the lead survive degross| 7f3c...91 ALIVE          |
+| 2.2 | credit-lead × hedge sleeve            | 0.15 | drill: hedge-sleeve interaction    | c0d4...ae DEAD             |
+| 2.3 | credit-lead × cross-sectional rank    | 0.19 | drill: XS vs TS form of the lead   | b8e2...07 DEAD             |
 ```
 
 ## Spend-freeze: zero-token resume (operator lesson)

@@ -931,6 +931,55 @@ DR_RUNID_REGEX = re.compile(r"\b[0-9a-f]{8,}\b")
 DR_VERDICT_TOKEN_REGEX = re.compile(r"\bALIVE\b|\bDEAD\b", re.IGNORECASE)
 DR_NEEDS_PAID_REGEX = re.compile(r"needs[ _-]?paid[ _-]?data\s*:?\s*\S+", re.IGNORECASE)
 DR_PENDING_CELL_REGEX = re.compile(r"^\s*(?:|-|–|—|\.{1,3}|n/?a|tbd|pending|todo|\?+)\s*$", re.IGNORECASE)
+# --- Hierarchical decimal-numbering of research directions (the numbered tree) ---
+# Research directions form a NUMBERED TREE; decimal DEPTH = research-round depth. A 1st round
+# proposing 3 big directions → ids `1`,`2`,`3`; a 2nd round drilling into `2` → `2.1`,`2.2`,`2.3`;
+# a 3rd into `2.1` → `2.1.1`… (one more dot per deeper round). EVERY node (every proposed
+# direction at every level) MUST get its own verification run → a real run id + ALIVE/DEAD (or
+# needs-paid-data:<feed>); a node with no run id = an un-run direction = a gap. The `## Candidates`
+# ledger carries an `id` column = the dotted-decimal number and is the COMPLETE accounting of all
+# rounds. A canonical id is one-or-more dot-separated positive integers (e.g. `2`, `2.1`,
+# `2.10.3`); anything else is malformed and ignored for tree-checking (never crashes/flags on it).
+DR_ID_REGEX = re.compile(r"^\d+(?:\.\d+)*$")
+
+
+def _normalize_dr_id(raw):
+    """Return a canonical dotted-decimal id (e.g. '2.1') from a raw cell, or None if the cell is
+    not a well-formed numeric tree id. Tolerates surrounding markdown/whitespace (`**2.1**`, a
+    trailing `.`, backticks). Non-numeric / empty / malformed → None (ignored for tree-checking)."""
+    if raw is None:
+        return None
+    s = str(raw).strip().strip("`*_ ").rstrip(".")
+    if not s or not DR_ID_REGEX.match(s):
+        return None
+    try:
+        return ".".join(str(int(p)) for p in s.split("."))  # 2.01 -> 2.1, no structure change
+    except (ValueError, TypeError):
+        return None
+
+
+def _dr_tree_gaps(ids):
+    """Given the set of canonical ids PRESENT in a ledger, return the sorted REQUIRED-but-MISSING
+    ancestor/sibling ids (the tree gaps). Tree-completeness rule: if a node `2.3` exists then its
+    parent `2` and every earlier sibling `2.1`,`2.2` must also exist (a missing sibling/parent = a
+    dropped direction silently never proposed/run). For each present id we require (a) all proper
+    prefixes (ancestors) — `2.1` ⇒ `2`; and (b) all lower-numbered siblings at the same level —
+    `2.3` ⇒ `2.1`,`2.2`. Pure, never raises; caller passes only canonical ids."""
+    present = set(ids)
+    required = set()
+    for cid in present:
+        parts = cid.split(".")
+        for k in range(1, len(parts)):  # (a) ancestors
+            required.add(".".join(parts[:k]))
+        try:
+            last = int(parts[-1])
+        except (ValueError, TypeError):
+            continue
+        prefix = parts[:-1]
+        for n in range(1, last):  # (b) lower-numbered siblings
+            sib = ".".join(prefix + [str(n)]) if prefix else str(n)
+            required.add(sib)
+    return sorted(required - present, key=lambda s: [int(p) for p in s.split(".")])
 # A doc CARRIES a deep-research marker (it is the output of a DR/CCDR round, not an unrelated note).
 # Used to gate the no-ledger evasion check so a plain non-DR markdown file can never trip it.
 DR_DOC_MARKER_REGEX = re.compile(r"deep[ _-]?research|\bCCDR\b|\bDR\b|## Candidates|candidate ledger", re.IGNORECASE)
@@ -955,8 +1004,13 @@ def _parse_candidates_ledger(text: str):
     CONSERVATIVE (RULE A must NOT false-positive on the idle fleet):
       - None if no `## Candidates` heading, or no parseable table, or no `verdict` column
         → caller treats None as 'no ledger, do NOT flag';
-      - else (verified[], unverified[]). A row is unverified iff its verdict cell is
-        present-but-empty/pending OR carries none of {run id, ALIVE/DEAD, needs-paid-data}.
+      - else dict {verified, unverified, unverified_ids, present_ids, gaps}. A row is unverified
+        iff its verdict cell is present-but-empty/pending OR carries none of {run id, ALIVE/DEAD,
+        needs-paid-data}.
+    HIERARCHICAL TREE: if the table has an `id` column (the dotted-decimal node number), the row's
+    id is parsed and the parser additionally reports per-id un-run nodes and TREE GAPS (required-
+    but-missing ancestors/siblings — `2.3` present but `2.1`/`2.2`/`2` absent). No `id` column →
+    tree fields empty (back-compatible: only verdict completeness is enforced).
     Never raises — any structural surprise returns None (no flag)."""
     if not text:
         return None
@@ -986,7 +1040,11 @@ def _parse_candidates_ledger(text: str):
     vcol = next((idx for idx, h in enumerate(header) if "verdict" in h), None)
     if vcol is None:
         return None
-    verified, unverified = [], []
+    # id column = dotted-decimal tree-node number; EXACT 'id' header (or '#id'), not a substring
+    # of 'width'/'idea'. Absent → tree-checking skipped (back-compatible).
+    icol = next((idx for idx, h in enumerate(header)
+                 if re.fullmatch(r"#?\s*id", h.strip())), None)
+    verified, unverified, unverified_ids, present_ids = [], [], [], []
     for row in table[1:]:
         if re.match(r"^\s*\|?[\s:\-|]+\|?\s*$", row):  # markdown separator row
             continue
@@ -995,15 +1053,19 @@ def _parse_candidates_ledger(text: str):
             continue  # ragged row — skip, don't crash/flag on a parse artifact
         name = next((x for x in c if x and not re.fullmatch(r"\d+", x)), None) or "(unnamed)"
         verdict = c[vcol]
+        node_id = _normalize_dr_id(c[icol]) if (icol is not None and icol < len(c)) else None
+        if node_id is not None:
+            present_ids.append(node_id)
         if DR_RUNID_REGEX.search(verdict) or DR_VERDICT_TOKEN_REGEX.search(verdict) or DR_NEEDS_PAID_REGEX.search(verdict):
             verified.append(name)
-        elif DR_PENDING_CELL_REGEX.match(verdict) or not verdict:
-            unverified.append(name)
         else:
-            unverified.append(name)  # non-empty but not a real verdict → un-verified (RULE A)
+            unverified.append(name)  # empty/pending OR non-empty-but-not-a-verdict → un-verified
+            unverified_ids.append(node_id or name)
     if not verified and not unverified:
         return None
-    return (verified, unverified)
+    gaps = _dr_tree_gaps(present_ids) if present_ids else []
+    return {"verified": verified, "unverified": unverified,
+            "unverified_ids": unverified_ids, "present_ids": present_ids, "gaps": gaps}
 
 
 def _recent_research_docs(window_hours: int = 48):
@@ -1033,15 +1095,25 @@ def _recent_research_docs(window_hours: int = 48):
 
 
 def check_dr_candidates_verified():
-    """Pass (RULE A — no cherry-picking): a research round is NOT complete until EVERY ranked
-    candidate has a verdict — a real verification-backend run id + ALIVE/DEAD, OR an explicit
-    `needs-paid-data:<feed>` flag. Catches: a worker runs DR, gets N ranked candidates, verifies
-    only the 1-2 it likes, commits a 'DEAD' verdict, silently drops the rest (never falsified).
+    """Pass (RULE A — no cherry-picking + TREE completeness): a research round is NOT complete
+    until EVERY ranked candidate / numbered node has a verdict — a real verification-backend run
+    id + ALIVE/DEAD, OR an explicit `needs-paid-data:<feed>` flag. Catches: a worker runs DR, gets
+    N ranked candidates, verifies only the 1-2 it likes, commits a 'DEAD' verdict, silently drops
+    the rest (never falsified).
 
     For each ACTIVE research worker, find the most-recent committed research doc with a
-    `## Candidates` ledger, parse it, and FLAG (naming the candidates) if any row's verdict cell
-    is un-verified. CONSERVATIVE — only a CLEAR table WITH a verdict column AND a verdict-less row
-    trips it; no ledger → no flag; per-(worker,doc) cooldown; all parsing exception-guarded."""
+    `## Candidates` ledger, parse it, and FLAG if either:
+      (a) any row's verdict cell is un-verified — message NAMES un-run nodes BY ID ('direction 2.2
+          proposed, no run'); OR
+      (b) the numbered tree has a GAP — a required ancestor/sibling id is missing (`2.3` present
+          but `2.1`/`2.2`/parent `2` absent = a dropped direction).
+    The ledger's `id` column = the dotted-decimal node number; the ledger is the COMPLETE
+    accounting of all rounds (every node → its own run id).
+
+    CONSERVATIVE — only a CLEAR table WITH a verdict column AND a verdict-less row OR a tree gap
+    trips it; tree-gap checking only fires when the ledger HAS an `id` column with well-formed ids
+    (no id column / malformed → only verdict-completeness, back-compatible); no ledger → no flag;
+    per-(worker,doc) cooldown; all parsing exception-guarded."""
     COOLDOWN_MIN = 120
     try:
         reg = json.loads(WORKERS_FILE.read_text())
@@ -1119,9 +1191,12 @@ def check_dr_candidates_verified():
             except Exception:
                 pass
             continue
-        verified, unverified = ledger
-        if not unverified:
-            continue  # every candidate has a verdict → RULE A satisfied
+        unverified = ledger["unverified"]
+        unverified_ids = ledger["unverified_ids"]
+        verified = ledger["verified"]
+        gaps = ledger["gaps"]
+        if not unverified and not gaps:
+            continue  # every node has a verdict AND the tree has no gaps → RULE A satisfied
         key = f"{name}|{doc_path}"
         last = stamps.get(key)
         if last:
@@ -1130,23 +1205,31 @@ def check_dr_candidates_verified():
                     continue
             except (ValueError, TypeError):
                 pass
-        flagged.append((name, doc_path, unverified, len(verified)))
+        flagged.append((name, doc_path, unverified, len(verified), gaps))
         stamps[key] = now.isoformat()
-        names = ", ".join(unverified[:6]) + (" …" if len(unverified) > 6 else "")
+        unrun = ", ".join(str(x) for x in unverified_ids[:6]) + (" …" if len(unverified_ids) > 6 else "")
+        gap_txt = ", ".join(gaps[:6]) + (" …" if len(gaps) > 6 else "")
+        parts = []
+        if unverified:
+            parts.append(f"un-run nodes (no run-id/verdict): {unrun}")
+        if gaps:
+            parts.append(f"tree GAP (missing ancestor/sibling directions, silently dropped): {gap_txt}")
         try:
             subprocess.run([str(TS), name,
-                f"[manager RULE A] you ran DR but candidates aren't all verified — in {doc_path} the "
-                f"## Candidates rows with no run-id/verdict: {names}. A DR round is NOT done until EVERY "
-                f"candidate has a run id + ALIVE/DEAD, or needs-paid-data:<feed>. Don't cherry-pick the top 1-2."],
+                f"[manager RULE A] you ran DR but the numbered tree isn't closed — in {doc_path} the "
+                f"## Candidates: " + "; ".join(parts) + ". Every numbered direction (every node at every "
+                f"level) needs its OWN run id + ALIVE/DEAD, or needs-paid-data:<feed>; if `2.3` exists then "
+                f"`2.1`/`2.2`/parent `2` must too. Don't cherry-pick the top 1-2."],
                 check=False, capture_output=True, timeout=10)
         except Exception:
             pass
     if flagged or no_ledger_flagged:
         _save_stamp_map(DR_CANDIDATES_SEEN_FILE, stamps)
     if flagged:
-        print(f"dr-candidates: {len(flagged)} research worker(s) ran DR but left candidates un-verified (RULE A) — repoked:")
-        for name, doc, unver, nv in flagged:
-            print(f"  [dr-candidates] {name}: {doc} — {len(unver)} un-verified ({', '.join(unver[:6])}), {nv} verified → repoked (no cherry-picking).")
+        print(f"dr-candidates: {len(flagged)} research worker(s) ran DR but left the numbered tree open (RULE A) — repoked:")
+        for name, doc, unver, nv, gaps in flagged:
+            gap_note = f", tree-gaps: {', '.join(gaps[:6])}" if gaps else ""
+            print(f"  [dr-candidates] {name}: {doc} — {len(unver)} un-run ({', '.join(unver[:6])}), {nv} verified{gap_note} → repoked (every numbered node needs a run, no gaps).")
     if no_ledger_flagged:
         print(f"dr-candidates: {len(no_ledger_flagged)} DR-conclusion doc(s) with NO `## Candidates` ledger (cherry-pick-by-omission) — repoked:")
         for name, doc in no_ledger_flagged:
