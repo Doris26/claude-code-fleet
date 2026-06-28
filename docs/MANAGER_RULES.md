@@ -307,6 +307,47 @@ anything you didn't stage. (A cc-recruit commit once swept another worker's stag
 fan-out/verify/cite workflow). Always issue `/deep-research <question>`. Same for any skill: use the
 `/` command, don't describe it in prose. DR ladder: CCDR(=/deep-research) → Gemini DR.
 
+### RULE A — completion bar (a DR round is NOT done until EVERY candidate has a verdict)
+
+**A deep-research round is NOT COMPLETE until EVERY ranked candidate has a verdict — a real
+verification-backend run id + ALIVE/DEAD, OR an explicit `needs-paid-data:<feed>` flag. No
+cherry-picking the "top 1-2".** The failure mode: a worker runs DR, gets N ranked candidates, verifies
+only the 1-2 it likes, commits a "DEAD" verdict, and silently drops the rest — the dropped candidates
+were never falsified, so the round's verdict is unearned. Every candidate must land in exactly one of:
+a real run id + ALIVE/DEAD, or `needs-paid-data:<feed>` (it genuinely can't be tested for free — name
+the feed). Nothing else counts (`pending` / `-` / empty = NOT done). The cc-monitor
+`check_dr_candidates_verified` pass parses the `## Candidates` ledger and flags any un-verified row.
+
+### RULE B — force genuine novelty (don't converge on the obvious literature idea)
+
+After reading a lot of DR, exploration tends to collapse onto the literature-standard, mostly-DEAD
+ideas. The DR prompt MUST demand NON-obvious / contrarian / cross-domain mechanisms, treat the
+textbook-standard answers as presumed-DEAD (name them in the DEAD-list), RANK candidates by
+orthogonality/novelty (NOT plausibility — the most plausible is usually the most crowded/priced-in),
+and require, per candidate, a self-novelty-critique: *"is this just the obvious literature idea? what
+assumption is everyone making here that might be wrong, and does this candidate exploit that or repeat
+it?"* A candidate that can't answer this is a retread → drop it. Operationalized as a reusable
+diverse-lens Workflow (`bin/dr_exploration_workflow.js`): parallel distinct-lens idea agents →
+dedup → novelty-critic (drop literature-standard/known-DEAD, rank by orthogonality) → per-candidate
+verify (RULE A) → synthesis emitting the `## Candidates` ledger. Invoke it for a thorough round
+instead of free-forming one DR prompt and cherry-picking its output.
+
+### The `## Candidates` ledger format (MANDATORY — the round's auditable output)
+
+Every DR-research doc MUST contain a section headed exactly `## Candidates` with a markdown table whose
+columns include the candidate name/mechanism and a `verdict` cell. Each row's `verdict` is one of: a
+run id (e.g. a 32-hex backtest id), `ALIVE` / `DEAD`, or `needs-paid-data:<feed>`. An EMPTY / `pending`
+/ `-` verdict = an un-verified candidate → the round is NOT complete (RULE A). Example:
+
+```
+## Candidates
+| # | mechanism (domain)                    | corr | novelty-critique (1-line)        | verdict                     |
+|---|---------------------------------------|------|----------------------------------|-----------------------------|
+| 1 | dispersion-of-beliefs reversal (behav)| 0.18 | not OFI; bets crowd is overconf.  | 32a1...f9 DEAD              |
+| 2 | cross-asset credit->equity lead       | 0.31 | contrarian: lead not lag           | 9c0b...4e ALIVE            |
+| 3 | dealer-gamma flow-structural overlay  | 0.22 | needs dealer positioning feed     | needs-paid-data:dealer-gex |
+```
+
 ## Spend-freeze: zero-token resume (operator lesson)
 
 The 5h limit shows MIS-LABELED as "You've hit your monthly spend limit / usage-credits" (not the
