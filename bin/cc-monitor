@@ -1568,9 +1568,25 @@ def check_goal_stale():
     only the manager knows).
 
     Guards: skip manager/multi assignees; GRACE so a just-created task isn't flagged
-    before the manager has had a cycle to set /goal; throttle per (worker,task)."""
+    before the manager has had a cycle to set /goal; throttle per (worker,task).
+
+    Recruit-ordering grace (observed false-positive on fresh hires): cc-recruit sets the
+    /goal anchor FIRST (registry step stamps goal_updated), then creates the cc-task
+    ~seconds-to-a-minute LATER. So on EVERY freshly-recruited worker
+    `goal_updated < task_ts` by a tiny margin — the raw `last_goal >= task_ts` test reads
+    "task is newer than the anchor -> goal stale" and flags an actively-working hire on
+    its CORRECT goal. That is a recruit-ordering artifact, not a stale goal: a genuine
+    "only --nudged, never re-/goal" drift has the anchor predating the task by a LARGE
+    margin AND an idle pane. Two guards below close it WITHOUT becoming a bypass:
+      (1) RECRUIT_SKEW: if the anchor predates the task by < RECRUIT_SKEW_MIN, treat it
+          as the recruit handoff, not a stale goal -- skip.
+      (2) ACTIVITY gate: a worker whose pane is mid-work (MIDWORK_REGEX) is actively
+          working -- NOT goal-stale -- skip (mirrors check_dropped_tasks' idle-guard).
+    A truly abandoned goal (anchor older than the task by >= RECRUIT_SKEW_MIN, OR never
+    set, AND an idle/unreadable pane) STILL flags."""
     GRACE_MIN = 20
     COOLDOWN_MIN = 60
+    RECRUIT_SKEW_MIN = 10  # anchor set <10min before task = recruit handoff, not stale
     tasks = materialize()
     now = datetime.now()
     # newest OPEN task per assignee
@@ -1610,6 +1626,23 @@ def check_goal_stale():
         # FAIL: /goal never set, OR last /goal predates this open task (only nudged since)
         if last_goal is not None and last_goal >= task_ts:
             continue  # /goal anchor is fresher than the task → properly dispatched
+        # (1) RECRUIT-ORDERING GRACE: cc-recruit stamps goal_updated then creates the
+        # task ~seconds later, so on a fresh hire the anchor predates the task by a tiny
+        # margin. That is the recruit handoff, NOT a stale goal -- don't flag. A genuine
+        # never-re-/goal drift has the anchor predating the task by a LARGE margin (the
+        # manager only --nudged for a long time), which still falls through.
+        if last_goal is not None and (task_ts - last_goal).total_seconds() / 60 < RECRUIT_SKEW_MIN:
+            continue
+        # (2) ACTIVITY GATE: a worker whose pane is mid-work is actively working its goal
+        # -- by definition not goal-stale. Skip (mirrors check_dropped_tasks' idle-guard).
+        # An unreadable pane is treated as inconclusive -> fall through to flag (don't
+        # silently swallow a genuine stale goal just because tmux capture failed).
+        try:
+            pane = subprocess.run([str(TP), worker, "12"], capture_output=True, text=True, timeout=12).stdout
+        except Exception:
+            pane = ""
+        if pane and MIDWORK_REGEX.search(pane):
+            continue  # actively working -> not goal-stale
         # throttle on (worker, task)
         key = f"{worker}:{info['id']}"
         last = stamps.get(key)
