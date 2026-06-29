@@ -1,7 +1,7 @@
 #!/bin/bash
 # cc-recruit — one-command worker recruit that ALWAYS sets /goal.
-# Per operator lesson "onboarding can also carry a goal" — codify "recruit always
-# anchors mandate via /goal" so the manager can't forget it.
+# Per user 2026-05-28 "onboard 也可以发 goal 改下机制" — codify "recruit always
+# anchors mandate via /goal" so the manager can't forget it (Skill 119 step 4b).
 #
 # Flow: spawn tmux+claude → capture remote URL FIRST (halt if missing) → /effort
 #       ultracode → set /goal FIRST (verified, the persistent first directive) →
@@ -11,24 +11,24 @@
 #   cc-recruit <name> <onboarding_file> "<goal mandate>" "<role>" "<task desc>" "<deliverable>"
 #
 # Example:
-#   cc-recruit demo_worker /tmp/onboard_demo.txt \
-#       "build three candidate baskets, research + score, explore-not-ship" \
-#       "candidate basket research" \
-#       "Build the candidate baskets + dimensional scoring" \
-#       "research/baskets/"
+#   cc-recruit theme_dag /tmp/onboard_theme_dag.txt \
+#       "建 3 主题 DAG 篮子 robotics/space/datacenter, DR + 维度打分, 探索不ship" \
+#       "thematic DAG basket DR" \
+#       "Build robotics/space/datacenter DAG baskets + dimensional scoring" \
+#       "apexnova/lean/research/theme_dags/"
 set -e
 
 [ $# -ge 3 ] || { echo "Usage: cc-recruit <name> <onboarding_file> '<goal>' ['<role>'] ['<task>'] ['<deliverable>'] ['<agent_type|raw>']" >&2; exit 2; }
 
 NAME="$1"; ONBOARD_FILE="$2"; GOAL="$3"
 ROLE="${4:-worker}"; TASKDESC="${5:-$GOAL}"; DELIV="${6:-}"
-# $7 agent-type (operator lesson "decide base type from the task; raw if none fits"): the MANAGER picks
+# $7 agent-type (user 2026-06-15 "decide base type from the task; raw if none fits"): the MANAGER picks
 # the persona that fits the task and passes it; empty => role-based default; "raw"/"none" => plain claude.
 AGENT_TYPE="${7:-}"
 
 LB="$HOME/.local/bin"
 
-# Name INFERENCE (operator lesson "infer the name from my instructions / no need to ask me"):
+# Name INFERENCE (user 2026-06-14 "infer the name from my instructions / no need ask me"):
 # the session name no longer has to be supplied or user-confirmed. If NAME is a placeholder
 # (auto / infer / - / "" / name), derive a short slug from the GOAL/instruction text — first
 # salient lowercase token, stopwords stripped, <=14 chars, sanitized [a-z0-9_]. The caller
@@ -58,11 +58,11 @@ fi
 
 [ -f "$ONBOARD_FILE" ] || { echo "onboarding file not found: $ONBOARD_FILE" >&2; exit 1; }
 
-# Account guard ("Standard recruit flow"): ~/.claude.json's account can
-# silently switch on a shared machine — it once flipped to a colleague's account mid-session and 5
-# workers spawned under THEIR account+quota, unreachable by you. Verify BEFORE spawn; abort if not the
+# Account guard (meta-grill #8 / MANAGER_RULES "Standard recruit flow"): ~/.claude.json's account can
+# silently switch on a shared machine — it flipped to other-user@example.com mid-session and 5 workers
+# spawned under HIS account+quota, unreachable by the user. Verify BEFORE spawn; abort if not the
 # intended account. Override with CC_EXPECT_ACCT env if the intended account ever changes.
-EXPECT_ACCT="${CC_EXPECT_ACCT:-you@example.com}"
+EXPECT_ACCT="${CC_EXPECT_ACCT:-user@example.com}"
 CUR_ACCT=$(python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.claude.json')))['oauthAccount']['emailAddress'])" 2>/dev/null)
 if [ "$CUR_ACCT" != "$EXPECT_ACCT" ]; then
     echo "✋ ABORT recruit '$NAME': CLI account is '${CUR_ACCT:-unknown}', not '$EXPECT_ACCT'." >&2
@@ -72,10 +72,10 @@ if [ "$CUR_ACCT" != "$EXPECT_ACCT" ]; then
 fi
 echo "✓ account verified: $CUR_ACCT" >&2
 
-# Single-manager guard (operator lesson "only one manager at a time"): two managers =
-# double-firing supervision crons (duplicate reviews, conflicting auto-fixes, 2x API load).
-# ABORT if an active manager is already in the registry.
-# Override with CC_FORCE_MANAGER=1 to recover a dead session.
+# Single-manager guard (user 2026-06-21 "需要保证只有一个manager"): only ONE manager
+# session may run at a time — two managers = double-firing supervision crons (duplicate
+# cc-review, conflicting auto-fixes, 2x API load). ABORT if an active manager is already
+# in the registry. Use CC_FORCE_MANAGER=1 to override (e.g. recovering a dead session).
 if [ "$ROLE" = "manager" ] && [ "${CC_FORCE_MANAGER:-0}" != "1" ]; then
     _EXISTING_MGR=$(python3 - <<'PY'
 import json, os
@@ -97,7 +97,7 @@ PY
 fi
 
 # Robust remote-control URL capture. Run FIRST — while the session is idle and
-# nothing else is redrawing the pane. Operator hard rule: "we need the remote
+# nothing else is redrawing the pane. User hard rule 2026-06-08: "we need remote
 # url first". Capturing BEFORE /effort + onboarding is what keeps the URL line
 # on-screen long enough to grep; once onboarding pastes, it scrolls out forever.
 _capture_url() {
@@ -119,32 +119,27 @@ _capture_url() {
 
 echo "1. spawning tmux session '$NAME'..."
 # Wrap claude in a shell (`; exec $SHELL`) so the SESSION SURVIVES claude exiting.
-# Root cause of "pane GONE" deaths: with `new-session "claude"` the session's
+# Root cause of "pane GONE" deaths (2026-06-13): with `new-session "claude"` the session's
 # sole process is claude — when /loop ends / goal completes / claude exits, tmux destroys the
 # whole session (remain-on-exit is off by default) and it can never be re-nudged. Falling back
 # to a shell keeps the pane alive so cc-keepalive can restart claude in-place / state is inspectable.
-# role=manager: launch under the
+# role=manager (user 2026-06-15 "do you need manager as one kind of agent? a)"): launch under the
 # cc-manager AGENT so the Tier-1 non-negotiables live in its SYSTEM PROMPT (persist in context, survive
 # compaction — not "read once at onboarding then drift", which is how the manager actually drifted).
-# Source is git-tracked at personas/cc-manager.agent.md; .claude/ is gitignored, so copy the def
+# Source is git-tracked at bin/cc-manager/cc-manager.agent.md; .claude/ is gitignored, so copy the def
 # into the user-level agents dir (found regardless of session CWD) at spawn — the tracked file stays truth.
 CLAUDE_CMD="claude"
-REPO_DIR="${CC_REPO:-$HOME/your-repo}"
-# claude-code-fleet install dir (parent of this bin/) — where personas/, docs/, plugins/ live.
-# Follow symlinks so it resolves correctly under `ln -s` / `npm i -g` (CC_HOME env wins if set).
-_self="$0"
-while [ -L "$_self" ]; do _ln="$(readlink "$_self")"; case "$_ln" in /*) _self="$_ln" ;; *) _self="$(dirname "$_self")/$_ln" ;; esac; done
-CC_HOME="${CC_HOME:-$(cd "$(dirname "$_self")/.." && pwd)}"
+REPO_DIR="/workspace/apexnova"
 # Every recruited agent boots under a PERSONA whose SYSTEM PROMPT carries the Tier-1 non-negotiables
-# (persist in context, not "read once & drift"). AGENT-TYPE SELECTION: the manager
+# (persist in context, not "read once & drift"). AGENT-TYPE SELECTION (user 2026-06-15): the manager
 # picks the type that fits the TASK and passes it ($7); if it passes nothing we fall back to a role-based
 # default (manager->cc-manager, else->researcher); if no existing type fits the task the manager passes
-# "raw" => plain claude with no persona. Source defs are git-tracked in personas/<type>.agent.md;
+# "raw" => plain claude with no persona. Source defs are git-tracked in bin/cc-manager/<type>.agent.md;
 # .claude/ is gitignored, so copy into the user-level agents dir at spawn.
 if [ -z "$AGENT_TYPE" ]; then
     if [ "$ROLE" = "manager" ]; then AGENT_TYPE="cc-manager"; else AGENT_TYPE="researcher"; fi
 fi
-# SANITIZE $7: AGENT_TYPE is interpolated into a file path AND into the tmux
+# SANITIZE $7 (grill 2026-06-15): AGENT_TYPE is interpolated into a file path AND into the tmux
 # command-STRING (`claude --agent $X; exec ...`, shell-interpreted). A `../` traversed outside the
 # agents dir (cp dest collapsed to ~/.claude/<x>.md) and a `;`/$()/backtick is a latent shell-injection
 # sink. $7 comes from the manager LLM (trusted-ish), so a garbled arg is the realistic threat. Reject
@@ -155,19 +150,19 @@ case "$AGENT_TYPE" in
 esac
 if [ "$AGENT_TYPE" = "raw" ] || [ "$AGENT_TYPE" = "none" ]; then
     echo "   agent-type=raw -> plain claude (no persona; no existing type fit this task)"
-elif [ -f "$CC_HOME/personas/${AGENT_TYPE}.agent.md" ]; then
+elif [ -f "$REPO_DIR/bin/cc-manager/${AGENT_TYPE}.agent.md" ]; then
     # --agent resolves by the def's `name:` FRONTMATTER field, not the filename. Use the frontmatter
     # name so a future def whose name: differs from its filename doesn't silently boot persona-less.
-    AGENT_NAME=$(awk -F': *' '/^name:/{print $2; exit}' "$CC_HOME/personas/${AGENT_TYPE}.agent.md" | tr -d '[:space:]')
+    AGENT_NAME=$(awk -F': *' '/^name:/{print $2; exit}' "$REPO_DIR/bin/cc-manager/${AGENT_TYPE}.agent.md" | tr -d '[:space:]')
     AGENT_NAME="${AGENT_NAME:-$AGENT_TYPE}"
-    if mkdir -p "$HOME/.claude/agents" && cp "$CC_HOME/personas/${AGENT_TYPE}.agent.md" "$HOME/.claude/agents/${AGENT_NAME}.md" 2>/dev/null; then
+    if mkdir -p "$HOME/.claude/agents" && cp "$REPO_DIR/bin/cc-manager/${AGENT_TYPE}.agent.md" "$HOME/.claude/agents/${AGENT_NAME}.md" 2>/dev/null; then
         CLAUDE_CMD="claude --agent ${AGENT_NAME}"
         echo "   agent-type='${AGENT_TYPE}' (name: ${AGENT_NAME}) -> launching under it (Tier-1 rules in system prompt)"
     else
         echo "   ⚠️  ${AGENT_TYPE} agent def copy failed — spawning plain claude" >&2
     fi
 else
-    echo "   ⚠️  agent-type '${AGENT_TYPE}' has no def in personas/${AGENT_TYPE}.agent.md — falling back to raw (plain claude)" >&2
+    echo "   ⚠️  agent-type '${AGENT_TYPE}' has no def in bin/cc-manager/${AGENT_TYPE}.agent.md — falling back to raw (plain claude)" >&2
 fi
 tmux new-session -d -s "$NAME" "$CLAUDE_CMD; exec ${SHELL:-/bin/zsh}"
 tmux set-option -t "$NAME" history-limit 50000 2>/dev/null || true
@@ -177,10 +172,10 @@ for _ in $(seq 1 25); do
     sleep 1
 done
 
-echo "2. capturing remote-control URL FIRST (before onboarding — operator rule)..."
+echo "2. capturing remote-control URL FIRST (before onboarding — user rule 2026-06-08)..."
 URL="$(_capture_url "$NAME")" || URL=""
 # Claude Code v2.1.170+: /remote-control connects but NO LONGER prints a URL into
-# the pane (empirically hit on a recruit — RC footer said
+# the pane (empirically hit on dag_paper recruit 2026-06-10 — RC footer said
 # "Remote Control active" yet zero claude.ai/code lines in 2000-line scrollback).
 # Fall back to the /status Session ID so the registry still identifies the session
 # in the claude.ai/code list, and DON'T halt — RC itself is working.
@@ -202,17 +197,17 @@ else
     echo "   ✗ remote-control URL NOT captured after 2 attempts (and RC not active)." >&2
     echo "     HALTING before onboarding so the URL isn't lost. Session '$NAME' is up + idle." >&2
     echo "     Recover:  ts $NAME '/remote-control' ; tp $NAME 30 | grep claude.ai/code" >&2
-    echo "     Then continue manually (remaining recruit steps), or kill + re-run cc-recruit." >&2
+    echo "     Then continue manually (Skill 119 steps 2.5→7), or kill + re-run cc-recruit." >&2
     exit 3
 fi
 
-# /effort ultracode — THIS SEND IS REQUIRED, do not remove. Verified empirically:
-# ultracode is NOT persistable via settings.json (`effortLevel` accepts
+# /effort ultracode — THIS SEND IS REQUIRED, do not remove. Verified empirically
+# 2026-06-08: ultracode is NOT persistable via settings.json (`effortLevel` accepts
 # only low/medium/high/xhigh/max — "ultracode" silently falls back to "high"; the
 # `env.CLAUDE_CODE_EFFORT_LEVEL` value is ignored). Fresh sessions default to xhigh,
 # so this session-scoped `/effort ultracode` slash command is the ONLY enable path.
 echo "3. /effort ultracode..."
-# RETRY until the footer actually shows ultracode: a single send+grep
+# RETRY until the footer actually shows ultracode (fix 2026-06-12): a single send+grep
 # raced the TUI render and emitted a false "not visible" warning even though /effort had
 # landed. Send while the session is still idle (pre-goal) so it can't queue behind work;
 # verify up to 3 times. Footer shows "ultracode" once active.
@@ -229,9 +224,29 @@ else
     echo "   ⚠ ultracode still not visible after 3 tries — pane may be busy; re-run: ts $NAME '/effort ultracode'"
 fi
 
+# /model claude-opus-4-8 — THIS SEND IS REQUIRED (user-mandated 2026-06-24). Without it a
+# fresh session boots on the CLI default (claude-sonnet-4-5 — confirmed: dbento spawned as
+# Sonnet 4.5). The whole fleet runs Opus 4.8, so pin the model session-scoped right after
+# /effort, while the session is still idle (pre-goal) so the slash command can't queue behind
+# work. RETRY-until-verified like the /effort block; the footer/model line shows "Opus 4.8"
+# once active. Soft-warn (don't hard-fail) if still not visible — the session is otherwise up.
+echo "3b. /model claude-opus-4-8..."
+model_ok=0
+for attempt in 1 2 3; do
+    "$LB/ts" "$NAME" "/model claude-opus-4-8" >/dev/null
+    sleep 3
+    if tmux capture-pane -t "$NAME" -p -S -20 | grep -qi "Opus 4.8"; then model_ok=1; break; fi
+    sleep 2
+done
+if [ "$model_ok" = 1 ]; then
+    echo "   ✓ Opus 4.8 active (verified)"
+else
+    echo "   ⚠ Opus 4.8 still not visible after 3 tries — pane may be busy; re-run: ts $NAME '/model claude-opus-4-8'"
+fi
+
 # Set /goal FIRST — the recruit's first directive must be the PERSISTENT anchor,
 # not a scrolling onboarding message that the worker loses on scroll/compaction
-# (operator rule "the first message for the new recruit also needs to be a
+# (user rule 2026-06-08 "the first message for the new recruit also needs to be a
 # goal"). Sent here while the session is still idle, so the slash command anchors
 # cleanly before onboarding work begins. Verify a NEW "Goal set:" line appeared —
 # "goal active" alone is a false positive (matches any/worker-set goal).
@@ -259,38 +274,54 @@ sleep 2
 tmux send-keys -t "$NAME" Enter
 sleep 4
 
-# Mandatory skills-read (operator lesson "make sure every new worker reads all the skills"): injected by
-# cc-recruit so EVERY worker reads the skills/rules library regardless of what onboarding file was passed —
+# Mandatory skills-read (user 2026-06-13 "保证新员工都能读到所有 skill"): injected by cc-recruit so
+# EVERY worker reads the skill library + house rules regardless of what onboarding file was passed —
 # the manager can't forget it. Skills = the accumulated ALIVE/DEAD lessons; not reading them = repeating
 # dead angles. Sent as a goal-prefixed nudge so it survives as a standing instruction.
 if [ "$ROLE" = "manager" ]; then
-    # CONTEXT-FLOOD FIX: a fresh manager must NOT bulk-read the big docs into its own context. The
-    # cc-manager persona system prompt already carries the MANAGER_RULES hard-rule subset, and the
-    # skills/rules library is worker-oriented — telling the manager to read MANAGER_RULES + the whole
-    # skills index at startup is what floods a new manager to the context limit before it does any
-    # work (then /compact fails and it wedges). Read only the light overview; pull the rest on demand.
-    "$LB/ts" "$NAME" "Read first (keep context light): your cc-manager persona system prompt already carries the MANAGER_RULES hard-rule subset — do NOT read MANAGER_RULES.md / the full skills index / every skill into your own context (that is exactly what floods a new manager to the context limit, after which /compact fails and the session wedges). Read ONLY docs/MECHANISM_INDEX.md (~60-line overview). Pull MANAGER_RULES detail / cron-prompts / a specific skill on demand, or have a subagent read it and return just a summary — never bulk-load docs." >/dev/null 2>&1
+    # CONTEXT-FLOOD FIX (user 2026-06-21 "招manager似乎会把context flood"): a fresh manager must NOT
+    # bulk-read the big docs into its own context. The cc-manager persona system prompt ALREADY carries
+    # the MANAGER_RULES hard-rule subset, and the skills library is worker-oriented — telling the manager
+    # to read MANAGER_RULES (441L) + skills INDEX + every skill_NNN at startup is what floods it to the
+    # context limit before it does any work (then /compact fails, manager wedged). Read ONLY the light
+    # overview; pull anything else on demand or via a subagent.
+    "$LB/ts" "$NAME" "必读(开工前,保 context):你的 cc-manager persona system prompt 已含 MANAGER_RULES 硬规则子集 —— 不要把 MANAGER_RULES.md(441行)/ skills INDEX / 每个 skill 整篇读进你自己的 context(这正是新 manager 一上来就 context-flood、然后 /compact 失败卡死的根因)。只读 apexnova/bin/cc-manager/MECHANISM_INDEX.md(~60 行机制总览)。需要 MANAGER_RULES 细节 / cron-prompts / 某个 skill 时按需查,或派一个 subagent 读并只回传摘要,绝不一次性灌进 context。" >/dev/null 2>&1
 else
-    "$LB/ts" "$NAME" "必读(开工前):你团队的 skills/rules docs(全部索引,Tier-1 硬规则必读)+ <CC_HOME>/docs/MECHANISM_INDEX.md(机制总览)+ docs/MANAGER_RULES.md。这些是积累的 ALIVE/DEAD 教训和制度;不读 = 重复已死的角度。读完再开工。" >/dev/null 2>&1
+    "$LB/ts" "$NAME" "必读(开工前):lean/research/skills/coding/INDEX.md(全部 skill 索引,Tier-1 硬规则必读)+ apexnova/bin/cc-manager/MECHANISM_INDEX.md(机制总览)+ MANAGER_RULES.md。这些是积累的 ALIVE/DEAD 教训和制度;不读 = 重复已死的角度。读完再开工。" >/dev/null 2>&1
 fi
 sleep 2
 
-# CCDR prompt-quality (operator lesson "make sure workers have a high-quality ccdr prompt"): CCDR is
-# GIGO — a worker's exploration is only as good as its /deep-research prompt. Inject the prompt template
-# so workers don't free-form a weak prompt (the #1 failure is skipping the DEAD-list → re-exploring
-# refuted angles).
+# CCDR prompt-quality (user 2026-06-15 "保证 worker 有高质量的 ccdr prompt"): CCDR is GIGO — a worker's
+# exploration is only as good as its /deep-research prompt. Inject the skill_177 template so workers
+# don't free-form a weak prompt (the #1 failure is skipping the DEAD-list → re-exploring refuted angles).
 if [ "$ROLE" != "manager" ]; then
-    "$LB/ts" "$NAME" "跑 /deep-research(CCDR)前 MUST 按团队的 DR-prompt 模板组 prompt(别 free-form 弱 prompt):(1) goal+metric+acceptance(精确到要打的数);(2) DEAD-list——从本任务的 PROGRESS doc + memory 粘已死角度,明确叫它别再提(漏这条 = 最大浪费源);(3) novelty/orthogonality bar(机制上有因果、corr<0.4);(4) deliverable = ranked candidates,每个带 mechanism / expected-result / free-data 可得性(或需哪个付费 feed)/ 一个 \$0 falsification test;(5) cite-required;(6) free-first + 尊重 excluded scope。" >/dev/null 2>&1
+    "$LB/ts" "$NAME" "跑 /deep-research(CCDR)前 MUST 按 skill_177 模板组 prompt(别 free-form 弱 prompt):(1) goal+metric+acceptance(精确到要打的数);(2) DEAD-list——从本 strategy 的 PROGRESS.md + memory 粘已死角度,明确叫它别再提(漏这条 = 最大浪费源);(3) novelty/orthogonality bar(经济上有因果、corr<0.4);(4) deliverable = ranked candidates,每个带 mechanism / expected-SR / free-QC data 可得性(或需哪个付费 feed)/ 一个 \$0 falsification test;(5) cite-required;(6) free-QC-first + 尊重 excluded scope。" >/dev/null 2>&1
+    sleep 2
+    # Exploration-QUALITY gates (2026-06-28 meta-audit): the 4 recurring quality gaps — re-running
+    # dead/adjacent angles (not creative), dropped DR leads (un-run nodes), single-point DEADs (no
+    # dive-deep), and building code before grilling the hypothesis. The CCDR-prompt nudge above covers
+    # the dead-list; this one covers the build-discipline + completeness so a worker doesn't waste a
+    # run repeating something already-DEAD or kill a knob on one point.
+    "$LB/ts" "$NAME" "探索质量四条硬规(违反 = cc-review GRILL / 浪费 run):(1) GRILL-BEFORE-IMPLEMENT:动手写 probe 前先 grep 本 strategy 的 PERF_CARD.md/main.py/PROGRESS.md + memory 看这个角度是不是已经 DEAD(DR 文档会把死旋钮说成 'untested',以 strategy 卡为准);先写经济机制 + 反机制(为啥可能 priced-in/冗余/被成本吃掉),没机制假设的 BT = 钓鱼。(2) DIVE-DEEP:判 DEAD 前对参数化旋钮跑 ≥3-5 个 dose 点(单点会藏内部最优)+ ≥1 个 per-period(5y→10y→20y)或 per-regime 切片,报 vs-bar 的杀数。(3) RULE A 完备:DR 每个 numbered 节点都要自己的 32-hex QC bt-id + ALIVE/DEAD 或 needs-paid-data:<feed>,别 cherry-pick top1-2;`## Candidates` id-tree 不留 gap。(4) CREATIVITY:每轮提真新机制,别把已死/相邻角度换皮重跑。" >/dev/null 2>&1
+    sleep 2
+    # PLAN-FIRST (user 2026-06-29 plan-stage grill): commit a PLAN before exploring a new direction →
+    # post-commit hook routes it to `cc-review --plan` (DIRECTION grill BEFORE build+BT). Kill doomed
+    # directions before the expensive build+BT (token savings) + enforce grill-before-implement.
+    "$LB/ts" "$NAME" "PLAN-FIRST(硬规):探索一个新方向前,先 commit 一个 PLAN 文件(PLAN.md 或 commit 标题用 plan(...)):写清 alpha 假设 + 机制 + 反机制(counter-mechanism)+ DEAD-prescreen(grep 现有 DEAD 卡:PERF_CARD / id-tree ledger / memory)+ dose-response 设计(≥3-5 扫点)。等 plan-grill PASS 再 build+backtest。grill FAIL 就改方向/弃掉,别白烧 build+BT 的 token。(manager post-commit hook 自动把 PLAN commit 路由到 cc-review --plan 做方向 grill。)" >/dev/null 2>&1
+    sleep 2
+    # EXTERNALIZE + /clear (user 2026-06-29 token discipline): the single biggest token lever — keep big
+    # CCDR/BT outputs on DISK, only a one-line verdict+pointer in context, /clear after each round.
+    "$LB/ts" "$NAME" "EXTERNALIZE + /clear(token 纪律,最大杠杆):每轮 CCDR/BT 之后:完整结果落到 report 文件或 PERF_CARD / id-tree ledger;context 里只留一行 verdict + 文件指针;然后 /clear 把大输出甩出持久 context;需要细节时按需读那个文件。别在 context 里堆 CCDR 全文 / BT dump —— 它们住在磁盘,on-demand 读。worker context 别涨到 500k+。" >/dev/null 2>&1
     sleep 2
 fi
 
-# Manager handover — kill predecessor's crons (operator lesson "a new manager needs to kill the old
-# manager's cron"): a new manager TAKES OVER from a predecessor. The :17/:41/:13 supervision crons are
-# per-session IN-MEMORY — they die only when that Claude session exits and CANNOT be CronDelete'd from
-# another session. Two live managers => double-firing crons (duplicate audits, conflicting auto-fixes,
-# 2x API load). On takeover the NEW manager MUST ensure the predecessor's crons are dead BEFORE recreating its own.
+# Manager handover — kill predecessor's crons (user 2026-06-14 "new manager need to kill old manager's
+# cron"): a new manager TAKES OVER from a predecessor. The :17/:41/:13 supervision crons are per-session
+# IN-MEMORY — they die only when that Claude session exits and CANNOT be CronDelete'd from another session.
+# Two live managers => double-firing crons (duplicate audits, conflicting auto-fixes, 2x API load). On
+# takeover the NEW manager MUST ensure the predecessor's crons are dead BEFORE recreating its own.
 if [ "$ROLE" = "manager" ]; then
-    "$LB/ts" "$NAME" "You are taking over from a previous manager. (1) Make sure the old manager's in-memory supervision crons are dead: find it (cc-roster / tmux ls) -> tell it 'CronList -> CronDelete all crons, commit WIP, exit claude'; if it lingers, tmux kill-session (in-memory crons die with it). (2) FIRST PRIORITY: recreate your supervision crons (launchd is off, so these are the ONLY supervision — forget them and there is none). KEEP CONTEXT LIGHT: do NOT read cron-prompts.md into your own context -- spawn a subagent to read docs/cron-prompts.md 'How to recreate' and return just the CronCreate calls, then run them yourself; run each recurring work-cron's actual job via a subagent too (it returns one line, so the heavy output never lands in your context). Verify with CronList. Never run two managers' supervision crons at once." >/dev/null 2>&1
+    "$LB/ts" "$NAME" "你在接管旧 manager。(1) 确保旧 manager 的 in-memory supervision cron 已死:cc-roster / tmux ls 找到它 → ts 它『CronList→CronDelete 全部 cron,提交 WIP,退出 claude』;赖着不退就 tmux kill-session(in-memory cron 随之清)。(2) 然后【第一要务】重建你自己的全部 Claude cron(launchd 已关,这些是唯一监督;忘建 = 零监督)。⚠ 保 context:别把 cron-prompts.md 整篇读进你自己的 context —— 派一个 subagent 读 apexnova/bin/cc-manager/cron-prompts.md 的『How to recreate』块、只回传那几条 CronCreate 命令,你再逐条执行 CronCreate;每个 recurring work-cron(cc-watch / skill-capture / dream)的实际工作也都 SPAWN 一个 subagent 去跑、只回传一行(user『use subagent…不占 heavy context』)。建完 CronList 核对。绝不两个 manager 同跑 cron。" >/dev/null 2>&1
     sleep 2
 fi
 

@@ -12,7 +12,7 @@ Two passes:
 2. **Paid escalation**: scan each watched session's pane for `[PAID]`
    regex. If a NEW paid candidate appears (not yet in tasks.jsonl as
    paid-review), append a `cc-task add --category paid-review` entry.
-   The operator reviews any paid spend before it is committed to.
+   Per `feedback_paid_data_user_review` user reviews paid before commit.
 
 Usage:
   cc-monitor                # run both passes
@@ -21,7 +21,6 @@ Usage:
 """
 import argparse
 import json
-import os
 import re
 import subprocess
 import sys
@@ -42,11 +41,13 @@ PAID_REVIEW_SLA_SEEN_FILE = Path.home() / ".cc-manager" / "paid_review_sla_seen.
 LANDING_REOPEN_SEEN_FILE = Path.home() / ".cc-manager" / "landing_reopen_seen.json"
 SESSION_HEALTH_SEEN_FILE = Path.home() / ".cc-manager" / "session_health_seen.json"
 DELIV_NUDGE_SEEN_FILE = Path.home() / ".cc-manager" / "deliv_nudge_seen.json"
+CCDR_COMPLIANCE_SEEN_FILE = Path.home() / ".cc-manager" / "ccdr_compliance_seen.json"
 DR_CANDIDATES_SEEN_FILE = Path.home() / ".cc-manager" / "dr_candidates_seen.json"
+CONTEXT_BLOAT_SEEN_FILE = Path.home() / ".cc-manager" / "context_bloat_seen.json"
 WORKERS_FILE = Path.home() / ".cc-manager" / "workers.json"
-REPO_ROOT = Path(os.environ.get("CC_REPO") or str(Path.home() / "your-repo"))
+REPO_ROOT = Path("/workspace/apexnova")
 LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
-OPS_CRON_PREFIX = "com.claude-code-fleet."
+OPS_CRON_PREFIX = "com.apexnova."
 TS = Path.home() / ".local" / "bin" / "ts"
 TP = Path.home() / ".local" / "bin" / "tp"
 CC_TASK = Path.home() / ".local" / "bin" / "cc-task"
@@ -82,9 +83,9 @@ def session_alive(name: str) -> bool:
 ACTIVE_STATUSES = {"assigned", "in_progress", "blocked"}
 # Outer gate: explicit [PAID] tag OR an untagged prose proposal — a "$NN/mo|/yr"
 # subscription cost, or a named paid vendor/feed. Workers often discuss cost in
-# prose without self-tagging "[PAID]" (e.g. "a data feed ($79/mo)"); relying
-# on the tag alone silently misses escalations the operator must review.
-# Inner filters below (free-skip + cost-marker requirement) drop incidental cash like "$100k".
+# prose without self-tagging "[PAID]" (e.g. "Polygon options ($79/mo)"); relying
+# on the tag alone silently misses escalations (feedback_paid_data_user_review).
+# Inner filters below (free-skip + cost-marker requirement) drop BT cash like "$100k".
 PAID_REGEX = re.compile(
     r"(\[PAID\][^\n]{0,200}"
     r"|\$\d[\d,]*\s*/\s*(?:mo|month|yr|year)[^\n]{0,120}"
@@ -98,9 +99,9 @@ PANE_VERDICT_REGEX = re.compile(r"DEAD.?END|comprehensively negative|verdict.{0,
 # "found signal, keep iterating", not "task finished".
 TERMINAL_VERDICT_REGEX = re.compile(r"DEAD.?END|comprehensively negative|mandate (COMPLETE|delivered)|CLOSED|闭环了|交付完成|verdict.{0,20}(DEAD|DELIVERED)")
 EXCLUDED_SCOPE_REGEX = re.compile(r"(crypto|coinglass|perp(etual)?[ _-]?(swap|future)|defi|stablecoin|bitcoin|ethereum)", re.IGNORECASE)
-# Premature-exhaustion / data-wall claims. Per the optional research-escalation
-# ladder: a worker must exhaust the cheaper deep-research tiers before declaring
-# a "wall" or reaching for paid data. Flag these so the manager nudges UP the
+# Premature-exhaustion / data-wall claims. Per the DR escalation ladder (user
+# 2026-06-09): a worker must exhaust CCDR → Gemini DR → OpenAI DR before declaring
+# a "wall" or reaching for paid data. Flag these so the manager DR-nudges UP the
 # ladder instead of accepting the wall / approving paid data prematurely.
 EXHAUSTION_REGEX = re.compile(
     r"(data[ _-]?wall|数据墙"
@@ -117,7 +118,7 @@ SHIP_DRIFT_REGEX = re.compile(
     r"|ship[ _-]?verdict"                           # SHIP_VERDICT note
     r"|canonical[ _-]?ship[ _-]?ready"
     r"|gate[ _-]?sign[ _-]?-?off|gate[ _-]?\d[ _-]?sign"  # gate sign-off / gate 6 sign
-    r"|operator[ _-]?(approval|部署|deploy|promotion|note|推荐|签字|sign)"  # operator promotion-note etc.
+    r"|Damien[ _-]?(approval|部署|deploy|promotion|note|推荐|签字|sign)"  # Damien promotion-note etc.
     r"|promotion[ _-]?note"
     r"|promote[ _-]?to[ _-]?live"
     r"|productioni[sz]ation|产品化|prod[ _-]?lock"  # productionization / prodlock candidates
@@ -128,8 +129,8 @@ SHIP_DRIFT_REGEX = re.compile(
 # Completion-integrity — markers that a task self-marked `completed` still has WORK
 # REMAINING (manager manages 做完没, NOT 做对没). DELIBERATELY EXCLUDES concluded-
 # negative verdicts (DEAD / ALIVE / rejected / DEAD-END = valid COMPLETE exploration
-# outcomes per explore-not-ship) and expected terminal gates ("pending operator" /
-# "operator-gated" — out-of-scope deploy approval, NOT our unfinished work). Markers are
+# outcomes per explore-not-ship) and expected terminal gates ("pending Damien" /
+# "Damien-gated" — out-of-scope deploy approval, NOT our unfinished work). Markers are
 # deliberately NARROW — process-state language (re-audit owed, AUDIT/review-anchored
 # FAIL, scaffold-not-impl, unresolved blocker, denied-files-read, pending rework) — NOT
 # bare result-table tokens (❌ failed) or honest explore-not-ship caveats ("could not
@@ -143,12 +144,12 @@ INCOMPLETE_REGEX = re.compile(
     r"|to\s+fix\s+before\s+re-?audit"
     r"|unresolved\s+blocker|still\s+blocked\b|open\s+blocker"
     r"|pending\s+(?:re-?audit|review|implementation|impl|DSR|fix|rework|verification)"
-    # Chinese mirror: a fleet that works in Chinese can have a worker
-    # self-`cc-task done` whose ledger's newest section carries a CN work-remains marker
-    # that evades the English-only set entirely (INPROGRESS/SHIP_DRIFT/EXCLUDED_SCOPE are all
+    # Chinese mirror (grill 2026-06-08): the whole fleet works in Chinese, so a worker
+    # self-`cc-task done` whose card's newest section carries a CN work-remains marker
+    # evaded the English-only set entirely (INPROGRESS/SHIP_DRIFT/EXCLUDED_SCOPE are all
     # already bilingual — this was the lone monolingual reopen gate). NARROW + symmetric
     # to the EN process-state markers; deliberately EXCLUDES bare 未完成 (collides with
-    # explore caveats like '未能完成 beat baseline' = a DEAD verdict, which is done-right).
+    # explore caveats like '未能完成 beat baseline' = a DEAD verdict, which is 做对-done).
     r"|待\s*(?:返工|修复|重新审计|复审)"
     r"|需(?:要)?\s*重新审计|重新审计\s*(?:未完成|未通过|待办|owed|pending|required)"
     r"|(?:审计|复审)\s*(?:未通过|未过|失败)"
@@ -158,13 +159,21 @@ INCOMPLETE_REGEX = re.compile(
 
 # AUTO-FLIP GUARD — live-work markers in the DELIVERABLE FILE that mean the task
 # is NOT finished even if the worker pane happens to carry a terminal verdict from
-# an EARLIER sub-section. A task was once false-flipped
-# because its metric ledger's newest section said "IN PROGRESS — still
+# an EARLIER sub-section. Fix 2026-06-03: T-21030f14 (boom-gate) was false-flipped
+# because its PERF_CARD's newest section said "IN PROGRESS — tier matrix still
 # computing" while the pane still showed a stale "verdict DEAD" from the v1 section.
 # Pane-terminal + deliverable-exists was NOT enough; the deliverable's own content
 # must also be free of in-flight language before we auto-close. If this matches,
 # downgrade auto-flip → manager-verify (never silently close). DELIBERATELY broad:
 # auto-flip is the only irreversible-ish action, so bias to NOT flipping on doubt.
+# NOTE (grill 2026-06-21): bare `TODO\b|TBD\b` removed. They fired on 45 real
+# PERF_CARDs in the repo (e.g. "TBD per Damien approval", "TODO: compute if needed",
+# "TBD until audit completes") — ALL informational annotations on CLOSED cards, not
+# genuine in-flight markers. Every false hit landed tasks in live_work_guard
+# permanently, requiring manual manager flip every cycle. The real in-flight signals
+# (IN PROGRESS, still running, BTs running, 进行中, awaiting BT, etc.) remain and
+# are sufficient to catch the T-21030f14 class of false-close. `to-be-determined`
+# retained as it is always an explicit in-flight placeholder phrase (unlike bare TBD).
 INPROGRESS_REGEX = re.compile(
     r"(IN[ _-]?PROGRESS"
     r"|still\s+(?:computing|running|in[ _-]progress|pending|iterating)"
@@ -174,7 +183,7 @@ INPROGRESS_REGEX = re.compile(
     r"|awaiting\s+(?:BT|backtest|result|verdict)"
     r"|running\s+for\s+the\b|poll(?:ing)?\s+(?:to|until)\s+terminal"
     r"|进行中|运行中|还在(?:算|跑|测|回测)|待回测|待跑|尚未完成|未完成|跑完再"
-    r"|TODO\b|TBD\b|to[ _-]be[ _-]determined)",
+    r"|to[ _-]be[ _-]determined)",
     re.IGNORECASE)
 
 
@@ -191,7 +200,7 @@ def materialize() -> dict:
             e = json.loads(line)
         except json.JSONDecodeError:
             continue
-        # Shape guard: one wrong-shape line ('"x"', a list, an
+        # Shape guard (grill 2026-06-10): one wrong-shape line ('"x"', a list, an
         # object without id) crashed THIS pass and every sibling pass that calls
         # materialize() — zero flips/nudges/reopens until hand-repaired. Skip it.
         if not isinstance(e, dict) or "id" not in e:
@@ -209,7 +218,7 @@ def materialize() -> dict:
             except (ValueError, TypeError):
                 pass
         ev = e.get("event")
-        # Ordered event trail: completion-integrity needs to
+        # Ordered event trail (grill 2026-06-12): completion-integrity needs to
         # distinguish the sanctioned override channel (block → unblock → done)
         # from a worker re-`done`-ing straight over our block (evasion lane).
         if ev:
@@ -235,19 +244,19 @@ def materialize() -> dict:
 def _deliv_path(deliv: str):
     """Extract the filesystem path token from a deliverable spec that may carry a
     trailing human annotation, e.g.
-      'docs/.../metric-ledger.md (col A + recompute)' → 'docs/.../metric-ledger.md'.
+      'lean/.../PERF_CARD.md (40/20 row + DSR recompute)' → 'lean/.../PERF_CARD.md'.
     ~10% of deliverables carry such a '(...)' suffix; the annotation often contains a
-    '/' ('a/b'), so naive Path() parsing mis-splits and Path.parent points at a
+    '/' ('40/20'), so naive Path() parsing mis-splits and Path.parent points at a
     nonexistent dir — which silently broke proof-detection and false-reopened a
-    legitimately-done landing task. Strips a redundant leading repo-name prefix.
-    Returns the cleaned path str, or None for a pure-prose deliverable
+    legitimately-BT-done landing task (crypto_4020, 2026-06-04). Strips a leading
+    'apexnova/'. Returns the cleaned path str, or None for a pure-prose deliverable
     (no '/' and no file extension) so callers can treat it as 'no resolvable path'."""
     if not deliv:
         return None
     s = deliv.strip()
     head = re.split(r"\s+\(", s, maxsplit=1)[0].strip() or s
-    if head.startswith("your-repo/"):
-        head = head[len("your-repo/"):]
+    if head.startswith("apexnova/"):
+        head = head[len("apexnova/"):]
     if "/" not in head and not re.search(r"\.\w{1,5}$", head):
         return None  # pure-prose deliverable, no path to resolve
     return head
@@ -256,10 +265,10 @@ def _deliv_path(deliv: str):
 def resolve_deliverable(deliv: str):
     """Resolve a deliverable spec to (exists, newest_mtime). Handles three forms:
       - exact file path        → that file
-      - glob ('*' present)     → any matching file (modules/*_v2.md)
-      - directory              → exists + non-empty (your-repo/bin/refresh/)
+      - glob ('*' present)     → any matching file (theme_dags/*_v2_chatgpt.md)
+      - directory              → exists + non-empty (apexnova/bin/alt_data/refresh/)
     Returns (exists: bool, mtime: datetime|None). mtime = newest matching file.
-    Earlier code required path.is_file(), so glob/dir
+    Bug fixed 2026-05-28: prior code required path.is_file(), so glob/dir
     deliverables (most of them) were silently skipped → tasks never flipped."""
     spec = _deliv_path(deliv)
     if spec is None:
@@ -281,7 +290,7 @@ def resolve_deliverable(deliv: str):
         matches = [base]
     if not matches:
         return (False, None)
-    # TOCTOU guard: a file deleted between glob/rglob and stat()
+    # TOCTOU guard (grill 2026-06-10): a file deleted between glob/rglob and stat()
     # (worker mid-checkout) raised FileNotFoundError and aborted the whole pass.
     mts = []
     for m in matches:
@@ -299,17 +308,17 @@ def _classify_pane_verdict(pane: str):
     must both pass before a verdict counts:
       1. ECHO guard — the verdict sits in MY OWN nudge/STOP text echoed back
          (STOP / 不要 / manager / per feedback), not the worker's own conclusion.
-      2. NEGATION guard — the verdict is NEGATED in the ~25 chars
+      2. NEGATION guard (grill 2026-06-08) — the verdict is NEGATED in the ~25 chars
          immediately to its LEFT ('isn't comprehensively negative', '还没 CLOSED',
          'not a dead-end'). A negated verdict is the worker saying it is NOT done, so it
          must NOT trigger AUTO-FLIP (the only irreversible-ish action — bias to not
          flipping on doubt). LEFT-only window is deliberate: a genuine dead-end conclusion
-         ('DEAD-END confirmed, 没有更多可做') carries negation words to the RIGHT of the
+         ('DEAD-END confirmed, 没有更多 alpha') carries negation words to the RIGHT of the
          verdict — guarding the whole window would false-negative real verdicts.
     PANE_VERDICT/TERMINAL regexes stay case-sensitive (uppercase DEAD-END/CLOSED only) —
     that conservatism is intentional (lowercase = a softer mention, no auto-close).
 
-    CRITICAL fix: both guards used to run ONLY on the FIRST
+    Grill 2026-06-10 (CRITICAL fix): both guards used to run ONLY on the FIRST
     PANE_VERDICT match, then `terminal` came from an UNGUARDED whole-pane search —
     so a clean 'verdict: ALIVE, keep iterating' + the manager's own echoed GOAL
     text ('write a DEAD-END card', '不要标 CLOSED') returned terminal=True and
@@ -325,7 +334,7 @@ def _classify_pane_verdict(pane: str):
 
 def _guarded_verdict_match(regex, pane: str):
     """First match of `regex` in pane that survives BOTH suppressor guards (echo +
-    left-negation), else None. Echo tokens: bare '别' matched
+    left-negation), else None. Echo tokens (grill 2026-06-10): bare '别' matched
     特别/分别/级别 and bare 'manager' lacked word-bounds — both suppressed GENUINE
     worker verdicts in a Chinese-language fleet; now intent-anchored."""
     for m in regex.finditer(pane):
@@ -396,12 +405,12 @@ def check_deliverables():
         # can re-add). Logged loudly so manager can audit/reverse.
         # NEVER auto-flip a `blocked` task — it was deliberately blocked (a real
         # blocker, or a completion-integrity reopen); flipping it to done on stale
-        # pane text would silently undo that block (a real prior incident).
+        # pane text would silently undo that block (the 2026-06-01 T-547f841f fight).
         if terminal and t["status"] != "blocked":
-            # FRESHNESS gate (mirrors check_dropped_tasks): a
+            # FRESHNESS gate (grill 2026-06-10, mirrors check_dropped_tasks): a
             # deliverable whose newest mtime PRE-DATES the task's creation is a
-            # pre-existing artifact (shared-ledger pattern — task B points at the
-            # ledger task A already wrote). The pane's terminal verdict belongs to the
+            # pre-existing artifact (shared-PERF_CARD pattern — task B points at the
+            # card task A already wrote). The pane's terminal verdict belongs to the
             # PREVIOUS task; flipping would close B before any work started.
             created = t.get("created_at")
             if created is not None and mtime is not None and mtime < created:
@@ -410,8 +419,8 @@ def check_deliverables():
             # GUARD: even with a terminal pane verdict, do NOT auto-close if the
             # deliverable file itself still carries in-flight markers (the pane
             # verdict may belong to an earlier sub-section). Downgrade to a
-            # manager-verify flag instead of silently flipping.
-            # FAIL-CLOSED: dir/glob/unreadable deliverables return
+            # manager-verify flag instead of silently flipping (T-21030f14 fix).
+            # FAIL-CLOSED (grill 2026-06-10): dir/glob/unreadable deliverables return
             # "" → content can't be attributed → manager-verify too, never silent flip
             # (the guard used to fail-OPEN and vanish for exactly those specs).
             try:
@@ -429,7 +438,7 @@ def check_deliverables():
                 # Only report AUTO-FLIPPED if cc-task done actually SUCCEEDED. check=False
                 # means a non-zero exit does NOT raise — appending unconditionally would
                 # report a FAILED flip as success (silent false-close; re-reported every
-                # run if the failure is permanent).
+                # run if the failure is permanent). Grill 2026-06-09 fix.
                 if r.returncode == 0:
                     auto_flipped.append((t["id"], assignee, deliv))
                 else:
@@ -446,13 +455,13 @@ def check_deliverables():
             continue
         # Not terminal → nudge (recent) or flag (stale / non-terminal verdict).
         # Blocked tasks are the MANAGER's to resolve — never nudge the worker to
-        # "run cc-task done" (that's what re-completed a previously-blocked task).
+        # "run cc-task done" (that's what re-completed the blocked T-547f841f).
         if t["status"] == "blocked":
             continue
         if any_verdict:
             pane_verdict.append((t["id"], assignee))
         if age < timedelta(minutes=90):
-            # Anti-spam: this branch used to fire EVERY cycle for
+            # Anti-spam (grill 2026-06-10): this branch used to fire EVERY cycle for
             # a worker iterating on its card (16 identical nudges over a 4h sweep) —
             # per-task 60min cooldown + mid-work guard + only count rc==0 sends.
             last = nudge_stamps.get(t["id"])
@@ -520,7 +529,7 @@ def read_deliverable_text(deliv: str, single_file_only: bool = False) -> str:
     deliverable with a trailing '(...)' annotation otherwise reports exists=True via
     resolve_deliverable but read_deliverable_text returned '' (raw path un-cleaned) →
     completion-integrity's `if not text: continue` SKIPPED it, and the auto-flip guard
-    fail-opened. A deliverable like 'ledger.md (re-audit pending)' evaded
+    fail-opened. Grill 2026-06-04 reproduced: 'PERF_CARD.md (re-audit pending)' evaded
     the work-remains hard-block. Single source of path truth closes that inconsistency."""
     spec = _deliv_path(deliv)
     if spec is None:
@@ -541,9 +550,9 @@ def read_deliverable_text(deliv: str, single_file_only: bool = False) -> str:
         matches = [base]
     # Per-file read cap. Single-file scope (completion-integrity + auto-flip guard)
     # reads ONE concrete card → cap high (1MB) so a work-remains / in-progress marker
-    # in the NEWEST section of a large append-only ledger (the metric ledger or an
-    # audit log, 95KB–401KB) is NOT truncated away. A
-    # marker at byte-offset 76336 was once invisible under the old 40000 cap → both checks
+    # in the NEWEST section of a large append-only card (PERF_CARD/TRADE_AUDIT run
+    # 95KB–401KB) is NOT truncated away. Grill 2026-06-03 reproduced the hole: a
+    # marker at byte-offset 76336 was invisible under the old 40000 cap → both checks
     # false-negatived. Multi-file dir/glob path keeps 40000/file (×20) to bound cost.
     per_file = 1_000_000 if single_file_only else 40000
     out = []
@@ -574,12 +583,12 @@ def check_completed_integrity():
     a WORK-REMAINS marker (re-audit owed, AUDIT FAIL/rework, scaffold/not-implemented,
     buried unverified blocker, issues-to-fix). Such a task is NOT done → auto-reopen to
     `blocked` (re-arms its cron gate) + loud alert. The manager's job is 做完没 not 做对没,
-    so concluded-negative verdicts (DEAD/ALIVE) and out-of-scope deploy gates (operator)
+    so concluded-negative verdicts (DEAD/ALIVE) and out-of-scope deploy gates (Damien)
     are NOT matched (see INCOMPLETE_REGEX). Seen-set exemption is for the SANCTIONED
     override channel only (block → cc-task unblock → done, as the reopen alert
     instructs): a bare block → done with no intervening unblock is a worker
     re-completing without fixing — the exact evasion this pass exists to close
-    — and stays under re-check every cycle."""
+    (grill 2026-06-12) — and stays under re-check every cycle."""
     seen = load_json_seen(COMPLETION_SEEN_FILE)
     tasks = materialize()
     reopened = []
@@ -587,6 +596,7 @@ def check_completed_integrity():
     for t in tasks.values():
         if t.get("status") != "completed":
             continue
+        swap_evasion = False
         if t["id"] in seen:
             # Honor the one-shot ONLY if the task went through unblock after our
             # last block (manager's deliberate override). block → done directly =
@@ -596,22 +606,46 @@ def check_completed_integrity():
             li = max((i for i, ev in enumerate(evs) if ev == "block"), default=-1)
             if li < 0 or "unblock" in evs[li + 1:]:
                 continue
+            # DELIVERABLE-SWAP evasion (grill 2026-06-24): the events-trail guard above
+            # catches a bare block → done re-completion, but a worker can defeat it by
+            # re-POINTING the deliverable at a clean file between our block and the
+            # re-`done` (block → set_deliverable → done, no unblock). The marker re-check
+            # below then reads the SWAPPED clean file and finds nothing → the original
+            # WORK-REMAINS card is laundered and the task silently stays 'completed'
+            # (reproduced: smoke harness, AUDIT-FAIL card swapped to a DEAD-verdict card).
+            # A set_deliverable that lands after our FIRST still-active block (i.e. the
+            # earliest block with no later unblock) IS the evasion signature — re-block
+            # regardless of the new file's contents, and stay latched across a subsequent
+            # plain re-block→re-done (the swapped pointer persists, so a single 'last
+            # block' window would lose it on the next cycle). The manager must unblock to
+            # override — the same sanctioned channel as the bare-re-done guard above.
+            fb = next((i for i, ev in enumerate(evs)
+                       if ev == "block" and "unblock" not in evs[i + 1:]), -1)
+            if fb >= 0 and "set_deliverable" in evs[fb + 1:]:
+                swap_evasion = True
         deliv = t.get("deliverable")
         if not deliv:
             continue
-        exists, _ = resolve_deliverable(deliv)
-        if not exists:
-            continue
-        # single-file scope: a verdict/audit deliverable is a concrete file (the metric
-        # ledger, main.py, a verdict doc). Bare dir/glob research deliverables are skipped — one
-        # stale explore-not-ship caveat in an unrelated sub-card must not block the task.
-        text = read_deliverable_text(deliv, single_file_only=True)
-        if not text:
-            continue
-        m = INCOMPLETE_REGEX.search(text)
-        if not m:
-            continue
-        marker = m.group(0).replace("\n", " ").strip()
+        # swap-evasion: a deliverable repointed after our block (no unblock) re-blocks
+        # unconditionally — the new file's contents are irrelevant, the worker bypassed
+        # the sanctioned unblock channel by swapping the pointer. exists/marker checks
+        # below are skipped so a clean (or missing) swapped file can't launder it.
+        if swap_evasion:
+            marker = "deliverable repointed after reopen (swap evasion — no unblock)"
+        else:
+            exists, _ = resolve_deliverable(deliv)
+            if not exists:
+                continue
+            # single-file scope: a verdict/audit deliverable is a concrete file (PERF_CARD.md,
+            # main.py, a verdict doc). Bare dir/glob research deliverables are skipped — one
+            # stale explore-not-ship caveat in an unrelated sub-card must not block the task.
+            text = read_deliverable_text(deliv, single_file_only=True)
+            if not text:
+                continue
+            m = INCOMPLETE_REGEX.search(text)
+            if not m:
+                continue
+            marker = m.group(0).replace("\n", " ").strip()
         reason = (f"completion-integrity: '{deliv}' marked completed but deliverable still "
                   f"carries WORK-REMAINS marker «{marker}» → NOT done. Auto-reopened to blocked. "
                   f"Manager: finish/resolve the open item then cc-task done, or cc-task unblock to override.")
@@ -623,7 +657,7 @@ def check_completed_integrity():
             # + seen.add unconditionally, so a failed block was reported as ⛔ REOPENED
             # (false success: task still `completed`) AND seen-advanced (never retried
             # → reopen silently lost forever). Mirror of the auto-flip rc fix in
-            # check_deliverables; mirrored here.
+            # check_deliverables (grill 2026-06-09); this one grill 2026-06-10.
             if r.returncode == 0:
                 reopened.append((t["id"], t.get("assignee", ""), deliv, marker))
                 seen.add(t["id"])
@@ -631,7 +665,7 @@ def check_completed_integrity():
                 err = (r.stderr or b"").decode("utf-8", "replace").strip().replace("\n", " ")[:100]
                 reopen_failed.append((t["id"], t.get("assignee", ""), err))
         except Exception as ex:
-            # A subprocess timeout/OSError previously vanished
+            # Grill 2026-06-12: a subprocess timeout/OSError previously vanished
             # (bare pass) — no reopen, no report, task stayed 'completed' silently.
             reopen_failed.append((t["id"], t.get("assignee", ""), f"exception: {type(ex).__name__}"))
     save_json_seen(COMPLETION_SEEN_FILE, seen)
@@ -663,7 +697,7 @@ def save_paid_seen(seen: set):
 
 def _paid_tokens(text: str) -> set:
     """Canonical dedup tokens for a paid proposal: vendor names + normalized $amounts.
-    Lets fragments of the SAME proposal ('$79/mo as pending', 'a vendor's pricing')
+    Lets fragments of the SAME proposal ('$79/mo as pending', 'Polygon options pricing')
     collide on a stable token instead of volatile snippet text."""
     toks = set()
     for v in re.findall(r"EODHD|Coinglass|Quandl|Bloomberg|Refinitiv|Polygon|Tradier|Benzinga|FMP|Nasdaq[ _-]?TotalView|OPRA", text, re.IGNORECASE):
@@ -685,7 +719,7 @@ def check_paid():
     seen = load_paid_seen()
     # Pre-seed dedup from existing OPEN paid-review tasks so a proposal that's
     # already tracked is never re-flagged — survives pane-fragment drift across
-    # scans + seen-file resets (fixes a duplicate-tasks-per-hour regression).
+    # scans + seen-file resets (fixes the 5-dup-tasks/hr regression 2026-05-29).
     try:
         for t in materialize().values():
             d = t.get("description", "")
@@ -734,8 +768,8 @@ def check_paid():
         except Exception:
             continue
     # Collapse near-duplicates: one paid proposal can match multiple regex branches
-    # on different pane lines (e.g. "a data feed ($79/mo)…" + bare "a data
-    # feed"). Keep only maximal snippets per session (drop substrings) → 1 task.
+    # on different pane lines (e.g. "Polygon options ($79/mo)…" + bare "Polygon
+    # options"). Keep only maximal snippets per session (drop substrings) → 1 task.
     collapsed = []
     for sess, snip in new_findings:
         norm = snip.lower().replace(" ", "")
@@ -762,8 +796,8 @@ def check_paid():
                                 "--category", "paid-review"], check=False, capture_output=True, timeout=10)
             except Exception:
                 pass
-            # self-audit #5 (b): a NEW [PAID] block registered is an operator-review escalation
-            # — notify + log it, deduped per worker so it fires once.
+            # self-audit #5 (b): a NEW [PAID] block registered is a user-review escalation
+            # (feedback_paid_data_user_review) — notify + log it, deduped per worker so it fires once.
             notify_user(f"paid:{sess}", f"new [PAID] candidate from {sess}: {snippet[:120]}")
         print(f"paid-detection: {len(new_findings)} new [PAID] candidate(s)")
         for sess, snip in new_findings:
@@ -775,10 +809,10 @@ def check_paid():
 
 def check_premature_exhaustion():
     """Pass: scan worker panes for premature 'data exhausted / data wall / need paid
-    data' claims. Per the optional research-escalation ladder: a worker must
-    exhaust the cheaper deep-research tiers before declaring a wall or going paid. Flag
-    so the manager nudges it UP the ladder, never accepts the wall / approves paid
-    data while research tiers remain. Complements check_paid (which gates the $ decision)."""
+    data' claims. Per the DR escalation ladder (user 2026-06-09): a worker must
+    exhaust CCDR → Gemini DR → OpenAI DR before declaring a wall or going paid. Flag
+    so the manager DR-nudges it UP the ladder, never accepts the wall / approves paid
+    data while DR tiers remain. Complements check_paid (which gates the $ decision)."""
     if not WATCH_LIST.exists():
         return
     sessions = [line.strip() for line in WATCH_LIST.read_text().splitlines()
@@ -793,7 +827,7 @@ def check_premature_exhaustion():
                 continue
             ctx = out.stdout[max(0, m.start() - 80):m.end() + 80]
             # Skip false positives: worker is ALREADY escalating the ladder / has
-            # reached a higher DR tier (tier 2/3 → ladder genuinely progressing), OR
+            # reached Gemini|OpenAI DR (tier 2/3 → ladder genuinely progressing), OR
             # this is the manager's own anti-wall nudge echoed in the pane.
             if re.search(r"gemini[ _-]?dr|openai[ _-]?dr|chatgpt[ _-]?dr|升级 (gemini|openai|dr)"
                          r"|escalat|别停|别说枯竭|先升级|不准.{0,8}枯竭|三档.{0,4}dr|paid.{0,8}最后手段"
@@ -801,7 +835,7 @@ def check_premature_exhaustion():
                          ctx, re.IGNORECASE):
                 continue
             print(f"  [dr-ladder] {sess}: '{m.group(0)}' — PREMATURE exhaustion claim; "
-                  f"DR-escalate up the research ladder before any paid-data, do NOT accept the wall")
+                  f"DR-escalate (CCDR→Gemini→OpenAI) before any paid-data, do NOT accept the wall")
             # self-audit #5 (a): a CONFIRMED premature-exhaustion claim is a real escalation —
             # surface it to the user (notify + escalations.log), deduped per worker so it fires once.
             notify_user(f"premature-exhaust:{sess}",
@@ -810,14 +844,70 @@ def check_premature_exhaustion():
             continue
 
 
+# Worker goals that AUTHORIZE escalate-and-hold / Damien-approval / gated-deploy
+# language. These markers mean the worker's OWN goal sanctions an escalate-and-hold
+# (real-capital → Damien, deploy gated PENDING approval) — so a pane line reporting
+# that gated wall is the goal-authorized job, NOT ship-paradigm drift. (Bug 2026-06-24:
+# check_ship_drift was GOAL-BLIND — it grilled dagdr for honestly recording
+# 'EC2 deploy PENDING (Damien approval)' even though its goal was 'explore-not-ship,
+# 真实资金=Damien'; dagdr then made a placating commit 41d7d805 that softened a
+# legitimate institutional record.) Matched against current_goal + role.
+GOAL_ESCALATE_AUTH_REGEX = re.compile(
+    r"explore.?not.?ship|真实资金\s*=\s*Damien|真实资金.{0,6}Damien"
+    r"|escalate.?and.?hold|escalate-?and-?hold"
+    r"|=\s*Damien|→\s*Damien|交\s*Damien|Damien.?(approv|批准|审批|gate|gated|签字|hand.?off)"
+    r"|PENDING\b.{0,30}(Damien|approval|VPC|deploy)|(Damien|approval|VPC).{0,30}\bPENDING"
+    r"|Damien.?gated|deploy.{0,12}(gated|pending|审批|批准)",
+    re.IGNORECASE)
+
+# Ship/complete OVERCLAIM keywords — these assert the work IS shipped/locked/done,
+# which an explore-not-ship goal NEVER authorizes, so they stay flagged even when the
+# goal sanctions escalation. (Mirrors a subset of SHIP_DRIFT_REGEX; the goal-aware
+# suppression below only spares the APPROVAL-GATE class, never these.) Anchored to
+# completion/lock framing, not to mere mention of approval being pending.
+SHIP_OVERCLAIM_REGEX = re.compile(
+    r"ship[ _-]?gate|ship[ _-]?verdict|canonical[ _-]?ship[ _-]?ready"
+    r"|gate[ _-]?sign[ _-]?-?off|gate[ _-]?\d[ _-]?sign"
+    r"|promotion[ _-]?note|promote[ _-]?to[ _-]?live"
+    r"|productioni[sz]ation|产品化|prod[ _-]?lock"
+    r"|交付档案|推荐决策|部署决策|deployment[ _-]?decision"
+    r"|champion[ _-]?(lock|定版|final|sign)"
+    r"|deployed[ _-]?to[ _-]?(live|prod)|shipping[ _-]?to[ _-]?live|approval[ _-]?obtained|Damien[ _-]?approved",
+    re.IGNORECASE)
+
+
+def _load_worker_goals() -> dict:
+    """{worker_name: 'current_goal role'} from workers.json — the DURABLE signal that
+    persists after the pane scrolls. Fail-safe: returns {} on any read/parse error so a
+    missing/empty registry never crashes a pass (it just means no goal-aware suppression,
+    i.e. fall back to pure-pane detection — the pre-fix behavior)."""
+    goals = {}
+    try:
+        reg = json.loads(WORKERS_FILE.read_text())
+        for w in reg.get("workers", []):
+            name = w.get("name")
+            if name:
+                goals[name] = f"{w.get('current_goal') or ''} {w.get('role') or ''}"
+    except Exception:
+        pass
+    return goals
+
+
 def check_ship_drift():
-    """Pass 3: scan worker panes for ship-paradigm keywords. Per the explore-not-ship rule.
+    """Pass 3: scan worker panes for ship-paradigm keywords. Per feedback_explore_not_ship.
     EXEMPT: workers with an open category=landing task — for a USER-DESIGNATED landing
-    line, operator-approval / deploy / promote-to-live talk is the legitimate job, not
-    paradigm drift (exempting here keeps this pass from fighting check_landing_debt)."""
+    line, Damien-approval / deploy / promote-to-live talk is the legitimate job, not
+    paradigm drift (exempting here keeps this pass from fighting check_landing_debt).
+    GOAL-AWARE (fix 2026-06-24): if the matched keyword is APPROVAL-GATE language
+    (Damien-approval / deploy-pending) AND the worker's OWN goal authorizes an
+    escalate-and-hold (explore-not-ship + 真实资金=Damien / Damien-gated / PENDING), the
+    line is the goal-sanctioned escalation, NOT drift — suppress it. A genuine ship
+    OVERCLAIM (champion-lock / deployed-to-live / approval-obtained) still fires even
+    when the goal sanctions escalation."""
     if not WATCH_LIST.exists():
         return
     exempt = open_landing_workers()
+    goals = _load_worker_goals()
     sessions = [line.strip() for line in WATCH_LIST.read_text().splitlines()
                 if line.strip() and not line.startswith("#")]
     findings = []
@@ -833,15 +923,27 @@ def check_ship_drift():
                 # Skip echo false-positive: keyword in a STOP/exclusion/negation/removal context
                 # (my own anti-ship nudge, OR a worker REPORTING it stripped ship-framing — not drift).
                 ctx = out.stdout[max(0, m.start()-60):m.end()+60]
-                # NOTE: 'residual'/'negat' were once BARE → any ship-drift
-                # phrase with common domain words ('residual ...'/'negative ...')
-                # within 60 chars was silently skipped (real drift missed). Anchored
+                # NOTE (2026-06-02 grill): 'residual'/'negat' were BARE → any ship-drift
+                # phrase with the ubiquitous quant words 'residual momentum'/'negative
+                # Sharpe' within 60 chars was silently skipped (real drift missed). Anchored
                 # to 'ship' so they still catch compliance-reporting ('negated the ship gate',
-                # 'addressed ship-residual') without neutering detection on normal domain text.
+                # 'addressed ship-residual') without neutering detection on normal quant text.
                 if re.search(r"STOP|不要|别|別|don.t|不算|not the goal|explore.?not.?ship|记 PERF|exploration 结论"
                              r"|strip|remov|去掉|删除|addressed|ship[ _-]?residual|negat\w*[ _-]?(the[ _-]?)?ship"
                              r"|NOT a ship|NO ship|no ship[ _-]?gate|没有 ship|不 ship|不是 ship|无 ship",
                              ctx, re.IGNORECASE):
+                    continue
+                # GOAL-AWARE suppression (fix 2026-06-24, dagdr false-positive): if the
+                # worker's OWN goal authorizes an escalate-and-hold (explore-not-ship +
+                # 真实资金=Damien / Damien-gated / deploy-PENDING), then an APPROVAL-GATE
+                # keyword (Damien-approval, deploy-pending) is the goal-sanctioned job, not
+                # drift. The durable goal — not the 60-char pane window — carries that
+                # authorization, so the existing ctx-negation guard alone misses it once
+                # the goal text scrolls off the pane. A true ship OVERCLAIM (champion-lock,
+                # deployed-to-live, approval-obtained) is NEVER goal-authorized → still fires.
+                goal_txt = goals.get(sess, "")
+                if (goal_txt and GOAL_ESCALATE_AUTH_REGEX.search(goal_txt)
+                        and not SHIP_OVERCLAIM_REGEX.search(m.group(0))):
                     continue
                 findings.append((sess, m.group(0)))
         except Exception:
@@ -850,7 +952,7 @@ def check_ship_drift():
         for sess, snippet in findings:
             print(f"  [ship-drift] {sess}: '{snippet}' — GRILL paradigm drift")
             try:
-                subprocess.run([str(TS), sess, f"GRILL: paradigm drift detected — '{snippet}' is ship-paradigm。Per the explore-not-ship rule,goal = 持续探索,不 ship。把 variant 当作探索结论(ALIVE/DEAD)记录就够,不要 'lock ship-ready' / 'ship gate' 框架。"],
+                subprocess.run([str(TS), sess, f"GRILL: paradigm drift detected — '{snippet}' is ship-paradigm。Per feedback_explore_not_ship,goal = 持续探索,不 ship。把 variant 当作探索结论(ALIVE/DEAD)记录就够,不要 'lock ship-ready' / 'ship gate' 框架。"],
                                check=False, capture_output=True, timeout=10)
             except Exception:
                 pass
@@ -861,14 +963,14 @@ def check_ship_drift():
 
 def check_repeated_nudge():
     """Pass 4: detect cross-worker deadlock — same worker sent near-identical
-    nudge 3+ cycles in a row (e.g. 'ping worker_a for X' that never gets answered).
-    Flags for manager to mediate directly. Per an observed multi-cycle nudge loop."""
+    nudge 3+ cycles in a row (e.g. 'ping ai_dag for X' that never gets answered).
+    Flags for manager to mediate directly. Per observed data_pipe 6-cycle loop 2026-05-27."""
     log = Path("/tmp/cc-manager.log")
     if not log.exists():
         return
     # Window the SENT lines, NOT raw lines. cc-monitor logs ~14 '[monitor] …' lines per
     # cycle into this same file, so a raw [-60:] window is dominated by monitor output
-    # (e.g. last 60 raw lines = 14 monitor + only 2 sent; last 200 raw = 7
+    # (grill 2026-06-05: last 60 raw lines = 14 monitor + only 2 sent; last 200 raw = 7
     # sent) → the detector could never accumulate 3 sent-lines from one worker and thus
     # SILENTLY NEVER FIRED regardless of a real nudge-loop. Filter to sent-lines first,
     # then keep the most recent N so monitor noise can't crowd out the signal.
@@ -894,10 +996,12 @@ def check_repeated_nudge():
         # Compare last 3 msgs: if they share a long common keyword signature → loop
         last3 = msgs[-3:]
         # crude similarity: shared 6+-char tokens across all 3.
-        # CASE-FOLD first: cc-watch's hard-cap-2 only blocks BYTE-identical re-sends; a nudge
-        # re-sent with only case tweaks (e.g. AI_DAG→ai_dag, BLOCKED→blocked) slips PAST the cap
-        # AND, without folding, past this detector — the case-only tokens never intersect
-        # (set('AI_DAG') ∩ set('ai_dag') = ∅) so a real deadlock loop is silently missed.
+        # CASE-FOLD first (grill 2026-06-27): cc-watch's hard-cap-2 only blocks BYTE-
+        # identical re-sends; a nudge re-sent with only case tweaks (e.g. AI_DAG→ai_dag,
+        # BLOCKED→blocked) slips PAST the cap AND, without folding, past this detector —
+        # the case-only tokens never intersect (set('AI_DAG') ∩ set('ai_dag') = ∅) so a
+        # real deadlock loop is silently missed (double-miss). Lowering both the cap-evasion
+        # and the false-positive risk is checked: distinct tasks still share <3 long tokens.
         def toks(m):
             return set(w for w in re.split(r"[\s,，。()（）]", m.lower()) if len(w) >= 6)
         common = toks(last3[0]) & toks(last3[1]) & toks(last3[2])
@@ -917,29 +1021,60 @@ def check_repeated_nudge():
         print("repeated-nudge-detection: no deadlock loops")
 
 
-# --- check_dr_candidates_verified (RULE A — no cherry-picking) regexes/helpers ---
-# A research round is NOT complete until EVERY ranked candidate has a verdict: a real
-# verification-backend run id, an explicit ALIVE/DEAD, or a needs-paid-data:<feed> flag.
-# A verdict cell that is empty / `pending` / `-` / `TBD` = un-verified → round NOT done.
-DR_RESEARCH_GOAL_REGEX = re.compile(
+# Research-shaped goal markers — only research workers are subject to the CCDR-compliance
+# check (a strategy-coding / fix / paper-deploy worker legitimately uses WebSearch/WebFetch
+# for docs without owing a /deep-research). EN + CN.
+CCDR_RESEARCH_GOAL_REGEX = re.compile(
     r"research|deep[ _-]?research|\bDR\b|\bCCDR\b|explore|exploration|survey|literature"
-    r"|find\s+(?:a\s+)?(?:new\s+)?(?:alpha|signal|edge|mechanism|angle|direction|candidate)",
+    r"|find\s+(?:a\s+)?(?:new\s+)?(?:alpha|signal|edge|mechanism|angle|direction|candidate)"
+    r"|研究|探索|找(?:新)?(?:角度|方向|信号|因子|alpha|机制)|调研|文献",
     re.IGNORECASE)
-# A verdict cell counts as VERIFIED iff it carries a run id (>=8-hex backtest/run id),
-# an ALIVE/DEAD verdict, or a needs-paid-data flag.
-DR_RUNID_REGEX = re.compile(r"\b[0-9a-f]{8,}\b")
-DR_VERDICT_TOKEN_REGEX = re.compile(r"\bALIVE\b|\bDEAD\b", re.IGNORECASE)
-DR_NEEDS_PAID_REGEX = re.compile(r"needs[ _-]?paid[ _-]?data\s*:?\s*\S+", re.IGNORECASE)
-DR_PENDING_CELL_REGEX = re.compile(r"^\s*(?:|-|–|—|\.{1,3}|n/?a|tbd|pending|todo|\?+)\s*$", re.IGNORECASE)
-# --- Hierarchical decimal-numbering of research directions (the numbered tree) ---
-# Research directions form a NUMBERED TREE; decimal DEPTH = research-round depth. A 1st round
-# proposing 3 big directions → ids `1`,`2`,`3`; a 2nd round drilling into `2` → `2.1`,`2.2`,`2.3`;
-# a 3rd into `2.1` → `2.1.1`… (one more dot per deeper round). EVERY node (every proposed
-# direction at every level) MUST get its own verification run → a real run id + ALIVE/DEAD (or
-# needs-paid-data:<feed>); a node with no run id = an un-run direction = a gap. The `## Candidates`
-# ledger carries an `id` column = the dotted-decimal number and is the COMPLETE accounting of all
-# rounds. A canonical id is one-or-more dot-separated positive integers (e.g. `2`, `2.1`,
-# `2.10.3`); anything else is malformed and ignored for tree-checking (never crashes/flags on it).
+# Ad-hoc web-research activity markers in the pane (the tool calls a worker emits when it
+# free-forms web research instead of running /deep-research). DELIBERATELY excludes generic
+# words; these are the literal Claude Code tool-call / status tokens.
+WEB_RESEARCH_MARKER_REGEX = re.compile(
+    r"WebSearch|WebFetch|web_search|web_fetch|\bSearched\b|\bFetched\b",
+    re.IGNORECASE)
+# CCDR-in-use markers — if any of these appear, the worker IS routing through /deep-research
+# (skill_177) and must NOT be flagged, regardless of how many web markers also show (CCDR
+# itself fans out WebSearch/WebFetch internally).
+CCDR_MARKER_REGEX = re.compile(
+    r"/deep-research|deep[ _-]?research|deep-research|skill_177|CCDR",
+    re.IGNORECASE)
+
+# --- check_dr_candidates_verified (RULE A — no cherry-picking) regexes/helpers ---
+# A verdict cell is VERIFIED iff it carries one of: a 32-hex QC bt-id, an explicit
+# ALIVE/DEAD verdict, or a needs-paid-data:<feed> flag. Anything else (empty / `pending`
+# / `-` / `TBD` / `?`) = un-verified → the DR round is NOT complete (RULE A).
+BTID_HEX_REGEX = re.compile(r"\b[0-9a-f]{32}\b")
+VERDICT_TOKEN_REGEX = re.compile(r"\bALIVE\b|\bDEAD\b", re.IGNORECASE)
+NEEDS_PAID_REGEX = re.compile(r"needs[ _-]?paid[ _-]?data\s*:?\s*\S+", re.IGNORECASE)
+# A node is RESOLVED (not an un-run gap) if its row carries an EXPLICIT terminal disposition that
+# means "no QC run is owed here" — beyond a bt-id/ALIVE-DEAD/needs-paid:<feed>. Per RULE A the only
+# legitimate non-bt-id terminals are: a paid/external-feed gate (`needs-data:FINRA-SI`,
+# `needs-paid-data:ETF-flow`), or an OUT-OF-SCOPE / OUT-OF-MANDATE / ROUTED-to-another-lane / OVERLAP
+# (already-owned by an ALIVE engine) disposition. Recognizing these stops the check from false-flagging
+# a properly-disposed node as "un-run" (accuracy fix 2026-06-28; keeps a real PENDING/blank node caught).
+TERMINAL_DISPOSITION_REGEX = re.compile(
+    r"needs[ _-]?(?:paid[ _-]?)?data\b"               # needs-data[:<feed>] / needs-paid-data[:<feed>]
+    r"|out[ _-]?of[ _-]?(?:scope|mandate)"            # out-of-scope / out-of-mandate
+    r"|\brout(?:e|ed)\s+to\b|\bROUTE\b"               # routed to another lane
+    r"|already[ _-](?:settled|owned|exploited|DEAD)"  # overlap with an existing verdict/engine
+    r"|\boverlap\b|already[ _-]?DEAD"
+    r"|出?[ _]?(?:范围|界|mandate)外|超出范围|路由|另起|已(?:死|属|被)",
+    re.IGNORECASE)
+# A cell that is explicitly UN-verified (so we only flag a clear ledger with pending rows,
+# never a missing/None cell that could be a parse artifact).
+PENDING_CELL_REGEX = re.compile(r"^\s*(?:|-|–|—|\.{1,3}|n/?a|tbd|pending|todo|\?+|待测|待回测|待验证|未测|未验证)\s*$", re.IGNORECASE)
+# --- Hierarchical decimal-numbering of DR directions (the numbered tree) ---
+# DR directions form a NUMBERED TREE; decimal DEPTH = DR-round depth. A 1st-round DR proposing
+# 3 big directions → ids `1`,`2`,`3`; a 2nd round drilling into `2` → `2.1`,`2.2`,`2.3`; a 3rd
+# into `2.1` → `2.1.1`… (one more dot per deeper round). EVERY node (every proposed direction
+# at every level) MUST get its own QC run → a real bt-id + ALIVE/DEAD (or needs-paid-data:<feed>);
+# a node with no bt-id = an un-run direction = a gap. The `## Candidates` ledger carries an `id`
+# column = the dotted-decimal number and is the COMPLETE accounting of all DR rounds. A canonical
+# id is one-or-more dot-separated positive integers (e.g. `2`, `2.1`, `2.10.3`); anything else is
+# malformed and ignored for tree-checking (never crashes, never flags on a parse artifact).
 DR_ID_REGEX = re.compile(r"^\d+(?:\.\d+)*$")
 
 
@@ -952,69 +1087,99 @@ def _normalize_dr_id(raw):
     s = str(raw).strip().strip("`*_ ").rstrip(".")
     if not s or not DR_ID_REGEX.match(s):
         return None
+    # drop any accidental leading zeros per segment without changing structure (2.01 -> 2.1)
     try:
-        return ".".join(str(int(p)) for p in s.split("."))  # 2.01 -> 2.1, no structure change
+        return ".".join(str(int(p)) for p in s.split("."))
     except (ValueError, TypeError):
         return None
 
 
-def _dr_tree_gaps(ids):
-    """Given the set of canonical ids PRESENT in a ledger, return the sorted REQUIRED-but-MISSING
-    ancestor/sibling ids (the tree gaps). Tree-completeness rule: if a node `2.3` exists then its
-    parent `2` and every earlier sibling `2.1`,`2.2` must also exist (a missing sibling/parent = a
-    dropped direction silently never proposed/run). For each present id we require (a) all proper
-    prefixes (ancestors) — `2.1` ⇒ `2`; and (b) all lower-numbered siblings at the same level —
-    `2.3` ⇒ `2.1`,`2.2`. Pure, never raises; caller passes only canonical ids."""
+def _dr_tree_gaps(ids, resolved=None):
+    """Given the set of canonical ids actually PRESENT in a ledger, return the sorted list of
+    REQUIRED-but-MISSING ancestor/sibling ids (the tree gaps). Tree-completeness rule: if a node
+    `2.3` exists then its parent `2` and every earlier sibling `2.1`,`2.2` must also exist (a
+    missing sibling/parent = a dropped direction that was silently never proposed/run). For each
+    present id we require: (a) all proper prefixes (ancestors) — `2.1` ⇒ `2`; and (b) all
+    lower-numbered siblings at the same level — `2.3` ⇒ `2.1`,`2.2`. Pure, never raises; malformed
+    ids must already be filtered out by the caller (only canonical ids passed in).
+
+    ORGANIZATIONAL-HEADER suppression (accuracy fix 2026-06-28): a missing pure-ANCESTOR (e.g. `2`
+    when `2.1`..`2.11` are present) is often just a header row the worker elided, NOT a dropped
+    direction — as long as EVERY present descendant of that ancestor is resolved (carries a verdict).
+    When the optional `resolved` set is given, such an ancestor is dropped from the gap list (a
+    missing SIBLING is always still flagged — that's a real silently-skipped direction). `resolved`
+    omitted → original strict behavior (back-compatible)."""
     present = set(ids)
-    required = set()
+    ancestors, siblings = set(), set()
     for cid in present:
         parts = cid.split(".")
-        for k in range(1, len(parts)):  # (a) ancestors
-            required.add(".".join(parts[:k]))
+        # (a) ancestors: every proper prefix
+        for k in range(1, len(parts)):
+            ancestors.add(".".join(parts[:k]))
+        # (b) lower-numbered siblings at this id's own level
         try:
             last = int(parts[-1])
         except (ValueError, TypeError):
             continue
         prefix = parts[:-1]
-        for n in range(1, last):  # (b) lower-numbered siblings
+        for n in range(1, last):
             sib = ".".join(prefix + [str(n)]) if prefix else str(n)
-            required.add(sib)
-    return sorted(required - present, key=lambda s: [int(p) for p in s.split(".")])
-# A doc CARRIES a deep-research marker (it is the output of a DR/CCDR round, not an unrelated note).
-# Used to gate the no-ledger evasion check so a plain non-DR markdown file can never trip it.
-DR_DOC_MARKER_REGEX = re.compile(r"deep[ _-]?research|\bCCDR\b|\bDR\b|## Candidates|candidate ledger", re.IGNORECASE)
+            siblings.add(sib)
+    required = ancestors | siblings
+    missing = required - present
+    if resolved is not None:
+        resolved = set(resolved)
+        # drop a missing pure-ancestor (not also a missing sibling) whose every present descendant
+        # is resolved → it is an elided organizational header, not a dropped/un-run direction.
+        keep = set()
+        for gid in missing:
+            # a missing node is REPRESENTED (header-elided, not dropped) if it has present
+            # descendants that are ALL resolved — true whether it was required as an ancestor
+            # OR as a lower-numbered sibling (worker numbered the group's content in children).
+            descendants = [p for p in present if p.startswith(gid + ".")]
+            if descendants and all(d in resolved for d in descendants):
+                continue  # represented-by-resolved-children → suppress (not a dropped direction)
+            keep.add(gid)  # genuinely missing (no children, or some child un-run) → real gap
+        missing = keep
+    return sorted(missing, key=lambda s: [int(p) for p in s.split(".")])
 # A doc READS LIKE a DR-round CONCLUSION (a round-verdict / closure / "explored N → DEAD" framing).
-# Paired with a DR marker, a doc that matches this but has NO `## Candidates` ledger is the
-# cherry-pick-by-omission evasion of RULE A (run DR, verify the 1-2 you like, write a prose
-# 'all DEAD / closing lane' close, emit no ledger). DELIBERATELY anchored to round-CLOSURE language
-# (not bare 'DEAD' in a result table) so an in-progress / stub research note never trips it.
+# Paired with a CCDR/DR marker, a doc that matches this but has NO `## Candidates` ledger is the
+# cherry-pick-by-omission evasion of RULE A (run DR, test 1-2, write a prose 'all DEAD' close, no
+# ledger). DELIBERATELY anchored to round-CLOSURE language (not bare 'DEAD' in a result table) so
+# an in-progress / stub research note doesn't trip it.
 DR_CONCLUSION_DOC_REGEX = re.compile(
     r"all\s+(?:candidates\s+|directions\s+|angles\s+)?DEAD"
     r"|every\s+(?:candidate|direction|angle)\s+(?:is\s+)?DEAD"
     r"|explored\s+\d+|\d+\s+(?:candidates?|directions?|angles?|mechanisms?|leads?)\s+(?:all\s+)?(?:explored|DEAD|tested)"
     r"|round\s+(?:is\s+)?(?:DEAD|complete|concluded|closed)|DR\s+round\s+(?:DEAD|complete|done)"
     r"|clos(?:e|ing|ed)\s+(?:this\s+)?(?:lane|direction|line|exploration)"
-    r"|exploration\s+(?:concluded|complete|closed|exhausted)|direction\s+(?:DEAD|exhausted|closed)",
+    r"|exploration\s+(?:concluded|complete|closed|exhausted)|direction\s+(?:DEAD|exhausted|closed)"
+    r"|全部?\s*DEAD|都\s*DEAD|均\s*DEAD|探索\s*(?:结论|结束|完成|闭环|枯竭)|方向\s*(?:DEAD|枯竭|关闭|结束)"
+    r"|关闭\s*(?:该)?(?:方向|lane|探索)|这条?\s*(?:lane|方向)\s*(?:关闭|结束|DEAD)",
     re.IGNORECASE)
 
 
 def _parse_candidates_ledger(text: str):
-    """Parse a `## Candidates` markdown table out of a research doc.
+    """Parse a `## Candidates` markdown-table section out of a DR-research doc.
 
-    CONSERVATIVE (RULE A must NOT false-positive on the idle fleet):
-      - None if no `## Candidates` heading, or no parseable table, or no `verdict` column
-        → caller treats None as 'no ledger, do NOT flag';
-      - else dict {verified, unverified, unverified_ids, present_ids, gaps}. A row is unverified
-        iff its verdict cell is present-but-empty/pending OR carries none of {run id, ALIVE/DEAD,
-        needs-paid-data}.
+    CONSERVATIVE by design (RULE A enforcement must NOT false-positive on the idle fleet):
+      - returns None if there is no `## Candidates` heading, or no parseable table under it,
+        or the table has no `verdict` column → caller treats None as 'no ledger, do NOT flag';
+      - returns a dict {verified, unverified, unverified_ids, present_ids, gaps} for a CLEAR
+        table that HAS a verdict column.
+    A row is 'unverified' iff its verdict cell is present-but-empty/pending (PENDING_CELL_REGEX)
+    OR carries none of {32-hex bt-id, ALIVE/DEAD, needs-paid-data}. The candidate-name column is
+    taken as the first non-numeric, non-empty cell (skips a leading '#'/index column).
+
     HIERARCHICAL TREE: if the table has an `id` column (the dotted-decimal node number), the row's
     id is parsed and the parser additionally reports per-id un-run nodes and TREE GAPS (required-
-    but-missing ancestors/siblings — `2.3` present but `2.1`/`2.2`/`2` absent). No `id` column →
-    tree fields empty (back-compatible: only verdict completeness is enforced).
+    but-missing ancestors/siblings — `2.3` present but `2.1`/`2.2`/`2` absent). If there is no `id`
+    column the tree fields are empty (back-compatible: only the verdict completeness is enforced).
     Never raises — any structural surprise returns None (no flag)."""
     if not text:
         return None
     lines = text.splitlines()
+    # locate the `## Candidates` heading (allow trailing words, e.g. '## Candidates (ranked)')
     start = None
     for i, ln in enumerate(lines):
         if re.match(r"^\s{0,3}#{1,6}\s+candidates\b", ln, re.IGNORECASE):
@@ -1022,57 +1187,86 @@ def _parse_candidates_ledger(text: str):
             break
     if start is None:
         return None
+    # collect the contiguous markdown-table block (lines containing a pipe), stopping at the
+    # next heading or a blank gap after the table started.
     table = []
     for ln in lines[start:]:
-        if re.match(r"^\s{0,3}#{1,6}\s", ln):  # next heading → section end
+        if re.match(r"^\s{0,3}#{1,6}\s", ln):  # next heading → end of section
             break
         if "|" in ln:
             table.append(ln)
-        elif table:
+        elif table:  # blank/non-pipe line after table rows began → table ended
             break
-    if len(table) < 2:
+    if len(table) < 2:  # need at least a header + one data row
         return None
 
     def cells(row):
-        return [c.strip() for c in row.strip().strip("|").split("|")]
+        parts = [c.strip() for c in row.strip().strip("|").split("|")]
+        return parts
 
     header = [h.lower() for h in cells(table[0])]
+    # find the verdict column; require an explicit 'verdict' header (conservative — no guessing)
     vcol = next((idx for idx, h in enumerate(header) if "verdict" in h), None)
     if vcol is None:
         return None
-    # id column = dotted-decimal tree-node number; EXACT 'id' header (or '#id'), not a substring
-    # of 'width'/'idea'. Absent → tree-checking skipped (back-compatible).
+    # find the id column (the dotted-decimal tree-node number). EXACT 'id' header (or '#id'),
+    # not a substring of 'width'/'idea' — match a header cell that is exactly 'id' (allowing a
+    # leading '#'). Optional: absent → tree-checking is skipped (back-compatible).
     icol = next((idx for idx, h in enumerate(header)
                  if re.fullmatch(r"#?\s*id", h.strip())), None)
+    # data rows skip the markdown separator row (|---|---|)
     verified, unverified, unverified_ids, present_ids = [], [], [], []
+    resolved_ids = []  # node ids whose row IS verified (for organizational-header gap suppression)
     for row in table[1:]:
-        if re.match(r"^\s*\|?[\s:\-|]+\|?\s*$", row):  # markdown separator row
+        if re.match(r"^\s*\|?[\s:\-|]+\|?\s*$", row):  # separator row
             continue
         c = cells(row)
         if vcol >= len(c):
-            continue  # ragged row — skip, don't crash/flag on a parse artifact
+            # malformed / ragged row — skip (don't crash, don't flag on a parse artifact)
+            continue
+        # candidate name = first cell that isn't a pure index number and isn't empty
         name = next((x for x in c if x and not re.fullmatch(r"\d+", x)), None) or "(unnamed)"
         verdict = c[vcol]
+        # node id (dotted-decimal) if there's an id column and this row's id cell is well-formed
         node_id = _normalize_dr_id(c[icol]) if (icol is not None and icol < len(c)) else None
         if node_id is not None:
             present_ids.append(node_id)
-        if DR_RUNID_REGEX.search(verdict) or DR_VERDICT_TOKEN_REGEX.search(verdict) or DR_NEEDS_PAID_REGEX.search(verdict):
+        # ROW-WISE verification (accuracy fix 2026-06-28): a node is RUN iff its row carries a real
+        # QC verdict ANYWHERE — many real ledgers (cvx2-5yr-hunt, conv-trend-robust) put the 32-hex
+        # bt-id in a DEDICATED `bt-id` column and a non-token note ("5yr✓ / AND✗") in the verdict
+        # column. Scanning ONLY the verdict cell false-flagged those fully-run nodes as un-run.
+        # Scan the whole row for {32-hex bt-id, ALIVE/DEAD, needs-paid-data}; this can only REDUCE
+        # false-positives (strictly fewer flags) — a truly un-run node (verdict empty/PENDING AND no
+        # bt-id anywhere in the row) is still caught.
+        row_text = " | ".join(c)
+        is_verified = bool(BTID_HEX_REGEX.search(row_text) or VERDICT_TOKEN_REGEX.search(row_text)
+                           or NEEDS_PAID_REGEX.search(row_text)
+                           or TERMINAL_DISPOSITION_REGEX.search(row_text))
+        if is_verified:
             verified.append(name)
+            if node_id is not None:
+                resolved_ids.append(node_id)
         else:
-            unverified.append(name)  # empty/pending OR non-empty-but-not-a-verdict → un-verified
+            # present-but-empty/pending, OR a non-empty cell that is none of the three terminal
+            # forms (a stray note) — both un-verified per RULE A (not a real QC verdict).
+            unverified.append(name)
             unverified_ids.append(node_id or name)
     if not verified and not unverified:
         return None
-    gaps = _dr_tree_gaps(present_ids) if present_ids else []
+    # tree-completeness: required-but-missing ancestor/sibling ids (only when ids were given).
+    # pass the resolved-id set so an elided organizational-header ancestor (all descendants resolved)
+    # is not mis-flagged as a dropped direction; a missing SIBLING is always still a gap.
+    gaps = _dr_tree_gaps(present_ids, resolved_ids) if present_ids else []
     return {"verified": verified, "unverified": unverified,
             "unverified_ids": unverified_ids, "present_ids": present_ids, "gaps": gaps}
 
 
-def _recent_research_docs(window_hours: int = 48):
-    """Most-recently-committed research .md docs (newest first) in the last window. Shared
-    tree → can't git-attribute to a worker by author; returns repo-wide recent research-shaped
-    docs and the caller scopes to active research workers. Returns repo-relative paths, never
-    raises (git failure → [])."""
+def _recent_research_docs(name: str, window_hours: int = 48):
+    """Most-recently-committed DR-research .md docs (newest first) touched in the last
+    window. Shared tree → we can't attribute a commit to a worker by git author, so this
+    returns repo-wide recent research-shaped docs; the caller scopes to ACTIVE research
+    workers and parses each doc's ledger. Returns repo-relative paths (newest-commit first).
+    Never raises (git failure → [])."""
     try:
         out = subprocess.run(
             ["git", "-C", str(REPO_ROOT), "log", f"--since={window_hours} hours ago",
@@ -1085,44 +1279,139 @@ def _recent_research_docs(window_hours: int = 48):
     seen = []
     for p in out.stdout.splitlines():
         p = p.strip()
-        if not p or p in seen or not p.endswith(".md"):
+        if not p or p in seen:
             continue
+        if not p.endswith(".md"):
+            continue
+        # research-shaped docs only: alpha_research / research-notes / *DR* / *research* / *candidates*
         low = p.lower()
-        if not any(k in low for k in ("research", "candidates", "deep-research", "_dr.md", "/dr_")):
+        if any(k in low for k in ("alpha_research", "research-note", "deep-research",
+                                  "/dr_", "_dr.md", "candidates", "research/")):
+            seen.append(p)
             continue
-        seen.append(p)
+        # COVERAGE fix (2026-06-28): the id-tree `## Candidates` ledger commonly lives in a
+        # strategy `PERF_CARD.md` / `VERDICT.md` (cvx2-5yr-hunt, conv-trend-robust) whose PATH
+        # carries none of the keywords above — so RULE-A enforcement was BLIND to ledgers in
+        # strategy dirs. Pull those in ONLY when the file actually carries a `## Candidates`
+        # heading (so a plain non-ledger PERF_CARD is never scanned). Conservative + cheap:
+        # gated on file basename AND a content probe; any read failure → skip silently.
+        base = low.rsplit("/", 1)[-1]
+        if base.startswith("perf_card") or base.startswith("verdict") or base == "perf_cards.md":
+            try:
+                txt = (REPO_ROOT / p).read_text(errors="replace")
+            except Exception:
+                continue
+            if re.search(r"^\s{0,3}#{1,6}\s+candidates\b", txt, re.IGNORECASE | re.MULTILINE):
+                seen.append(p)
     return seen
 
 
+def check_ccdr_compliance():
+    """Pass: enforce that RESEARCH goes through CCDR (/deep-research via subagent, skill_177),
+    not ad-hoc WebSearch/WebFetch. Per the DR-default cost mandate (user 2026-06-24, MANAGER_RULES
+    'All research goes through CCDR'): CCDR is the $0 default for ~all DR; a worker free-forming
+    web research instead of /deep-research skips the structured fan-out/verify/cite workflow AND
+    re-explores DEAD angles (no skill_177 DEAD-list).
+
+    CONSERVATIVE — bias hard against false-positives (the idle fleet must stay clean):
+      - only ACTIVE workers whose current_goal is research-shaped (CCDR_RESEARCH_GOAL_REGEX);
+      - require >=4 distinct web-research markers in the recent pane window (a doc lookup or
+        two is fine — only a sustained ad-hoc web-research session trips it);
+      - AND zero CCDR markers (/deep-research / skill_177) in that window — CCDR fans out
+        WebSearch internally, so its presence means the worker IS compliant;
+      - per-worker cooldown so it nudges once, not every cycle."""
+    COOLDOWN_MIN = 90
+    MIN_WEB_MARKERS = 4
+    try:
+        reg = json.loads(WORKERS_FILE.read_text())
+    except Exception:
+        print("ccdr-compliance: no workers.json — skip")
+        return
+    stamps = _load_stamp_map(CCDR_COMPLIANCE_SEEN_FILE)
+    now = datetime.now()
+    flagged = []
+    for w in reg.get("workers", []):
+        if w.get("status") != "active":
+            continue
+        name = w.get("name")
+        if not name or w.get("role") == "manager":
+            continue
+        goal = (w.get("current_goal") or "").strip()
+        if not goal or not CCDR_RESEARCH_GOAL_REGEX.search(goal):
+            continue
+        if not session_alive(name):
+            continue
+        # per-worker cooldown
+        last = stamps.get(name)
+        if last:
+            try:
+                if (now - datetime.fromisoformat(last)).total_seconds() / 60 < COOLDOWN_MIN:
+                    continue
+            except (ValueError, TypeError):
+                pass
+        try:
+            out = subprocess.run([str(TP), name, "80"], capture_output=True, text=True, timeout=15)
+        except Exception:
+            continue
+        if out.returncode != 0:
+            continue
+        pane = out.stdout
+        # CCDR in use anywhere in the window → compliant, never flag.
+        if CCDR_MARKER_REGEX.search(pane):
+            continue
+        web_hits = len(WEB_RESEARCH_MARKER_REGEX.findall(pane))
+        if web_hits < MIN_WEB_MARKERS:
+            continue
+        flagged.append((name, web_hits))
+        stamps[name] = now.isoformat()
+        try:
+            subprocess.run([str(TS), name,
+                            "research must use CCDR (/deep-research via subagent), not ad-hoc websearch — skill_177"],
+                           check=False, capture_output=True, timeout=10)
+        except Exception:
+            pass
+    if flagged:
+        _save_stamp_map(CCDR_COMPLIANCE_SEEN_FILE, stamps)
+        print(f"ccdr-compliance: {len(flagged)} research worker(s) doing ad-hoc websearch (no /deep-research) — repoked toward CCDR:")
+        for name, hits in flagged:
+            print(f"  [ccdr-compliance] {name}: {hits} web-research markers, NO /deep-research in window — repoked (skill_177)")
+    else:
+        print("ccdr-compliance: research workers routing through CCDR (no ad-hoc websearch drift)")
+
+
 def check_dr_candidates_verified():
-    """Pass (RULE A — no cherry-picking + TREE completeness): a research round is NOT complete
-    until EVERY ranked candidate / numbered node has a verdict — a real verification-backend run
-    id + ALIVE/DEAD, OR an explicit `needs-paid-data:<feed>` flag. Catches: a worker runs DR, gets
-    N ranked candidates, verifies only the 1-2 it likes, commits a 'DEAD' verdict, silently drops
-    the rest (never falsified).
+    """Pass (RULE A — no cherry-picking + TREE completeness): a DR round is NOT complete until
+    EVERY ranked candidate / numbered node has a QC verdict — a real 32-hex QC bt-id + ALIVE/DEAD,
+    OR an explicit `needs-paid-data:<feed>` flag. The failure mode this catches: a research worker
+    runs DR, gets N ranked candidates, QC-tests only the 1-2 it likes, commits a 'DEAD' verdict,
+    and silently drops the rest — the dropped candidates were never falsified.
 
-    For each ACTIVE research worker, find the most-recent committed research doc with a
-    `## Candidates` ledger, parse it, and FLAG if either:
-      (a) any row's verdict cell is un-verified — message NAMES un-run nodes BY ID ('direction 2.2
-          proposed, no run'); OR
-      (b) the numbered tree has a GAP — a required ancestor/sibling id is missing (`2.3` present
-          but `2.1`/`2.2`/parent `2` absent = a dropped direction).
-    The ledger's `id` column = the dotted-decimal node number; the ledger is the COMPLETE
-    accounting of all rounds (every node → its own run id).
+    Mechanism: for each ACTIVE research worker, find the most-recent committed DR-research
+    doc that carries a `## Candidates` ledger, parse it, and FLAG if either:
+      (a) any candidate row's verdict cell is un-verified (no bt-id / ALIVE-DEAD / needs-paid-data)
+          — message NAMES the un-run nodes BY ID ('direction 2.2 proposed, no QC run'); OR
+      (b) the numbered tree has a GAP — a required ancestor/sibling id is missing (e.g. `2.3`
+          present but `2.1`/`2.2`/parent `2` absent = a dropped direction).
+    The `## Candidates` ledger's `id` column = the dotted-decimal node number; the ledger is the
+    COMPLETE accounting of all DR rounds (every node → its own QC bt-id).
 
-    CONSERVATIVE — only a CLEAR table WITH a verdict column AND a verdict-less row OR a tree gap
-    trips it; tree-gap checking only fires when the ledger HAS an `id` column with well-formed ids
-    (no id column / malformed → only verdict-completeness, back-compatible); no ledger → no flag;
-    per-(worker,doc) cooldown; all parsing exception-guarded."""
+    CONSERVATIVE — must not false-positive on the idle/clean fleet:
+      - only ACTIVE, research-shaped (CCDR_RESEARCH_GOAL_REGEX) workers with a live session;
+      - only flags a CLEAR `## Candidates` table that HAS a verdict column AND >=1 bt-id-less
+        row or a tree gap; if NO ledger is found (None), do NOT flag (worker may not have run DR);
+      - tree-gap checking only fires when the ledger HAS an `id` column with well-formed ids
+        (no id column / malformed ids → only the verdict-completeness check runs, back-compatible);
+      - per-(worker,doc) cooldown so it nudges once per ledger, not every cycle;
+      - all parsing is exception-guarded (malformed/empty tables → no flag, no crash)."""
     COOLDOWN_MIN = 120
     try:
         reg = json.loads(WORKERS_FILE.read_text())
     except Exception:
         print("dr-candidates: no workers.json — skip")
         return
-    docs = _recent_research_docs(window_hours=48)
+    docs = _recent_research_docs("", window_hours=48)
     if not docs:
-        print("dr-candidates: no recent research docs committed — skip")
+        print("dr-candidates: no recent DR-research docs committed — skip")
         return
     stamps = _load_stamp_map(DR_CANDIDATES_SEEN_FILE)
     now = datetime.now()
@@ -1135,33 +1424,40 @@ def check_dr_candidates_verified():
         if not name or w.get("role") == "manager":
             continue
         goal = (w.get("current_goal") or "").strip()
-        if not goal or not DR_RESEARCH_GOAL_REGEX.search(goal):
+        if not goal or not CCDR_RESEARCH_GOAL_REGEX.search(goal):
             continue
         if not session_alive(name):
             continue
-        ledger, doc_path = None, None
+        # Find this worker's most-recent committed DR doc that carries a parseable ledger.
+        # Shared tree → can't git-attribute by author; we scan the recent research docs and
+        # take the newest one WITH a `## Candidates` ledger as 'the round's output'.
+        ledger = None
+        doc_path = None
         no_ledger_doc = None  # a DR-conclusion doc that carries NO parseable ledger
         for rel in docs:
+            fp = REPO_ROOT / rel
             try:
-                txt = (REPO_ROOT / rel).read_text(errors="replace")
+                txt = fp.read_text(errors="replace")
             except Exception:
                 continue
             parsed = _parse_candidates_ledger(txt)
             if parsed is not None:
                 ledger, doc_path = parsed, rel
-                break  # newest-first
-            # NO-LEDGER EVASION: the parser returns None for a doc with no `## Candidates` section
-            # — but a worker can CHERRY-PICK BY OMISSION: run DR, verify the 1-2 it likes, and write
-            # a prose "explored N, all DEAD / closing lane" conclusion with NO ledger at all. The old
-            # code treated every None as "no DR ran → don't flag", so the easiest evasion of RULE A
-            # was to emit no ledger. Record the FIRST (newest) recent doc that READS LIKE A DR
-            # CONCLUSION (a DR/CCDR marker AND a round-verdict / closure phrase) yet has no ledger —
-            # that omission is itself a RULE-A violation. Stays conservative: a stub/in-progress note
-            # (no conclusion language) or a non-DR doc never trips it, and a real ledger anywhere
-            # recent (loop continues, ledger set above) wins over this.
+                break  # docs are newest-first
+            # NO-LEDGER EVASION (grill 2026-06-27): the parser returns None for a doc with no
+            # `## Candidates` section — but a worker can CHERRY-PICK BY OMISSION: run DR, QC-test
+            # the 1-2 it likes, and write a prose "explored N, all DEAD / closing lane" conclusion
+            # with NO ledger at all. The old code treated every None as "no DR ran → don't flag",
+            # so the easiest evasion of RULE A was to emit no ledger. Reproduced end-to-end:
+            # active research worker + prose 'all DEAD' doc → 0 nudges. Record the FIRST (newest)
+            # recent doc that READS LIKE A DR CONCLUSION (DR/CCDR marker AND a round-verdict /
+            # closure phrase) yet has no ledger — that omission is itself a RULE-A violation. Stays
+            # conservative: a stub/in-progress research note (no conclusion language) or a non-DR
+            # doc never trips it, and a real ledger anywhere recent (loop continues, ledger set
+            # above) wins over this.
             if (no_ledger_doc is None
                     and DR_CONCLUSION_DOC_REGEX.search(txt)
-                    and DR_DOC_MARKER_REGEX.search(txt)):
+                    and CCDR_MARKER_REGEX.search(txt)):
                 no_ledger_doc = rel
         if ledger is None:
             # No parseable ledger anywhere recent. If the worker committed a DR-CONCLUSION doc
@@ -1182,11 +1478,9 @@ def check_dr_candidates_verified():
             stamps[key] = now.isoformat()
             try:
                 subprocess.run([str(TS), name,
-                    f"[manager RULE A] {no_ledger_doc} reads like a DR conclusion (DR ran + a verdict was "
-                    f"drawn) but has NO `## Candidates` ledger — a DR round is NOT done until EVERY ranked "
-                    f"candidate lands in the ledger with a run id + ALIVE/DEAD, or needs-paid-data:<feed>. "
-                    f"No ledger = cherry-pick by omission (you verified only the 1-2 you liked). Emit the "
-                    f"`## Candidates` table for every candidate."],
+                    f"[manager RULE A] {no_ledger_doc} 看起来是 DR 结论(跑了 DR + 下了 verdict)但没有 `## Candidates` ledger — "
+                    f"DR round 不算 done 直到 EVERY ranked candidate 进 ledger 且有 32-hex bt-id + ALIVE/DEAD 或 needs-paid-data:<feed>。"
+                    f"没 ledger = cherry-pick by omission(只测了喜欢的 1-2 个就收)。补全 `## Candidates` 表(skill_177)。"],
                     check=False, capture_output=True, timeout=10)
             except Exception:
                 pass
@@ -1197,6 +1491,7 @@ def check_dr_candidates_verified():
         gaps = ledger["gaps"]
         if not unverified and not gaps:
             continue  # every node has a verdict AND the tree has no gaps → RULE A satisfied
+        # per-(worker,doc) cooldown
         key = f"{name}|{doc_path}"
         last = stamps.get(key)
         if last:
@@ -1207,19 +1502,20 @@ def check_dr_candidates_verified():
                 pass
         flagged.append((name, doc_path, unverified, len(verified), gaps))
         stamps[key] = now.isoformat()
+        # name un-run nodes BY ID where we have one ('direction 2.2 proposed, no QC run')
         unrun = ", ".join(str(x) for x in unverified_ids[:6]) + (" …" if len(unverified_ids) > 6 else "")
         gap_txt = ", ".join(gaps[:6]) + (" …" if len(gaps) > 6 else "")
         parts = []
         if unverified:
-            parts.append(f"un-run nodes (no run-id/verdict): {unrun}")
+            parts.append(f"un-run 节点(无 bt-id/verdict): {unrun}")
         if gaps:
-            parts.append(f"tree GAP (missing ancestor/sibling directions, silently dropped): {gap_txt}")
+            parts.append(f"树有 GAP(缺 ancestor/sibling 方向,被悄悄丢了): {gap_txt}")
         try:
             subprocess.run([str(TS), name,
-                f"[manager RULE A] you ran DR but the numbered tree isn't closed — in {doc_path} the "
-                f"## Candidates: " + "; ".join(parts) + ". Every numbered direction (every node at every "
-                f"level) needs its OWN run id + ALIVE/DEAD, or needs-paid-data:<feed>; if `2.3` exists then "
-                f"`2.1`/`2.2`/parent `2` must too. Don't cherry-pick the top 1-2."],
+                f"[manager RULE A] 你跑了 DR 但 numbered-tree 还没闭合 — {doc_path} 的 ## Candidates: "
+                + "; ".join(parts) +
+                "。每个 numbered 方向(每层每个节点)都要有自己的 QC run:32-hex bt-id + ALIVE/DEAD 或 "
+                "needs-paid-data:<feed>;`2.3` 在则 `2.1`/`2.2`/parent `2` 必须都在。别 cherry-pick top 1-2 就收(skill_177)。"],
                 check=False, capture_output=True, timeout=10)
         except Exception:
             pass
@@ -1229,7 +1525,7 @@ def check_dr_candidates_verified():
         print(f"dr-candidates: {len(flagged)} research worker(s) ran DR but left the numbered tree open (RULE A) — repoked:")
         for name, doc, unver, nv, gaps in flagged:
             gap_note = f", tree-gaps: {', '.join(gaps[:6])}" if gaps else ""
-            print(f"  [dr-candidates] {name}: {doc} — {len(unver)} un-run ({', '.join(unver[:6])}), {nv} verified{gap_note} → repoked (every numbered node needs a run, no gaps).")
+            print(f"  [dr-candidates] {name}: {doc} — {len(unver)} un-run ({', '.join(unver[:6])}), {nv} verified{gap_note} → repoked (every numbered node needs a QC run, no gaps).")
     if no_ledger_flagged:
         print(f"dr-candidates: {len(no_ledger_flagged)} DR-conclusion doc(s) with NO `## Candidates` ledger (cherry-pick-by-omission) — repoked:")
         for name, doc in no_ledger_flagged:
@@ -1242,23 +1538,24 @@ CRYPTO_LANE_WORKERS = {"crypto_dr", "crypto_breadth", "data_pipe", "crypto_fix"}
 
 
 def check_excluded_scope():
-    """Pass 5: detect drift into an operator-EXCLUDED topic by workers not assigned to it.
-    (Example excluded topic here is configured via EXCLUDED_SCOPE_REGEX.)
+    """Pass 5: detect drift into traditional-lane workers touching crypto.
 
-    The excluded topic is OPEN only to the dedicated lanes named in CRYPTO_LANE_WORKERS
-    (and any session whose name starts with that prefix). So this guard does NOT
-    blanket-ban the topic — it only fires on OTHER-lane workers drifting into it,
-    where it remains off-limits. Firing on the dedicated-lane workers was actively
-    harmful (it GRILLed them with 'STOP' every cycle → caused a scope hallucination)."""
+    Scope REVERSED 2026-05-30 (user, per feedback_no_crypto_scope): crypto is now OPEN
+    via the dedicated crypto_dr / crypto_breadth lanes, and data_pipe owns crypto DATA
+    infra (Binance Data Vision ingestion). So this guard NO LONGER blanket-bans crypto —
+    it only fires on TRADITIONAL-lane workers (ai_dag/dag_alt/theme_dag/qqqe_risk/…)
+    drifting into crypto, which remains off-limits for those lanes. Firing on the
+    crypto-lane workers was actively harmful (it GRILLed data_pipe with 'STOP crypto'
+    every cycle → contributed to its 2026-06-01 scope-reversal hallucination)."""
     if not WATCH_LIST.exists():
         return
     sessions = [l.strip() for l in WATCH_LIST.read_text().splitlines() if l.strip() and not l.startswith("#")]
     findings = []
     for sess in sessions:
         if sess in CRYPTO_LANE_WORKERS or sess.startswith("crypto"):
-            continue  # the excluded topic IS their mandate — not drift
-            # startswith guard: dedicated-lane recruits are named with a shared prefix,
-            # so a new recruit missed by the static set still gets exempted (no bogus STOP)
+            continue  # crypto IS their mandate (or crypto-data infra) — not drift
+            # startswith guard: manager names all crypto-lane recruits crypto_* (e.g.
+            # crypto_fix 2026-06-10 was missed by the static set → bogus STOP sent)
         try:
             out = subprocess.run([str(TP), sess, "50"], capture_output=True, text=True, timeout=15)
             if out.returncode != 0:
@@ -1269,7 +1566,7 @@ def check_excluded_scope():
                 # Skip if keyword is in an exclusion/echo context (worker COMPLYING, not pursuing)
                 if re.search(r"STOP|排除|OUT.?of.?scope|不要|exclud|out of scope|don.t|別碰|别碰|skip|no crypto", ctx, re.IGNORECASE):
                     continue
-                # Only fire if there is ACTION intent near the keyword (actually pursuing the topic)
+                # Only fire if there is ACTION intent near the keyword (actually pursuing crypto)
                 if not re.search(r"request|build|implement|pursue|key|backtest|BT|pivot to|启动|搭建|接入|跑", ctx, re.IGNORECASE):
                     continue
                 findings.append((sess, m.group(0)))
@@ -1277,12 +1574,12 @@ def check_excluded_scope():
             continue
     if findings:
         for sess, kw in findings:
-            print(f"  [excluded-scope] {sess}: '{kw}' — this topic is OUT of scope, GRILL")
+            print(f"  [excluded-scope] {sess}: '{kw}' — crypto is OUT of scope, GRILL")
             try:
-                subprocess.run([str(TS), sess, f"STOP: '{kw}' 是 operator 排除的 scope(此 lane 不做)。回到你被分配的 lane / 等 manager 战略方向,不要碰这个排除 topic。"], check=False, capture_output=True, timeout=10)
+                subprocess.run([str(TS), sess, f"STOP: '{kw}' 是用户排除的 scope(crypto 不做)。回到 dag-sa risk-overlay / 等 manager 战略方向,不要碰 crypto/perp/defi。"], check=False, capture_output=True, timeout=10)
             except Exception:
                 pass
-        print(f"excluded-scope-detection: {len(findings)} worker(s) drifted to an excluded topic")
+        print(f"excluded-scope-detection: {len(findings)} worker(s) drifted to crypto")
     else:
         print("excluded-scope-detection: no excluded-scope drift")
 
@@ -1305,7 +1602,7 @@ def check_dropped_tasks():
     """Pass 6: re-surface DROPPED side-tasks — the mirror of deliverable-detection.
 
     deliverable-detection (pass 1) only acts on tasks whose deliverable file EXISTS.
-    This catches the opposite failure: a task is assigned,
+    This catches the opposite failure (VGT T-a497d42d 2026-05-28): a task is assigned,
     the worker writes a skeleton but never produces the deliverable, then pivots to a
     higher-priority mandate. The side-task scrolls out of the pane → the 15-min brain
     is pane-driven + task-blind → the task is silently dropped until the hourly audit.
@@ -1346,7 +1643,7 @@ def check_dropped_tasks():
         # assignment is a pre-existing/unrelated file (worker pointed at a stale path, or
         # dropped an empty stub at creation) → the task is still genuinely DROPPED. Without
         # this, pass 1 mis-buckets such a file as "stale→manager verify+flip" (looks-done)
-        # and the dropped task gets closed against a DRIFTED artifact — the exact
+        # and the dropped task gets closed against a DRIFTED artifact — the exact VGT-class
         # silent-drop this pass exists to catch, re-opened via the bare existence gate.
         # (created is None → can't establish staleness → defer to pass 1, old behavior.)
         if exists and (created is None or dmtime is None or dmtime >= created):
@@ -1387,14 +1684,14 @@ def check_dropped_tasks():
 
 
 def check_uncommitted():
-    """Pass 7: ping workers to COMMIT + push their work (per the always-commit rule).
+    """Pass 7: ping workers to COMMIT + push their work (per feedback_always_commit).
 
-    SHARED working tree — all workers commit to the SAME repo HEAD (one tree shared
-    by the fleet). So `git status` is GLOBAL, not
+    SHARED working tree — all workers commit to the SAME repo HEAD (user confirmed
+    2026-05-28: 他们都是 commit 到 head 的 same tree). So `git status` is GLOBAL, not
     per-worker. We:
       1. list dirty paths (git status --short), skip files touched <GRACE_MIN ago (mid-write)
       2. attribute each path to a watched worker by matching the path / its leaf
-         module-dir name against that worker's pane tail
+         strategy-dir name against that worker's pane tail
       3. ping each IDLE worker with ITS OWN paths + a HARD anti-`git add -A` warning —
          on a shared tree, `-A`/`.` would sweep in other workers' half-done files
     Unattributable dirty paths are logged for the manager to triage. Throttled per worker.
@@ -1414,12 +1711,12 @@ def check_uncommitted():
             continue
         path = ln[3:].strip().strip('"')
         full = REPO_ROOT / path
-        # `_`-prefixed DIR under a strategies/ tree = explore-not-ship scratch probe
+        # `_`-prefixed DIR under lean/strategies/ = explore-not-ship scratch probe
         # (convention documented in probe headers, e.g. "_-prefixed research probe").
         # Intentionally never committed → skip so it isn't nudged-to-commit nor re-escalated
-        # to manager-triage every cycle (else throwaway probes get flagged dozens of times).
-        # Scoped to a DIRECTORY component: a `_`-prefixed helper FILE inside a real module
-        # dir (e.g. some-module/_dispatch.py) still gets nudged.
+        # to manager-triage every cycle (grill 2026-06-04: 2 buy-hold probes flagged 31×/~8h).
+        # Scoped to a DIRECTORY component: a `_`-prefixed helper FILE inside a real strategy
+        # dir (e.g. v252-degross-xlkp85/_optconfig_dispatch.py) still gets nudged.
         _pp = Path(path.rstrip("/")).parts
         if "strategies" in _pp:
             _dirparts = _pp if (path.endswith("/") or full.is_dir()) else _pp[:-1]
@@ -1454,26 +1751,26 @@ def check_uncommitted():
             goals[w["name"]] = f"{w.get('current_goal','')} {w.get('role','')}"
     except Exception:
         pass
-    # Distinctive key per path = the module/parent dir, NOT a generic filename.
-    # ('config.json'/'main.py' appear in many panes → false attribution, e.g. a
-    # cross-worker misfire.) Require key length >=5; match the
+    # Distinctive key per path = the strategy/parent dir, NOT a generic filename.
+    # ('config.json'/'main.py' appear in many panes → false attribution, e.g. the
+    # 2026-05-28 data_pipe×momo-pairs misfire.) Require key length >=5; match the
     # FULL key as a substring (conservative — ambiguous/short keys stay unattributed
     # for manager triage rather than risk a wrong commit-ping on a shared tree).
     GENERIC_LEAVES = {"config.json", "main.py", "__init__.py", "PERF_CARD.md", "research.py", "research.ipynb"}
     # Parent dirs that are NOT distinctive enough to attribute on (would match many panes).
-    GENERIC_DIRS = {"strategies", "candidates", "modules", "research", "assets",
-                    "src", "bin", "data", "tests", "lib", "pkg", "your-repo", "__pycache__"}
+    GENERIC_DIRS = {"strategies", "candidates", "lean", "factors", "research", "alt_data",
+                    "src", "bin", "data", "tests", "qqqe", "qqqr", "apexnova", "__pycache__"}
     attributed = {}
     claimed = set()
     for path in dirty:
         parts = Path(path.rstrip("/")).parts
         leaf = parts[-1]
         # Candidate keys: the distinctive leaf (if non-generic) AND the distinctive
-        # parent module-dir. A one-off script filename (e.g. _dispatch.py)
-        # often does NOT appear in the worker's pane/goal, but its module DIR almost
-        # always does (it's in the /goal, ledger path, file listings). Fix:
-        # some-module/_dispatch.py went UNATTRIBUTED because only the
-        # leaf was keyed; the dir matched another worker's pane. Try both, attribute on first
+        # parent strategy-dir. A one-off script filename (e.g. _optconfig_dispatch.py)
+        # often does NOT appear in the worker's pane/goal, but its strategy DIR almost
+        # always does (it's in the /goal, PERF_CARD path, file listings). 2026-05-28 fix:
+        # v252-degross-xlkp85/_optconfig_dispatch.py went UNATTRIBUTED because only the
+        # leaf was keyed; the dir matched qqqe_risk's pane. Try both, attribute on first
         # match; both keys still require len>=5 + full-substring (conservative).
         keys = []
         if leaf not in GENERIC_LEAVES:
@@ -1490,15 +1787,15 @@ def check_uncommitted():
                 claimed.add(path)
                 break
     # Fallback: deterministic path-component → unique-session-name-token match.
-    # The pane-substring pass above misses files whose module dir is referenced
-    # by a SHORTER token than the full dir name (e.g. a worker's pane says
-    # "alpha" but the dir is "alpha-crosstest" → full-substring fails;
+    # The pane-substring pass above misses files whose strategy dir is referenced
+    # by a SHORTER token than the full dir name (e.g. qqqe_risk's pane says
+    # "degross" but the dir is "degross-etf-crosstest" → full-substring fails;
     # and loose token-splitting is unsafe once several workers transiently mention
-    # "alpha"). A path COMPONENT equal to a session-name token that is UNIQUE
-    # across the watchlist (e.g. a token owned by exactly one worker) is an unambiguous
-    # owner signal independent of volatile pane text. Shared infra/cache dir names are
+    # "degross"). A path COMPONENT equal to a session-name token that is UNIQUE
+    # across the watchlist (e.g. "qqqe" → only qqqe_risk) is an unambiguous owner
+    # signal independent of volatile pane text. Shared infra/cache dir names are
     # excluded — they name no owner even when unique.
-    SHARED_TOKENS = {"data", "lib", "tests", "infra", "research", "assets"}
+    SHARED_TOKENS = {"data", "lean", "tests", "infra", "research", "factors"}
     sess_tokens = {}
     for sess in sessions:
         for t in re.split(r"[_\-]", sess):
@@ -1555,10 +1852,10 @@ def check_goal_stale():
     """Pass 8: enforce that the manager sets a PERSISTENT /goal when it dispatches
     work — not just a tactical --nudge.
 
-    Root cause (operator lesson): when the manager assigned tasks all cycle via
-    `cc-goal <w> --nudge "..."` (plain ts, NO /goal anchor), each worker's status-bar
-    /goal stayed frozen at its
-    recruit-time mandate. A worker then drifted on a 22-min-stale anchor, dropped a
+    Root cause (user-flagged 2026-06-01 '我发现你又开始不发goal了！你需要更新机制哦'):
+    the manager assigned tasks all cycle via `cc-goal <w> --nudge "..."` (plain ts,
+    NO /goal anchor), so each worker's status-bar /goal stayed frozen at its
+    recruit-time mandate. data_pipe then drifted on a 22-min-stale anchor, dropped a
     step, and hallucinated a scope reversal. cc-goal's DEFAULT (non-nudge) path now
     stamps workers.json `goal_updated`; this guard catches the failure: a worker has
     an OPEN task whose created_at is NEWER than its last /goal refresh (or /goal never
@@ -1570,18 +1867,19 @@ def check_goal_stale():
     Guards: skip manager/multi assignees; GRACE so a just-created task isn't flagged
     before the manager has had a cycle to set /goal; throttle per (worker,task).
 
-    Recruit-ordering grace (observed false-positive on fresh hires): cc-recruit sets the
-    /goal anchor FIRST (registry step stamps goal_updated), then creates the cc-task
-    ~seconds-to-a-minute LATER. So on EVERY freshly-recruited worker
-    `goal_updated < task_ts` by a tiny margin — the raw `last_goal >= task_ts` test reads
-    "task is newer than the anchor -> goal stale" and flags an actively-working hire on
-    its CORRECT goal. That is a recruit-ordering artifact, not a stale goal: a genuine
-    "only --nudged, never re-/goal" drift has the anchor predating the task by a LARGE
-    margin AND an idle pane. Two guards below close it WITHOUT becoming a bypass:
+    Recruit-ordering grace (grill 2026-06-28, OBSERVED false-positive on fresh hires
+    convx/dagrt/spmo): cc-recruit sets the /goal anchor FIRST (registry step stamps
+    goal_updated), then creates the cc-task ~seconds-to-a-minute LATER. So on EVERY
+    freshly-recruited worker `goal_updated < task_ts` by a tiny margin — the raw
+    `last_goal >= task_ts` test reads "task is newer than the anchor → goal stale" and
+    flags an actively-working hire on its CORRECT goal. That is a recruit-ordering
+    artifact, not a stale goal: a genuine "only --nudged, never re-/goal" drift has the
+    anchor predating the task by a LARGE margin AND an idle pane. Two guards below close
+    it WITHOUT becoming a bypass:
       (1) RECRUIT_SKEW: if the anchor predates the task by < RECRUIT_SKEW_MIN, treat it
-          as the recruit handoff, not a stale goal -- skip.
+          as the recruit handoff, not a stale goal — skip.
       (2) ACTIVITY gate: a worker whose pane is mid-work (MIDWORK_REGEX) is actively
-          working -- NOT goal-stale -- skip (mirrors check_dropped_tasks' idle-guard).
+          working — NOT goal-stale — skip (mirrors check_dropped_tasks' idle-guard).
     A truly abandoned goal (anchor older than the task by >= RECRUIT_SKEW_MIN, OR never
     set, AND an idle/unreadable pane) STILL flags."""
     GRACE_MIN = 20
@@ -1628,21 +1926,21 @@ def check_goal_stale():
             continue  # /goal anchor is fresher than the task → properly dispatched
         # (1) RECRUIT-ORDERING GRACE: cc-recruit stamps goal_updated then creates the
         # task ~seconds later, so on a fresh hire the anchor predates the task by a tiny
-        # margin. That is the recruit handoff, NOT a stale goal -- don't flag. A genuine
+        # margin. That is the recruit handoff, NOT a stale goal — don't flag. A genuine
         # never-re-/goal drift has the anchor predating the task by a LARGE margin (the
         # manager only --nudged for a long time), which still falls through.
         if last_goal is not None and (task_ts - last_goal).total_seconds() / 60 < RECRUIT_SKEW_MIN:
             continue
         # (2) ACTIVITY GATE: a worker whose pane is mid-work is actively working its goal
-        # -- by definition not goal-stale. Skip (mirrors check_dropped_tasks' idle-guard).
-        # An unreadable pane is treated as inconclusive -> fall through to flag (don't
+        # — by definition not goal-stale. Skip (mirrors check_dropped_tasks' idle-guard).
+        # An unreadable pane is treated as inconclusive → fall through to flag (don't
         # silently swallow a genuine stale goal just because tmux capture failed).
         try:
             pane = subprocess.run([str(TP), worker, "12"], capture_output=True, text=True, timeout=12).stdout
         except Exception:
             pane = ""
         if pane and MIDWORK_REGEX.search(pane):
-            continue  # actively working -> not goal-stale
+            continue  # actively working → not goal-stale
         # throttle on (worker, task)
         key = f"{worker}:{info['id']}"
         last = stamps.get(key)
@@ -1665,14 +1963,14 @@ def check_goal_stale():
 
 
 def check_session_health():
-    """Pass 16: LIVE pane health sweep over every watch.list session (operator lesson:
-    some workers' servers go down, and some have the wrong kind of anchor set).
+    """Pass 16: LIVE pane health sweep over every watch.list session (user-flagged
+    2026-06-10 '有些员工server down了 你关照下 而且有些set的不是goal是不是需要调整机制').
     Two failure modes the metadata-only passes can't see:
 
     (a) /goal anchor LOST on the live session — footer no longer shows '◎ /goal
         active' even though workers.json says it was set. check_goal_stale compares
         TIMESTAMPS (workers.json goal_updated vs tasks.jsonl) and SKIPS workers with
-        no open cc-task, so a worker can sit goal-less for an hour unseen.
+        no open cc-task, so dag_paper 2026-06-10 sat goal-less for an hour unseen.
         FIX: auto re-anchor from workers.json current_goal — UNLESS an unsent
         input-box draft exists (ts would splice INTO the user's draft; the manual
         RC-draft protocol owns that case) or a dialog is hiding the footer.
@@ -1687,12 +1985,20 @@ def check_session_health():
         return
     sessions = [l.strip() for l in WATCH_LIST.read_text().splitlines() if l.strip() and not l.startswith("#")]
     goals = {}
+    idled = set()  # workers EXPLICITLY parked via `cc-goal --clear` (registry current_goal=="")
     goal_set_at = {}  # {name: datetime} — when cc-goal last VERIFIED-anchored a /goal (durable)
     try:
         for w in json.loads(WORKERS_FILE.read_text()).get("workers", []):
-            g = (w.get("current_goal") or "").strip()
-            if g:
-                goals[w["name"]] = g
+            # `cc-goal --clear <name>` sets current_goal="" as the deliberate
+            # "parked / idle, no goal wanted" signal (keepalive already honors it
+            # and will NOT re-anchor). Distinguish that empty string from a missing
+            # key: present-but-empty == idle, absent == never had a goal recorded.
+            if "current_goal" in w:
+                g = (w.get("current_goal") or "").strip()
+                if g:
+                    goals[w["name"]] = g
+                else:
+                    idled.add(w["name"])
             gu = w.get("goal_updated")
             if gu:
                 try:
@@ -1732,9 +2038,24 @@ def check_session_health():
         tail = "\n".join(pane.splitlines()[-25:])
         # ---- (b) blocked states FIRST: dialogs hide the footer, so the goal check
         #          below would false-positive; and never auto-type into a dialog ----
-        dialog = "Enter to confirm" in tail
-        limit_block = ("hit your session limit" in tail) and ("usage credits" not in tail)
-        api_err = re.search(r"API Error|overloaded_error|Connection (?:error|lost)|server (?:is )?(?:down|overloaded)|fetch failed", tail, re.IGNORECASE)
+        # BLOCKED/API-error must be detected at the pane BOTTOM ONLY (the LAST turn) —
+        # NOT in the wider 25-line window, where a STALE scrollback error (e.g. an "API
+        # Error: Overloaded" from hours ago that the worker already RECOVERED from) sits
+        # ABOVE a clean idle prompt and false-flags a healthy worker as BLOCKED every
+        # cycle (observed: polymkt flagged 3 cycles on a ~3h-old stale error while its
+        # pane bottom showed an idle prompt). Mirror cc-watch's transient-stall guard
+        # discipline (it uses tail -15 on a scrollback-inclusive `tp` capture). Here
+        # capture-pane -p is the VIEWPORT only, and the idle footer is ~5 lines, so a
+        # genuinely-dead turn's error sits ≤~3 lines above the footer (≤8 from bottom).
+        # A 10-line window = footer + last-turn bottom: a freshly-died turn / live
+        # dialog / limit banner (all of which render at the BOTTOM) still fire, but a
+        # stale error with any post-recovery output beneath it (idle/commit/done line)
+        # no longer matches. (The wider `tail` below is kept for the /goal-anchor frame
+        # check, which legitimately needs the footer + a few lines.)
+        block_tail = "\n".join(pane.splitlines()[-10:])
+        dialog = "Enter to confirm" in block_tail
+        limit_block = ("hit your session limit" in block_tail) and ("usage credits" not in block_tail)
+        api_err = re.search(r"API Error|overloaded_error|Connection (?:error|lost)|server (?:is )?(?:down|overloaded)|fetch failed", block_tail, re.IGNORECASE)
         if dialog or limit_block or api_err:
             if throttled(f"{sess}:blocked"):
                 continue
@@ -1752,32 +2073,46 @@ def check_session_health():
             continue  # alt screen / non-claude frame → footer absence proves nothing
         if "/goal active" in tail:
             continue
-        # FALSE-POSITIVE GUARD: a worker can be flagged goal-lost WHILE actively working its
-        # correct, freshly-set goal, then auto-re-anchored — eroding signal + risking goal-drift.
-        # The footer '◎ /goal active (Xm)' marker is a VIEWPORT-RENDER artifact, not a durable
-        # state: it legitimately drops out of the last-25-line window for a HEALTHY worker whenever
-        # (a) the worker is mid-turn/thinking (footer not yet re-rendering the marker), or (b) a
-        # transient overlay occupies or pushes out the footer slot. The DURABLE truth lives in
-        # workers.json goal_updated, which cc-goal stamps ONLY after VERIFYING the anchor landed
-        # ('Goal set:' echo). Two guards add the missing "actively-working / fresh-anchor" gate
-        # WITHOUT loosening into a bypass: a genuinely abandoned anchor (old/missing goal_updated,
-        # no overlay) STILL flags.
+        # FALSE-POSITIVE GUARD (meta-grill 2026-06-27: poly2/dbento/spmo all flagged
+        # goal-lost at 18:09:41 WHILE actively working their correct, freshly-set goals,
+        # then auto-re-anchored — eroding signal + risking goal-drift). The footer
+        # '◎ /goal active (Xm)' marker is a VIEWPORT-RENDER artifact, not a durable
+        # state: it legitimately drops out of the last-25-line window for a HEALTHY
+        # worker whenever (a) the worker is mid-turn/thinking (footer not yet re-rendering
+        # the marker — dbento was on '✻ Baked 53s'), (b) a transient overlay occupies or
+        # pushes out the footer slot — the '/rc active' RC-draft indicator (poly2) or the
+        # 'How is Claude doing this session?' feedback survey (spmo). cc-goal itself warns
+        # (cc-goal:144) that grepping the footer string is false-positive-prone. The
+        # DURABLE truth lives in workers.json goal_updated, which cc-goal stamps ONLY
+        # after VERIFYING the anchor landed ('Goal set:' echo). Two guards below add the
+        # missing "actively-working / fresh-anchor" gate WITHOUT loosening into a bypass:
+        # a genuinely abandoned anchor (old/missing goal_updated, no survey) STILL flags.
         #
-        # (a) overlay SUPPRESSES the '◎ /goal active' footer line even though the anchor is fine.
-        #     Two observed overlays: the 'How is Claude doing this session?' feedback survey (same
-        #     hazard class as the 'Enter to confirm' dialog above: auto-ts would type a rating INTO
-        #     the survey), and the '/rc active' RC-draft statusline state (RC mode only exists on an
-        #     anchored session, so its presence is positive proof the anchor is NOT lost). Marker-
-        #     absence under either overlay proves nothing — skip this cycle.
+        # (a) overlay SUPPRESSES the '◎ /goal active' footer line even though the anchor
+        #     is fine. Two observed overlays: the 'How is Claude doing this session?'
+        #     feedback survey (spmo — same hazard class as the 'Enter to confirm' dialog
+        #     above: auto-ts would type a rating INTO the survey), and the '/rc active'
+        #     RC-draft statusline state (poly2 — the bypass line shows '/rc active' and the
+        #     goal marker line is suppressed; RC mode only exists on an anchored session, so
+        #     its presence is positive proof the anchor is NOT lost). Marker-absence under
+        #     either overlay proves nothing — skip this cycle.
         if "How is Claude doing this session" in tail or "/rc active" in tail:
             continue
-        # (b) FRESH durable anchor: cc-goal verified-anchored a /goal within the recency window →
-        #     the missing footer marker is a render artifact, not a lost anchor. A genuinely-lost
-        #     anchor has a STALE (or absent) goal_updated and still falls through. Window =
-        #     COOLDOWN_MIN so at most one cycle can slip past a real loss that happened to follow a
-        #     recent set; the next cycle (anchor still missing, goal_updated now older) catches it.
+        # (b) FRESH durable anchor: cc-goal verified-anchored a /goal within the recency
+        #     window → the missing footer marker is a render artifact, not a lost anchor.
+        #     A genuinely-lost anchor has a STALE (or absent) goal_updated and still falls
+        #     through. Window = COOLDOWN_MIN so at most one cycle can slip past a real loss
+        #     that happened to follow a recent set; the next cycle (anchor still missing,
+        #     goal_updated now older) catches it.
         gset = goal_set_at.get(sess)
         if gset is not None and (now - gset).total_seconds() / 60 < COOLDOWN_MIN:
+            continue
+        # DELIBERATE IDLE: `cc-goal --clear` set registry current_goal="" — the
+        # manager parked this worker on purpose, so the missing footer anchor is
+        # EXPECTED, not a lost anchor. Skip (do NOT re-anchor to an empty goal).
+        # (A NON-empty current_goal that no longer matches the live pane still falls
+        # through below and is flagged as a genuine lost anchor.)
+        if sess in idled:
             continue
         if throttled(f"{sess}:goal-lost"):
             continue
@@ -1813,44 +2148,45 @@ def check_session_health():
 
 
 # Run-type = a task whose success criterion is "an EXECUTION engine actually RUNS the
-# loop end-to-end" (the verification backend producing a result), not "a file exists".
+# loop end-to-end" (a Lean BT consuming the data), not "a file exists / data ingested".
 # Keyword-gated TIGHT to engine-execution plumbing. Deliberately EXCLUDES bare
-# 'pipeline'/'ingest' (data-ingestion tasks prove via a written data panel, NOT a run —
-# check_deliverables owns those) and bare 'run' (every task says it).
-# Only genuine make-the-engine-run signals: smoke test, close-the-loop, local-engine,
-# container/docker. The keyword set below is plugin-specific (here it targets the
-# project's local execution backend); ingestion/format-conversion tasks do not match.
-# NOTE on excluded alternatives: format-conversion phrases denote INGESTION (writing
-# data into the engine's on-disk format), which is the OPPOSITE of running a job —
-# including them re-introduced ingestion false-positives. A genuine close-the-loop /
-# smoke-test / local-engine case is caught by the run-execution phrases below.
+# 'pipeline'/'ingest' (data-ingestion tasks prove via a written data panel, NOT a BT —
+# check_deliverables owns those) and bare 'backtest'/'BT' (every quant task says it).
+# Only genuine make-the-engine-run signals: smoke test, close-the-loop, lean-local,
+# colima/docker, →lean. The 2026-06-01 docker case ('close the Binance→Lean loop',
+# 'smoke test', 'lean local') matches; the alt-data refresh/ingestion tasks do not.
+# NOTE on excluded alternatives (learned in the 5-round grill): '→lean' / 'to lean
+# format' denote INGESTION (writing data into Lean's on-disk format), which is the
+# OPPOSITE of running a BT — including them re-introduced ingestion false-positives.
+# The genuine 2026-06-01 docker case ('close the Binance→Lean loop', 'smoke test',
+# 'lean local') is fully caught by the run-execution phrases below WITHOUT the arrows.
 RUN_TYPE_REGEX = re.compile(
     r"smoke[\s_-]?test|close the .{0,20}loop|local[\s_-]?lean|lean[\s_-]?local|"
     r"lean[\s_-]?cli|colima|\bdocker\b|"
     r"end[\s_-]?to[\s_-]?end (bt|backtest|run)",
     re.IGNORECASE)
-# Tokens that PROVE an engine run happened — kept ENGINE-LOG-SPECIFIC. Loose tokens
-# (a metric label, 'bars read') appear in ordinary research/verdict docs and would make
+# Tokens that PROVE an engine run happened — kept Lean-BT-log-SPECIFIC. Loose tokens
+# ('Sharpe Ratio', 'bars read') appear in ordinary research/verdict docs and would make
 # the check wrongly believe a run happened (false negative), so they are excluded; a
-# real metric ledger is already a separate proof path in _has_run_proof.
+# real BT's PERF_CARD.md is already a separate proof path in _has_run_proof.
 RUN_PROOF_TOKEN = re.compile(
     r"SMOKE_BAR_COUNT|Successfully ran|Total Orders|Algorithm Id|"
     r"BACKTEST(ING)? (PASS|OK|COMPLETE)",
     re.IGNORECASE)
 
-# A metric ledger only proves a RUN if it carries an engine-emitted substance signature:
-# a 32-hex result-artifact / run id, OR a real METRIC (a metric LABEL co-present with a
-# >=2-fractional-digit value — "metric_a 0.997", a "| metric_b |…| 33.20 |" table).
-# The bare-decimal hole: the OLD
-# `\d+\.\d{2,}` alternative matched ANY incidental decimal, and the container/local-engine
-# plumbing notes this pass targets are FULL of them (timing "0.85s", python "3.13", row
-# counts) — so a feasibility note with NO real run passed as proof and silenced the alert.
-# Requiring a metric LABEL alongside the value kills
-# that: a plumbing/feasibility note carries decimals but no metric label.
-# Label+value are checked FILE-GLOBAL (not within-line) so table-formatted ledgers (label in
+# A PERF_CARD only proves a RUN if it carries an engine-emitted substance signature:
+# a 32-hex QC backtest-id, OR a real PERF METRIC (a perf-metric LABEL co-present with a
+# >=2-fractional-digit value — "Sharpe 0.997", a "| MaxDD |…| 33.20 |" table, "CAGR 32.066").
+# Grill 2026-06-05 (check_run_proof) reproduced the bare-decimal hole: the OLD
+# `\d+\.\d{2,}` alternative matched ANY incidental decimal, and the docker/colima/lean-local
+# plumbing notes this pass targets are FULL of them (timing "0.85s", python "3.13", bar
+# counts) — so a feasibility note with NO real BT (the exact 2026-06-01 data_pipe failure)
+# passed as proof and silenced the alert. Requiring a metric LABEL alongside the value kills
+# that: a plumbing/feasibility note carries decimals but no Sharpe/CAGR/MaxDD/Sortino label.
+# Label+value are checked FILE-GLOBAL (not within-line) so table-formatted cards (label in
 # the header row, value in the next row) still pass — within-line anchoring would false-
 # negative real tables and wrongly auto-reopen landing-debt tasks. A bare `touch`, an
-# all-TBD stub, and "the metric was good, trust me" (no value) still correctly fail. Version
+# all-TBD stub, and "Sharpe was good, trust me" (no value) still correctly fail. Version
 # strings (v1.0, 1 fractional digit) do NOT match the value. Mirrors the .log 2048-byte gate.
 PERF_CARD_BTID = re.compile(r"[0-9a-f]{32}")
 PERF_CARD_METRIC_LABEL = re.compile(
@@ -1862,15 +2198,14 @@ PERF_CARD_VALUE = re.compile(r"[-+]?\d+\.\d{2,}")
 
 def _has_run_proof(deliv: str) -> bool:
     """True if an EXECUTION-GENERATED proof artifact exists under the deliverable's
-    subtree. Three accepted proofs, all hard-to-fake (artifact names are plugin-specific,
-    set here to the project's local execution backend):
-      1. a non-empty result-output dir (the local engine writes this),
-      2. a metric ledger CARRYING A SUBSTANCE SIGNATURE (32-hex result-artifact / run id
-         or a real metric value) — a touch/prose/all-TBD/feasibility ledger is NOT proof,
+    subtree. Three accepted proofs, all hard-to-fake:
+      1. a non-empty `backtests/` output dir (Lean local engine writes this),
+      2. a PERF_CARD.md CARRYING A SUBSTANCE SIGNATURE (32-hex bt-id or a real metric
+         value, per PERF_CARD_SIG) — a touch/prose/all-TBD/feasibility card is NOT proof,
       3. a run-success token in a `.log` file (raw engine/CLI stdout).
-    CRITICAL: a run-success token in a `.md`/`.txt` is NOT
-    accepted — a worker can simply TYPE 'Successfully ran / 2208 rows' into a markdown
-    self-report (this happened before any real run). Prose is
+    CRITICAL (the 2026-06-01 lesson): a run-success token in a `.md`/`.txt` is NOT
+    accepted — a worker can simply TYPE 'Successfully ran / 2208 bars' into a markdown
+    self-report (data_pipe's INGEST.md did exactly this before any real run). Prose is
     not proof; only engine-emitted artifacts count. File EXISTENCE only (not freshness —
     a stale-but-real run still proves the loop runs)."""
     spec = _deliv_path(deliv)
@@ -1906,8 +2241,8 @@ def _has_run_proof(deliv: str) -> bool:
                 # ALL run-success tokens are TYPEABLE — incl. the SMOKE_BAR_COUNT
                 # sentinel, whose name is in THIS (worker-readable) source, so the old
                 # "instrumented sentinel, not forgeable → accept at any size" carve-out
-                # was a 21-byte backdoor (`echo "SMOKE_BAR_COUNT=2208" > x.log` passed).
-                # No real harness emits SMOKE_BAR_COUNT
+                # was a 21-byte backdoor (`echo "SMOKE_BAR_COUNT=2208" > x.log` passed;
+                # grill 2026-06-03 reproduced it). No real harness emits SMOKE_BAR_COUNT
                 # anywhere in the repo, so subjecting it to the same size floor costs no
                 # legitimate proof. The other prose tokens ('Successfully ran' / 'Total
                 # Orders' / 'Algorithm Id' / 'BACKTEST PASS') are equally typeable (a
@@ -1925,13 +2260,12 @@ def _has_run_proof(deliv: str) -> bool:
 
 
 def check_run_proof():
-    """Pass 9: a RUN-TYPE task (close-the-loop / pipeline / ingest / smoke / local-engine)
-    must not be `completed` without an EXECUTION-PROOF artifact. Catches the failure
-    (operator lesson: 'a container job never actually completed the goal — why was it
-    not supervised?'): a close-the-loop task was treated as done because the ingested
-    output existed and looked format-correct — but a container/mount blocker meant a real
-    end-to-end run had NEVER happened, so the loop did not actually work. Format/file-
-    existence ≠ loop runs.
+    """Pass 9: a RUN-TYPE task (close-the-loop / pipeline / ingest / smoke / lean-local)
+    must not be `completed` without an EXECUTION-PROOF artifact. Catches the failure the
+    user flagged 2026-06-01 ('之前docker没有真的完成goal为什么你没有监督'): data_pipe's
+    Binance→Lean loop was treated as done because the ingested zip existed and looked
+    format-correct — but a DOCKER_HOST + colima-mount blocker meant a real Lean BT had
+    NEVER run, so the loop did not actually work. Format/file-existence ≠ loop runs.
 
     check_completed_integrity (pass 4) only fires on an explicit WORK-REMAINS marker in
     the deliverable text; a clean-looking-but-never-executed loop has no such marker, so
@@ -1939,9 +2273,9 @@ def check_run_proof():
 
     ALERT-ONLY (does NOT auto-block): proof-detection is heuristic, so a false positive
     must not destructively reopen genuinely-done work (an early auto-block draft wrongly
-    reopened legit refresh tasks). Like check_goal_stale, this is a MANAGER
+    reopened 4 legit alt-data refresh tasks). Like check_goal_stale, this is a MANAGER
     self-check — loud actionable stdout the manager reads in its cron cycle; the fix is
-    the manager RUNNING the end-to-end job itself and confirming expected output before
+    the manager RUNNING the end-to-end BT itself and confirming expected output before
     accepting done (verify by execution, not by the worker's say-so). One-shot per task
     (seen-set) so the alert isn't repeated every cycle.
 
@@ -1970,7 +2304,7 @@ def check_run_proof():
     if flagged:
         print(f"run-proof: ⚠ {len(flagged)} engine-RUN-type 'completed' task(s) have NO execution proof (loop never proven to RUN — file-existence ≠ loop runs):")
         for tid, a, d in flagged:
-            print(f"  [run-proof] {tid} ({a}): no result-output dir, no metric ledger, no run-success log under {d}. FIX: manager RUN the end-to-end job yourself, confirm expected output, THEN accept done.")
+            print(f"  [run-proof] {tid} ({a}): no backtests/ output, no PERF_CARD, no run-success log under {d}. FIX: manager RUN the end-to-end BT yourself, confirm expected output, THEN accept done.")
     else:
         print("run-proof: engine-run-type completed tasks all have execution proof")
 
@@ -1980,10 +2314,10 @@ def check_idle_on_blockers():
     the task-store still shows them 'busy' (a blocked task is not idle by status, so
     cc-task fleet and the 15-min pane brain both treat the worker as occupied).
 
-    Caught once: a worker's free deliverable landed (done) and its sole
+    Caught 2026-06-03 (crypto_4020): its free deliverable landed (done) and its sole
     remaining task was paid-review-BLOCKED → it sat spinning on a gated paid-data
-    decision while the manager assumed it was working ('why is it stuck — isn't there
-    other work?'). A worker with no parallel FREE task while a blocker is parked is a manager-DISPATCH
+    decision while the manager assumed it was working ('crypto 为啥卡 不是有别的算法').
+    A worker with no parallel FREE task while a blocker is parked is a manager-DISPATCH
     failure, not a worker state: the fix is the manager assigning a NEW FREE direction
     (explore-not-ship — the free space is rarely exhausted) or suspending the worker,
     NOT leaving it to poll a gated blocker indefinitely.
@@ -2036,14 +2370,15 @@ def check_idle_on_blockers():
 
 def check_ops_crons():
     """Pass 11: ops-cron health — the launchd jobs run autonomously and are NOT in
-    the task store, so no other pass ever sees them. Incident: a batch of zombie
-    crons fired daily on scripts deleted in a cleanup (exit-2 'No such file') for WEEKS,
-    fully undetected, because cc-monitor only watched worker tmux tasks. This reads
-    `launchctl list` + resolves each plist's inner target script. A cron whose target
-    script is GONE is a definitive zombie (can never do real work → retire). exit!=0
-    WITH the script present is INFO only (some jobs exit non-zero BY DESIGN when they
-    fire alerts, e.g. a monitor cron exit=1) — never hard-flagged, to avoid the
-    false-positive of misreading a by-design alerting cron as 'stalled'.
+    the task store, so no other pass ever sees them. 2026-06-04 incident: 13 zombie
+    crons (broker_health, risk_monitor, hedge_* ...) fired daily on scripts deleted in
+    the Path-A1 cleanup (exit-2 'No such file') for WEEKS, fully undetected, because
+    cc-monitor only watched worker tmux tasks. This reads `launchctl list` + resolves
+    each plist's inner target script. A cron whose target script is GONE is a definitive
+    zombie (can never do real work → retire). exit!=0 WITH the script present is INFO
+    only (some jobs exit non-zero BY DESIGN when they fire alerts, e.g. portfolio_monitor
+    exit=1) — never hard-flagged, to avoid the false-positive I hit when I misread
+    portfolio_monitor as 'stalled' (feedback_institutional_check_read_content).
 
     ALERT-ONLY. Throttled per job (twice/day)."""
     if not LAUNCH_AGENTS_DIR.exists():
@@ -2099,18 +2434,18 @@ def check_ops_crons():
         for label, target, ex in failing:
             print(f"  [ops-cron-check] {label} → {target} exit={ex}.")
     if not zombies and not failing:
-        print("ops-cron: all claude-code-fleet launchd crons healthy (no missing-script zombies)")
+        print("ops-cron: all apexnova launchd crons healthy (no missing-script zombies)")
 
 
 def check_paid_review_sla():
-    """Pass 12: paid-review close-loop. check_paid() dedups on CREATE,
+    """Pass 12: paid-review close-loop. check_paid() dedups on CREATE (2026-05-29 fix),
     but NOTHING forces open paid-review stubs to ever RESOLVE → they pile on 'manager'
-    forever (e.g. 19 open at once, many duplicated per worker). A paid-review stub is a
+    forever (2026-06-04: 19 open, crypto_4020 x7, qqqe_dbg x5). A paid-review stub is a
     user $-decision the manager must either escalate as ONE batch digest or close as
     dup/moot — never leave parked. This surfaces (a) workers with >1 open paid-review
     (collapse to 1) and (b) the whole backlog as a single digest for one user decision.
-    ALERT-ONLY (never auto-cancels — paid approve/decline is the operator's call).
-    Throttled (twice/day)."""
+    ALERT-ONLY (never auto-cancels — paid approve/decline is the user's call per
+    feedback_paid_data_user_review). Throttled (twice/day)."""
     tasks = materialize()
     open_pr = [t for t in tasks.values()
                if t.get("status") in ("assigned", "blocked")
@@ -2135,8 +2470,8 @@ def check_paid_review_sla():
     stamps["_digest"] = now.isoformat()
     _save_stamp_map(PAID_REVIEW_SLA_SEEN_FILE, stamps)
     # DUP = stubs whose descriptions share a canonical vendor/$-amount token
-    # (_paid_tokens), NOT merely "same worker, >1 stub". A worker's two feeds at
-    # $160/mo + $75/mo are two DISTINCT user decisions; the
+    # (_paid_tokens), NOT merely "same worker, >1 stub". Grill 2026-06-10: us_fut's
+    # $160/mo IV-dispersion + $75/mo PEAD-feed are two DISTINCT user decisions; the
     # old len(ids)-1 count labeled one a DUP with destructive 'cancel rest' advice.
     # Token-connected components per worker; tokenless stubs are singletons (can't
     # prove dup → never advise cancel).
@@ -2177,10 +2512,10 @@ LANDING_PROOF_TOKEN = re.compile(
     re.IGNORECASE)
 LANDING_PROOF_EXT = {".md", ".json", ".log", ".txt", ".csv", ".yaml", ".yml"}
 # DEPLOY-intent gate: 'landing' is an overloaded word — some tasks tag category=landing
-# meaning "validate a config" (proof = a normal run-proof / metric ledger), NOT "deploy
-# to production". Only tasks whose description/deliverable is genuinely DEPLOY-oriented
-# are held to the strict S3/ARN/paper-order-id bar; the rest accept a normal run-proof.
-# Without this, a legitimately-validated config task was wrongly auto-reopened.
+# meaning "落地验证 a config" (proof = a BT PERF_CARD), NOT "deploy to production".
+# Only tasks whose description/deliverable is genuinely DEPLOY-oriented are held to the
+# strict S3/ARN/paper-order-id bar; the rest accept a normal BT run-proof. Without this,
+# a legitimately-BT-done config task (crypto_4020 combo-rp-v2) was wrongly auto-reopened.
 DEPLOY_INTENT_REGEX = re.compile(
     r"deploy|部署|上线|\bAWS\b|lambda|cloudformation|eventbridge|s3://|s3[ _-]bucket"
     r"|paper[ _-]?(?:trade|trading|account)|alpaca|ibkr|interactive[ _-]?brokers"
@@ -2190,9 +2525,9 @@ DEPLOY_INTENT_REGEX = re.compile(
 
 def _has_landing_proof(deliv: str) -> bool:
     """True if a DEPLOYMENT-EVIDENCE artifact exists under the deliverable subtree.
-    Landing proof is deploy-specific (NOT a metric ledger): an S3 DRY-RUN output URI,
+    Landing proof is deploy-specific (NOT a BT PERF_CARD): an S3 DRY-RUN output URI,
     a deployed AWS ARN/StackId, or a broker paper order/fill id. File-existence of
-    code/metrics alone is NOT landing — that is the exact gap this check closes."""
+    code/PERF alone is NOT landing — that is the exact gap this check closes."""
     spec = _deliv_path(deliv)
     if spec is None:
         return False
@@ -2230,18 +2565,17 @@ def open_landing_workers(tasks=None) -> set:
 
 
 def check_landing_debt():
-    """Pass 13 (operator lesson): a category=landing task is a USER-DESIGNATED landing
+    """Pass 13 (user 2026-06-04): a category=landing task is a USER-DESIGNATED landing
     line and must NOT be accepted as `completed` on file-existence alone. Landing = the
     thing actually DEPLOYED/RAN in production (S3 DRY-RUN output, AWS deploy ARN, broker
-    paper order id). This closes the exact gap the 15-min cron missed — a refresh
-    pipeline was code-complete but never deployed, and another line was 'ship-ready'
-    but never put on a live/paper account, yet neither was flagged (deploy/landing was
+    paper order id). This closes the exact gap the 15-min cron missed — the DR
+    roster-refresh pipeline was code-complete but never deployed, and v1.5-pit was
+    'ship-ready' but never put on paper, yet neither was flagged (deploy/landing was
     deliberately out-of-scope per explore-not-ship).
 
     UNLIKE the alert-only run-proof pass, landing-debt AUTO-REOPENS (cc-task start) a
-    landing task closed WITHOUT deploy evidence — the operator mandated 'file existence
-    does not count as done' for this category. Reopen is throttled per task
-    (REOPEN_COOLDOWN) so a worker that
+    landing task closed WITHOUT deploy evidence — the user mandated '文件存在不算 done'
+    for this category. Reopen is throttled per task (REOPEN_COOLDOWN) so a worker that
     re-closes-without-evidence is re-reminded what evidence is owed, not thrashed. Open
     landing tasks are surfaced every cycle so the line stays visible."""
     REOPEN_COOLDOWN_MIN = 60
@@ -2289,7 +2623,7 @@ def check_landing_debt():
             try:
                 subprocess.run([str(TS), a,
                     f"[manager landing-gate] task {tid} 标了 done 但 deliverable 没有真部署证据 — 已 REOPEN。"
-                    f"landing 不接受'代码/metric-ledger 文件存在'当完成,必须贴下列之一才能 done:S3 DRY-RUN 输出(s3://… runs/<date>/proposal.json)、"
+                    f"landing 不接受'代码/PERF 文件存在'当完成,必须贴下列之一才能 done:S3 DRY-RUN 输出(s3://… runs/<date>/proposal.json)、"
                     f"AWS 部署 ARN/StackId、或 broker paper order/fill id。把证据写进 {deliv}。"],
                     check=False, capture_output=True, timeout=10)
             except Exception:
@@ -2309,11 +2643,187 @@ def check_landing_debt():
         print("landing-debt: no open or under-proven landing tasks")
 
 
+# Claude Code's idle-footer token meter: "new task? /clear to save <N>k tokens".
+# N may be an integer (697) or a decimal (242.5). Capturing it is the cheapest live
+# signal that a worker's context has bloated past the point where it should externalize
+# results + /clear (feedback_token_saving / researcher onboarding rule #14: 别涨到 500k+).
+CONTEXT_FOOTER_REGEX = re.compile(r"/clear to save\s+([0-9]+(?:\.[0-9]+)?)\s*k\s+tokens", re.IGNORECASE)
+CONTEXT_BLOAT_THRESHOLD_K = 80  # > this (k tokens) → flag + nudge to externalize + /clear
+
+
+def check_context_bloat():
+    """Pass: flag workers whose live pane footer shows a large '/clear to save <N>k tokens'
+    meter (N > CONTEXT_BLOAT_THRESHOLD_K). A bloated context burns tokens every turn and
+    risks goal-drift; the fix is to externalize big CCDR/BT outputs to a file/ledger and
+    /clear (researcher onboarding rule #14). ADDITIVE + conservative:
+      - no footer present (mid-turn render, alt screen, dialog) → no flag (proves nothing)
+      - N <= threshold → no flag
+      - per-worker throttle (COOLDOWN_MIN) so a slowly-bloating worker isn't nagged every cycle
+    Never crashes a pass (each pane read is guarded); fail-quiet on any error."""
+    COOLDOWN_MIN = 90
+    if not WATCH_LIST.exists():
+        return
+    sessions = [l.strip() for l in WATCH_LIST.read_text().splitlines()
+                if l.strip() and not l.startswith("#")]
+    stamps = _load_stamp_map(CONTEXT_BLOAT_SEEN_FILE)
+    now = datetime.now()
+    flagged = []
+    dirty = False
+    for sess in sessions:
+        if not session_alive(sess):
+            continue
+        try:
+            out = subprocess.run(["tmux", "capture-pane", "-t", sess, "-p"],
+                                 capture_output=True, text=True, timeout=10)
+        except Exception:
+            continue
+        if out.returncode != 0:
+            continue
+        m = CONTEXT_FOOTER_REGEX.search(out.stdout)
+        if not m:
+            continue  # no footer meter visible → nothing to assert
+        try:
+            n_k = float(m.group(1))
+        except (ValueError, TypeError):
+            continue
+        if n_k <= CONTEXT_BLOAT_THRESHOLD_K:
+            continue
+        last = stamps.get(sess)
+        if last:
+            try:
+                if (now - datetime.fromisoformat(last)).total_seconds() / 60 < COOLDOWN_MIN:
+                    continue
+            except (ValueError, TypeError):
+                pass
+        # Don't splice a nudge into a worker mid-turn (footer can coexist with thinking).
+        if MIDWORK_REGEX.search(out.stdout[-1500:]):
+            continue
+        n_disp = int(n_k) if n_k == int(n_k) else n_k
+        msg = (f"context bloat {n_disp}k — externalize results to file/ledger + /clear。"
+               f"每轮 CCDR/BT 之后:完整结果落到 report/PERF_CARD/id-tree,context 里只留一行 verdict+文件指针,然后 /clear。")
+        try:
+            r = subprocess.run([str(TS), sess, msg], check=False, capture_output=True, timeout=10)
+            if r.returncode == 0:
+                flagged.append((sess, n_disp))
+                stamps[sess] = now.isoformat()
+                dirty = True
+        except Exception:
+            pass
+    if dirty:
+        _save_stamp_map(CONTEXT_BLOAT_SEEN_FILE, stamps)
+    if flagged:
+        print(f"context-bloat: {len(flagged)} worker(s) over {CONTEXT_BLOAT_THRESHOLD_K}k tokens — nudged to externalize + /clear:")
+        for sess, n in flagged:
+            print(f"  [context-bloat] {sess}: {n}k tokens — externalize big outputs to disk + /clear")
+    else:
+        print("context-bloat: no worker over threshold")
+
+
+def check_plan_skip_backstop():
+    """Pass (LAYER-2 backstop): the pre-commit plan-grill gate can be evaded with
+    `git commit --no-verify`. Catch that here: flag any lean/strategies/<dir> that has
+    TRACKED code (committed .py at HEAD) but NO plan-grill PASS artifact for it
+    (.cc-review/<sha>.json, mode==plan, overall==PASS, reviewed commit touched a
+    plan/design .md inside that dir). ADVISORY-only (the pre-commit gate is the hard
+    block; this is the audit net for evasion), so it just prints — never reopens/nudges.
+
+    ADDITIVE + no false-positive on a clean fleet:
+      - only flags dirs whose FIRST tracked code landed AFTER plan-grilling existed,
+        i.e. NEW directions; PRE-EXISTING strategy dirs (the ~hundreds already in the
+        repo before Layer-2) are grandfathered via a one-time baseline seed so the
+        backstop doesn't dump the entire back catalog every cycle.
+      - any error resolving git/artifacts → that dir is skipped (fail-quiet)."""
+    BASELINE_FILE = Path.home() / ".cc-manager" / "plan_skip_baseline.json"
+    repo = str(REPO_ROOT)
+
+    def git(*args):
+        try:
+            return subprocess.run(["git", "-C", repo, *args],
+                                  capture_output=True, text=True, timeout=20).stdout
+        except Exception:
+            return ""
+
+    # All strategy dirs with at least one TRACKED .py at HEAD.
+    code_dirs = set()
+    for ln in git("ls-tree", "-r", "--name-only", "HEAD", "lean/strategies/").splitlines():
+        ln = ln.strip()
+        if not ln.endswith(".py"):
+            continue
+        parts = ln.split("/")
+        if len(parts) >= 3 and parts[0] == "lean" and parts[1] == "strategies":
+            code_dirs.add("/".join(parts[:3]))
+    if not code_dirs:
+        print("plan-skip-backstop: no tracked strategy code")
+        return
+
+    # One-time baseline seed: grandfather every strategy dir that already had code BEFORE
+    # this backstop existed, so we only ever flag genuinely-new directions going forward.
+    if not BASELINE_FILE.exists():
+        try:
+            BASELINE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            BASELINE_FILE.write_text(json.dumps(
+                {"baseline": sorted(code_dirs), "seeded": datetime.now().isoformat()}, indent=2))
+            print(f"plan-skip-backstop: seeded baseline of {len(code_dirs)} pre-existing strategy dir(s) (grandfathered)")
+            return
+        except Exception:
+            return  # couldn't seed → fail-quiet, do not flag the whole back catalog
+    try:
+        baseline = set(json.loads(BASELINE_FILE.read_text()).get("baseline", []))
+    except Exception:
+        return  # unreadable baseline → fail-quiet
+
+    candidates = code_dirs - baseline
+    if not candidates:
+        print("plan-skip-backstop: no new strategy dirs since baseline")
+        return
+
+    # Load plan-grill PASS artifacts once.
+    artdir = REPO_ROOT / ".cc-review"
+    arts = []
+    if artdir.is_dir():
+        try:
+            arts = [p for p in artdir.iterdir() if p.suffix == ".json"]
+        except Exception:
+            arts = []
+
+    def has_plan_pass(d):
+        for a in arts:
+            try:
+                obj = json.loads(a.read_text())
+            except Exception:
+                continue
+            if str(obj.get("mode", "")).lower() != "plan":
+                continue
+            if str(obj.get("overall", "")).upper() != "PASS":
+                continue
+            sha = obj.get("sha") or a.stem
+            for f in git("show", "--name-only", "--format=", sha).splitlines():
+                f = f.strip()
+                if f.startswith(d + "/") and f.endswith(".md") \
+                        and re.search(r"(plan|design)", f.rsplit("/", 1)[-1], re.I):
+                    return True
+        return False
+
+    evaded = []
+    for d in sorted(candidates):
+        try:
+            if not has_plan_pass(d):
+                evaded.append(d)
+        except Exception:
+            continue  # error resolving → skip (fail-quiet)
+    if evaded:
+        print(f"plan-skip-backstop: ⚠ {len(evaded)} strategy dir(s) with code but NO plan-grill PASS (grill-before-implement evaded?):")
+        for d in evaded:
+            print(f"  [plan-skip] {d}: strategy code with no plan-grill PASS (grill-before-implement evaded? --no-verify?)")
+    else:
+        print("plan-skip-backstop: all new strategy dirs have a plan-grill PASS")
+
+
 def _run_pass(fn):
     """Run one monitor pass in isolation. A monitor's worst failure is dying SILENTLY:
     main() runs ~14 passes with no try/except, so any pass that raises aborts main and
     every pass AFTER it never runs — undetected, since cron just sees a non-zero exit.
-    Example (check_goal_stale): its cross-source datetime compare
+    Grill 2026-06-07 (check_goal_stale): its line-1043 cross-source datetime compare
     (workers.json goal_updated vs tasks.jsonl ts) raises an uncaught TypeError the instant
     any tool writes a tz-aware ts (today both sources are naive, so it's latent — but
     goal_stale runs 4th and would silently kill the 10 downstream passes). Isolate every
@@ -2361,11 +2871,14 @@ def main():
         _run_pass(check_ship_drift)
         _run_pass(check_premature_exhaustion)
         _run_pass(check_repeated_nudge)
+        _run_pass(check_ccdr_compliance)
         _run_pass(check_dr_candidates_verified)
         _run_pass(check_excluded_scope)
         _run_pass(check_dropped_tasks)
         _run_pass(check_uncommitted)
         _run_pass(check_session_health)
+        _run_pass(check_context_bloat)
+        _run_pass(check_plan_skip_backstop)
 
 
 if __name__ == "__main__":

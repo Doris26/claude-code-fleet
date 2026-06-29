@@ -1,65 +1,104 @@
 #!/bin/bash
-# cc-review — MANAGER-SPAWNED reviewer for a landed commit (the worker can't skip it).
+# cc-review — MANAGER-SPAWNED dual reviewer (algo-grill + code/perf-card) for a commit.
 #
-# WHY this is a manager tool, not a worker instruction: a worker is an autonomous LLM —
-# telling it in its goal/onboarding to "run a review before claiming results" is NOT
-# enforceable; it forgets, skips, or does a token review. So the review is driven from the
-# MANAGER side: cc-watch detects a newly-landed commit and calls THIS, which runs the
+# WHY this is a manager tool, not a worker instruction (user 2026-06-13
+# "你怎么确保小弟会 invoke subagent?"): a worker is an autonomous LLM — telling it in
+# its goal/onboarding to "run a review subagent before claiming results" is NOT
+# enforceable; it forgets, skips, or does a token review. So the review is driven from
+# the MANAGER side: cc-watch detects a newly-landed commit and calls THIS, which runs the
 # layered reviewers on the diff. The worker does not participate in the decision to review,
-# so it cannot skip it. ("the judge can't be the party being judged".)
+# so it cannot skip it.
 #
-# HONEST SCOPE: this is a POST-HOC ADVISORY review, NOT a pre-merge block. Workers push
-# directly to the shared branch, so a FAILing commit is ALREADY on the branch when this runs;
-# cc-review's job is to CATCH it and re-poke the owner to fix-forward (the next commit is
-# re-reviewed until PASS). To make it a hard gate, add a pre-push hook that rejects on a prior
-# FAIL verdict (not wired here).
-#
-# LAYERS:
-#   L1  process/discipline review  (built-in prompt below — domain-agnostic)
-#   L2  domain review              (optional: $CC_VERIFY_PLUGIN/review-prompt.txt, if present)
-#   L3  /code-review               (Claude built-in — correctness, HEAD only)
-#   L4  /security-review           (Claude built-in — only when an attack surface is touched)
-#   +   deterministic secret-grep  (always, zero-token)
-#   +   claim verification         ($CC_VERIFY_PLUGIN/verify-claim — is a cited result real?)
+# HONEST SCOPE (meta-grill #6 correction): this is a POST-HOC ADVISORY review, NOT a pre-merge
+# block. Workers push directly to main, so a FAILing commit IS ALREADY on main when this runs;
+# cc-review's job is to CATCH it and repoke the owner to fix-forward (next commit re-reviewed
+# until PASS). The only HARD pre-commit gate is .git/hooks/pre-commit (check_perf_card.py), which
+# does NOT read .cc-review verdicts — so do not claim cc-review "blocks" anything. To make it a true
+# gate, a pre-push hook would need to reject on the prior commit's FAIL verdict (not yet wired).
 #
 # Usage:
-#   cc-review [<sha>]                 # review one commit (default HEAD); exit 0 PASS, 3 FAIL
-#   cc-review --repoke <name> <sha>   # review + auto re-poke worker session <name> on FAIL
-#   cc-review --goal "<text>" <sha>   # pass the owning worker's goal so the domain reviewer
-#                                     # is goal-aware (won't false-FAIL an explore-only directive)
+#   cc-review [<sha>]            # review one commit (default HEAD); exit 0 PASS, 3 FAIL
+#   cc-review --repoke <name> <sha>   # review + auto re-poke worker <name> on FAIL
 #
 # Reviewers are forced to emit a single JSON verdict object; we parse it out of the
-# `claude -p --output-format json` envelope. Diff is bounded to keep token cost sane.
+# `claude -p --output-format json` envelope. Model: claude-opus-4-8 (fable-5 unavailable,
+# user 2026-06-13). Diff bounded to keep token cost sane.
 set -uo pipefail
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/sbin"
 
-MODEL="${CC_REVIEW_MODEL:-claude-opus-4-8}"
-DIFF_MAX_LINES="${CC_REVIEW_DIFF_MAX:-600}"
-REPO="${CC_REPO:-$HOME/your-repo}"
+MODEL="claude-opus-4-8"
+DIFF_MAX_LINES=600
+REPO="/workspace/apexnova"
 ARTDIR="$REPO/.cc-review"
 
-# Resolve the claude-code-fleet install dir (parent of this bin/) and the active verification plugin.
-# Follow symlinks so plugins/ + personas/ are found even when a cc-* command was symlinked onto PATH
-# (`ln -s` / `npm i -g`) instead of run from inside the repo. (CC_HOME env always wins if set.)
-_self="$0"
-while [ -L "$_self" ]; do _ln="$(readlink "$_self")"; case "$_ln" in /*) _self="$_ln" ;; *) _self="$(dirname "$_self")/$_ln" ;; esac; done
-SELF="$(cd "$(dirname "$_self")" && pwd)"
-CC_HOME="${CC_HOME:-$(dirname "$SELF")}"
-CC_VERIFY_PLUGIN="${CC_VERIFY_PLUGIN:-plugins/generic}"
-case "$CC_VERIFY_PLUGIN" in
-    /*) PLUGIN_DIR="$CC_VERIFY_PLUGIN" ;;
-    *)  PLUGIN_DIR="$CC_HOME/$CC_VERIFY_PLUGIN" ;;
-esac
-
-# LOCAL user-notify primitive (cc-notify: desktop notification + durable escalations.log,
-# per-topic dedup). In-repo/in-home fallback if the ~/.local/bin symlink isn't installed.
-_CC_NOTIFY="$HOME/.local/bin/cc-notify"; [ -x "$_CC_NOTIFY" ] || _CC_NOTIFY="$CC_HOME/bin/cc-notify"
+# self-audit #5: LOCAL user-notify primitive (cc-notify: macOS notification + durable
+# escalations.log, per-topic dedup). In-repo fallback if the ~/.local/bin symlink isn't installed.
+_CC_NOTIFY="$HOME/.local/bin/cc-notify"; [ -x "$_CC_NOTIFY" ] || _CC_NOTIFY="$REPO/bin/cc-manager/cc-notify"
 _notify_user() { [ -x "$_CC_NOTIFY" ] && "$_CC_NOTIFY" "$1" "$2" >/dev/null 2>&1 || true; }
 
-REPOKE_WORKER=""
+# PLAN-STAGE GRILL flag (user 2026-06-29): `cc-review --plan <sha>` runs ONLY a direction grill on a
+# committed PLAN doc (BEFORE the worker builds+backtests), and SKIPS all results layers
+# (algo-grill / code-review / btid / secret). Goal: kill doomed directions before the expensive
+# build+BT (token savings) + enforce grill-before-implement (quality). Parse the flag EARLY so the
+# btid boot self-test (a QC round-trip) can be skipped for plan mode — a plan has no bt-id to verify.
+PLAN_MODE=0
+if [ "${1:-}" = "--plan" ]; then PLAN_MODE=1; shift; fi
+# --repoke / --goal may precede OR follow --plan; re-scan after the --plan shift so `--plan --repoke X`
+# and `--repoke X --plan` both parse (kept additive to the existing parsing below).
+if [ "${1:-}" = "--repoke" ]; then REPOKE_WORKER_EARLY="${2:-}"; shift 2; fi
+if [ "${1:-}" = "--plan" ]; then PLAN_MODE=1; shift; fi
+
+# grill #1 (CODE part): BOOT SELF-TEST of the bt-id gate. The anti-fabrication gate is only
+# meaningful if it can actually reach QC; under launchd (no creds) it silently SKIP-passes every
+# commit — the gate runs "dark" and a fabricated bt-id sails through. Probe one KNOWN-GOOD
+# bt-id/pid pair at boot; if it does NOT resolve, mark the gate DARK and surface that in the
+# artifact + escalations.log instead of pretending the SKIPs are clean passes.
+# (creds may live only in ~/.cc-manager/qc.env under launchd — source it best-effort, as cc-watch does.)
+# PLAN-MODE skips this entirely (no bt-id in a plan → nothing to self-test → save a QC round-trip).
+[ -f "$HOME/.cc-manager/qc.env" ] && { set -a; . "$HOME/.cc-manager/qc.env"; set +a; } 2>/dev/null || true
+BTID_GATE_DARK=1
+BTID_GATE_NOTE="btid gate DARK: known-good bt-id self-test did not resolve (no QC creds or QC unreachable) — every btid SKIP this run is UNVERIFIED, not a clean pass"
+if [ "$PLAN_MODE" != "1" ] && [ -n "${QC_USER_ID:-}" ] && [ -n "${QC_API_TOKEN:-}" ]; then
+    # Known-good pairs from PERF_CARDS.md (stable, repeatedly cross-verified). Any ONE resolving = lit.
+    if NO_PROXY="*" perl -e 'alarm 45; exec @ARGV' python3 -c '
+import base64,hashlib,json,os,ssl,time,urllib.request
+U=os.environ.get("QC_USER_ID"); T=os.environ.get("QC_API_TOKEN")
+ctx=ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE
+PAIRS=[("XXXXXXXX","REDACTED_BTID_1"),
+       ("XXXXXXXX","REDACTED_BTID_2"),
+       ("XXXXXXXX","REDACTED_BTID_3")]
+def ok(pid,bt):
+    ts=str(int(time.time())); h=hashlib.sha256(f"{T}:{ts}".encode()).hexdigest()
+    cred=base64.b64encode(f"{U}:{h}".encode()).decode()
+    req=urllib.request.Request(f"https://www.quantconnect.com/api/v2/backtests/read?projectId={pid}&backtestId={bt}",
+        headers={"Authorization":f"Basic {cred}","Timestamp":ts},method="GET")
+    op=urllib.request.build_opener(urllib.request.ProxyHandler({}),urllib.request.HTTPSHandler(context=ctx))
+    try:
+        r=json.loads(op.open(req,timeout=20).read()); return bool(r.get("success") and r.get("backtest"))
+    except Exception:
+        return False
+import sys
+sys.exit(0 if any(ok(p,b) for p,b in PAIRS) else 1)
+' 2>/dev/null; then
+        BTID_GATE_DARK=0
+    fi
+fi
+if [ "$PLAN_MODE" != "1" ] && [ "$BTID_GATE_DARK" = "1" ]; then
+    echo "[cc-review] $BTID_GATE_NOTE" >&2
+    # once-per-day escalation so a creds-loss / QC-outage is loud but not spammy.
+    _dark_stamp="$HOME/.cc-manager/.btid-gate-dark.$(date '+%Y-%m-%d').sent"
+    if [ ! -f "$_dark_stamp" ]; then
+        mkdir -p "$HOME/.cc-manager" 2>/dev/null || true
+        echo "$(date '+%Y-%m-%d %H:%M:%S') [cc-review] $BTID_GATE_NOTE" >> "$HOME/.cc-manager/escalations.log"
+        _notify_user "btid-gate-dark-$(date '+%Y-%m-%d')" "$BTID_GATE_NOTE"
+        touch "$_dark_stamp"
+    fi
+fi
+
+REPOKE_WORKER="${REPOKE_WORKER_EARLY:-}"
 if [ "${1:-}" = "--repoke" ]; then REPOKE_WORKER="${2:-}"; shift 2; fi
-# the owning worker's goal text, so the domain reviewer doesn't FALSE-FAIL an explicitly
-# explore-only / in-sample directive.
+# meta-grill fix (goal-aware grill): the owning worker's goal text, so the algo-grill doesn't
+# FALSE-FAIL an explicitly in-sample / 5yr-only / explore-not-ship directive on checks #4/#8.
 GOAL_CTX=""
 if [ "${1:-}" = "--goal" ]; then GOAL_CTX="${2:-}"; shift 2; fi
 SHA="${1:-HEAD}"
@@ -69,29 +108,94 @@ mkdir -p "$ARTDIR"
 ART="$ARTDIR/${SHA}.json"
 
 # --- gather the commit context (bounded) ---------------------------------------
-# `git show` on a MERGE commit emits an EMPTY diff by default → the reviewer would see nothing
-# and rubber-stamp PASS. Use --first-parent for merges so the merged-in changes are reviewed.
+# Grill 2026-06-13 #16: `git show` on a MERGE commit emits an EMPTY diff by default → the reviewer
+# saw nothing and rubber-stamped PASS. Use --first-parent for merges so the merged-in changes are
+# reviewed. (Workers push linearly so merges are rare, but a merged PR must not slip through.)
 SHOWOPT=""
 [ "$(git -C "$REPO" rev-list --parents -n1 "$SHA" 2>/dev/null | wc -w)" -gt 2 ] && SHOWOPT="--first-parent -m"
 STAT=$(git -C "$REPO" show $SHOWOPT --stat --format="%H%n%an%n%s%n%b" "$SHA" 2>/dev/null | head -60)
-# the diff is capped at DIFF_MAX_LINES so the reviewer never reviews code past the cap as PASS
-# though it never saw it. Detect truncation and TELL the reviewer so it can't silently rubber-stamp.
+# meta-grill #15: the diff is capped at DIFF_MAX_LINES so the reviewer never sees code past the cap
+# (a big main.py change → stop-loss logic past line 600 reviewed as PASS though never seen). Detect
+# truncation and TELL the reviewer in the prompt so it can't silently rubber-stamp the unseen part.
 _DIFF_TOTAL=$(git -C "$REPO" show $SHOWOPT --format= "$SHA" 2>/dev/null | wc -l | tr -d ' ')
 DIFF=$(git -C "$REPO" show $SHOWOPT --format= "$SHA" 2>/dev/null | head -"$DIFF_MAX_LINES")
-# the deterministic secret-grep MUST see the WHOLE diff, not the capped $DIFF (a secret past
-# line 600 of a big diff would never be scanned). Build a FULL uncapped diff just for that pass;
+# FIX B: the deterministic secret-grep + perf-fabrication scan are zero-token regex passes; they MUST
+# see the WHOLE diff, not the 600-line-capped $DIFF (a secret or a fabricated "Sharpe=… BT=<32hex>"
+# past line 600 of a big diff was NEVER scanned). Build a FULL uncapped diff just for those passes;
 # the capped $DIFF stays the input to the LLM reviewer prompts (token budget unchanged).
 DIFF_FULL=$(git -C "$REPO" show $SHOWOPT --format= "$SHA" 2>/dev/null)
 DIFF_TRUNC=""
-[ "${_DIFF_TOTAL:-0}" -gt "$DIFF_MAX_LINES" ] && DIFF_TRUNC="DIFF TRUNCATED: only the first $DIFF_MAX_LINES of $_DIFF_TOTAL diff lines are shown below. You did NOT see the rest. If any unseen file/region could carry a behavior-affecting change, you MUST NOT return PASS on it — return FIX noting the review is incomplete and which files exceed the cap."
+[ "${_DIFF_TOTAL:-0}" -gt "$DIFF_MAX_LINES" ] && DIFF_TRUNC="⚠️ DIFF TRUNCATED: only the first $DIFF_MAX_LINES of $_DIFF_TOTAL diff lines are shown below. You did NOT see the rest. If any unseen file/region could carry a perf-affecting change (stop-loss, gate, exit, sizing), you MUST NOT return PASS on it — return GRILL noting the review is incomplete and which files exceed the cap."
 TOUCHED=$(git -C "$REPO" show $SHOWOPT --name-only --format= "$SHA" 2>/dev/null | grep -v '^$')
+# perf-card(s) touched or adjacent to touched strategy dirs
+CARDS=$(echo "$TOUCHED" | grep -iE 'PERF_CARD' || true)
+# grill #3(a): NARROW the strategy class. The old bare `\.py$`/`lean/research` over-fired the
+# perf/btid gate on cc-manager infra (bin/*.py) and skill/research docs (their PROSE/CODE matched
+# the perf regex → false OVERALL=FAIL). Strategy class is now: a real strategy code/config file
+# (lean/strategies/**/*.py or **/config.json) OR a touched PERF_CARD. EXCLUDED by construction:
+# bin/, any *.md, lean/research/skills/, lean/factors/alpha_research/ (docs are checked by the
+# path-independent fabrication gate below, NOT by the strategy-code escalation).
+TOUCHES_STRATEGY=$( { echo "$TOUCHED" | grep -qE 'lean/strategies/.*\.py$' \
+    || echo "$TOUCHED" | grep -qE 'lean/strategies/.*/config\.json$' \
+    || [ -n "$CARDS" ]; } && echo 1 || echo 0)
+# grill #3(c) hard guard: the btid/perf escalation may only fire when a lean/ path is actually
+# touched (a pure bin/ or *.md commit can never be a strategy perf-claim escalation).
+TOUCHES_LEAN=$(echo "$TOUCHED" | grep -qE '(^|/)lean/' && echo 1 || echo 0)
+# FIX 2 (research-exempt, mirrors cc-verify-btid `_is_research_only_commit`): a commit whose changed
+# files are ALL under lean/research/ AND NONE under lean/strategies/ is OFFLINE non-QC research (e.g.
+# lean/research/polymarket/ prediction-market analysis); a QC bt-id is structurally N/A, so cc-review
+# must NOT independently raise a fabrication-class btid FAIL on a perf number it detects — it DEFERS to
+# cc-verify-btid's SKIP/exempt verdict. (Empty TOUCHED -> 0, so a no-file commit never reads exempt.)
+TOUCHES_RESEARCH_ONLY=$(echo "$TOUCHED" | python3 -c '
+import sys
+files=[l.strip() for l in sys.stdin if l.strip()]
+# all files under lean/research/ AND none under lean/strategies/ (and at least one file)
+ok = bool(files) and all("lean/research/" in f for f in files) and not any("lean/strategies/" in f for f in files)
+print("1" if ok else "0")' 2>/dev/null)
+[ -n "$TOUCHES_RESEARCH_ONLY" ] || TOUCHES_RESEARCH_ONLY=0
+# FIX 2 (path-INDEPENDENT trigger): the btid-verify + fabrication-scan only fired when the FILE TYPE
+# was a strategy .py/config.json/PERF_CARD/alpha_research doc — so a commit dumping "Sharpe=2.664
+# BT=513f7904…" into a _results.txt / .sh / STATUS.md / HANDOFF.md under lean/strategies/ had
+# algo=SKIP btid=SKIP and the fabrication path NEVER ran (reproduced on real commit 309d6eb6).
+# Trigger path-INDEPENDENTLY when ANY added line under a TOUCHED lean/ path contains a 32-hex BT-ID
+# token, regardless of extension — the bt-id is the verifiable anchor (resolves on QC or 404s) and the
+# demonstrated dump always carries one. We do NOT trigger on a bare perf NUMBER alone: legit lean/ docs
+# (research notes / STATUS / HANDOFF) discuss target Sharpes in prose with no bt-id, and flagging those
+# would re-create false-FAIL churn. The EXPENSIVE LLM algo-grill keeps the strategy file-type gate
+# (TOUCHES_STRATEGY) — we do NOT run the LLM grill on every .txt.
+# FIX B: this 32-hex BT-ID trigger is a zero-token regex pass and is the gate that ENABLES the
+# btid-verify + fabrication scan; reading the 600-line-capped $DIFF would miss a "BT=<32hex>" past
+# line 600 → the whole anti-fabrication path never fires. Scan the FULL uncapped diff ($DIFF_FULL).
+LEAN_BTID=$(DIFF="$DIFF_FULL" python3 -c '
+import os, re
+diff = os.environ.get("DIFF", "")
+_BTID = re.compile(r"\b[0-9a-f]{32}\b")
+cur_lean = False   # is the current file (per +++ header) under a lean/ path?
+hit = False
+for raw in diff.splitlines():
+    if raw.startswith("+++ "):
+        path = raw[4:].strip()
+        if path.startswith("b/"): path = path[2:]
+        cur_lean = ("lean/" in path)
+        continue
+    if raw.startswith("---") or raw.startswith("@@"):
+        continue
+    if not raw.startswith("+"):
+        continue
+    body = raw[1:]
+    if cur_lean and _BTID.search(body):
+        hit = True; break
+print("1" if hit else "0")' 2>/dev/null)
+[ -n "$LEAN_BTID" ] || LEAN_BTID=0
 
 # --- headless reviewer helper: $1=label  $2=prompt -> prints extracted JSON ----
 _run_reviewer() {
     local label="$1" prompt="$2" raw result
-    raw=$(printf '%s' "$prompt" | claude -p --model "$MODEL" --output-format json 2>/dev/null) || { echo '{"verdict":"ERROR","note":"claude -p failed (maybe usage limit)"}'; return; }
+    raw=$(printf '%s' "$prompt" | claude -p --model "$MODEL" --output-format json 2>/dev/null) || { echo '{"verdict":"ERROR","note":"claude -p failed (maybe 5h limit) "}'; return; }
     # envelope .result holds the model text; pull the first {...} JSON object out of it.
-    # Pass $raw via ENV VAR, not a stdin pipe: `python3 -c` with a heredoc would swallow the pipe.
+    # Pass $raw via ENV VAR, not a stdin pipe: `python3 - <<HEREDOC` reads the PROGRAM from
+    # stdin, so a `printf | python3 - <<PY` pipe is swallowed by the heredoc and json.load(stdin)
+    # reads nothing → the old "no json" bug (fixed 2026-06-13).
     result=$(RAW="$raw" python3 -c '
 import json,os,re
 raw=os.environ.get("RAW","")
@@ -105,16 +209,24 @@ print(m.group(0) if m else "{\"verdict\":\"ERROR\",\"note\":\"no json in reviewe
     [ -n "$result" ] && printf '%s' "$result" || echo '{"verdict":"ERROR","note":"empty"}'
 }
 
-# Built-in reviewer layers: Claude's mature built-ins — /code-review (CORRECTNESS) and
-# /security-review (SECURITY). Both review the HEAD/branch diff, so only run when reviewing HEAD.
-# Output is prose → classify: "(none)"/no-issues = PASS, else FINDINGS (surfaced in repoke).
+# Built-in reviewer layers (user 2026-06-13 "内置的 review agent 可能更好 / 四层review"). Our own
+# algo-grill (overfit) + code-prompt (house-rule process) are KEPT; these ADD Claude's mature built-in
+# reviewers: /code-review (CORRECTNESS) + /security-review (SECURITY — secrets/unsafe patterns, fits the
+# no-hardcoded-secrets rules). NOTE: /review was rejected — it targets open PRs, not the per-commit diff
+# cc-review gates. Both built-ins review the HEAD/branch diff, so only run when reviewing HEAD (common
+# 1-commit/tick case); older batched commits get algo+process only. Output is prose → classify:
+# "(none)"/no-issues = PASS, else FINDINGS (surfaced in repoke).
 _run_builtin_review() {  # $1 = slash command (e.g. "/code-review low") → echoes JSON {verdict, findings}
     local raw txt
-    # under launchd, cc-watch runs with cwd=/, so a headless `claude -p` sees "not a git repository"
-    # and reviews NOTHING. Run from inside $REPO AND --add-dir it so the built-in sees the live diff
-    # (else its no-diff prose was mis-classified as FINDINGS → false FAIL → wasted worker repoke).
-    # FORCE the built-in to emit a strict verdict-JSON; parse that FIRST; only if no parseable
-    # verdict-JSON is found do we fall back to the hand-maintained substring allowlist (kept intact).
+    # self-audit #3: under launchd cc-watch runs with cwd=/ , so a headless `claude -p` sees "not a
+    # git repository" and reviews NOTHING. Run from inside $REPO AND --add-dir it so the built-in
+    # /code-review / /security-review actually see the live diff (else their no-diff prose was
+    # mis-classified as FINDINGS → false OVERALL=FAIL → wasted worker repoke).
+    # FIX 4 (structured-first): FORCE the built-in to emit a strict verdict-JSON. We parse that JSON
+    # FIRST in the classifier below; ONLY if no parseable verdict-JSON is found do we fall back to the
+    # hand-maintained substring allowlist (kept intact). This removes the whack-a-mole false-FAIL class
+    # when the built-in honors the JSON contract, and never breaks review when it doesn't (allowlist
+    # still runs). The instruction is appended to the slash command so the built-in still does its work.
     local prompt="$1
 Reply with ONLY a JSON object: {\"verdict\":\"PASS\",\"findings\":[]} (PASS if no real issues) or {\"verdict\":\"FINDINGS\",\"findings\":[\"...\"]}. No prose, no markdown fences, nothing before or after the JSON object."
     raw=$(cd "$REPO" && printf '%s' "$prompt" | claude -p --add-dir "$REPO" --output-format json 2>/dev/null) || { echo '{"verdict":"ERROR"}'; return; }
@@ -125,15 +237,18 @@ except Exception: print("")' 2>/dev/null)
 import os,json,re
 t=(os.environ.get("RAW","") or "").strip()
 low=t.lower()
-# infra-failure prose (the subagent could not see the repo/diff) must be ERROR, NEVER FINDINGS —
-# an infra failure must not be able to flip overall=FAIL. Checked FIRST, before the JSON parse.
+# self-audit #3 (b): infra-failure prose (the subagent could not see the repo/diff) must be ERROR,
+# NEVER FINDINGS — an infra failure must not be able to flip overall=FAIL. Checked FIRST, before the
+# JSON parse, so an infra-failure that happens to embed a stray brace can never read as a verdict.
 infra = any(s in low for s in (
     "not a git repository", "not in a git repo", "no diff to review", "nothing to review",
     "no changes to review", "point me at a repo", "where is the code", "wheres the code"))
 if infra:
     print(json.dumps({"verdict":"ERROR","findings":t[:600]}, ensure_ascii=False)); raise SystemExit
-# structured-first: extract a verdict-JSON object from the output. If found AND its verdict is
-# exactly PASS/FINDINGS, trust it directly. Any other shape → fall through to the substring allowlist.
+# FIX 4 (structured-first): try to extract a verdict-JSON object from the output (mirrors the
+# _run_reviewer first-{...} extraction pattern). If found AND its verdict is exactly PASS/FINDINGS,
+# trust it directly — this is the precise, whack-a-mole-free path. Any other shape (no JSON, no
+# verdict field, an unexpected verdict value) → fall through to the legacy substring allowlist below.
 m = re.search(r"\{.*\}", t, re.S)
 if m:
     try:
@@ -148,28 +263,41 @@ if m:
         raise
     except Exception:
         pass   # malformed JSON → fall back to the substring allowlist (safety net preserved)
-# the no-findings sentinel "(none)" can be emitted AFTER a preamble, or markdown-wrapped
-# (`(none)`, **(none)**). STRIP markdown wrappers before the sentinel compare so a clean review
-# is not mis-read as FINDINGS. A REAL finding lists issue bullets, never a bare wrapped "(none)".
-_WRAP = "`*_() " + chr(34) + chr(39)
+# self-audit (2026-06-14): the no-findings sentinel "(none)" is emitted by /code-review AFTER a
+# preamble line ("...no runtime code logic in the diff.\n\n(none)"), so startswith("(none)") MISSED it
+# and flipped a clean review to FINDINGS -> false OVERALL=FAIL (7e0a14c7). Detect the sentinel on ANY
+# line, and broaden the "no ... code logic" phrasing. A REAL finding lists issue bullets, never a bare
+# "(none)" line, so this cannot suppress a genuine finding.
+# self-audit (2026-06-17): /code-review can backtick/asterisk-wrap the sentinel (`` `(none)` ``,
+# **(none)**) so the bare-string `ln.strip() in (...)` MISSED it -> a pure .md commit got mis-read
+# as FINDINGS -> false OVERALL=FAIL -> repoke (511e665b). STRIP markdown wrappers (backtick, *, _,
+# quotes, parens, spaces) before the sentinel compare. A REAL finding lists issue bullets, never a
+# bare wrapped "(none)", so this cannot suppress a genuine finding.
+_WRAP = "`*_() " + chr(34) + chr(39)   # strip-set: backtick star underscore parens space, plus chr34=dquote and chr39=squote; the squote MUST be chr() not a literal because this whole block lives inside a single-quoted shell heredoc
 sentinel = False
 for ln in low.splitlines():
     core = ln.strip().strip(_WRAP)
     if core in ("none", "no findings", "(none)", "(no findings)", "n/a") \
-       or core.startswith("(none)"):
+       or core.startswith("(none)"):   # NOTE: bare startswith("none") intentionally dropped — it would false-CLEAN a real finding like "None of the paths..."; the exact set already catches stripped `(none)`->none
         sentinel = True
         break
 clean = (not t) or low.startswith("(none)") or sentinel or "no issues" in low or "no findings" in low or "nothing to flag" in low or "no code logic" in low or "no runtime code logic" in low or "no blocking" in low or "no security" in low or "no vulnerab" in low or "no runtime-correctness bug" in low or "no correctness bug" in low or "no bug" in low or "no candidate vulnerab" in low or "found no candidate" in low or "no candidate" in low
-# FALLBACK fail-safe: an unparseable/ambiguous built-in verdict whose prose is NOT in the
-# clean-allowlist classifies as SKIP, NEVER FINDINGS — a phrasing artifact must never flip a
-# structurally-clean review to FAIL. Only an EXPLICIT, bulleted finding → FINDINGS.
+# self-audit (FALLBACK fail-safe): an unparseable/ambiguous built-in verdict whose prose is NOT in the
+# clean-allowlist must classify as SKIP, NEVER FINDINGS — mirroring the infra-failure->ERROR fail-safe
+# above. A phrasing artifact (e.g. backtick-`(none)`, "No runtime-correctness bug visible", "No ...
+# vulnerabilities were found") must NEVER flip a structurally-clean review to FAIL (511e665b/8cc477d2).
+# Only an EXPLICIT, clearly-stated finding -> FINDINGS. A real built-in finding LISTS issue bullets
+# (markdown "- "/"* "/"N. " list lines, or a fenced "issue/bug/vuln" callout); ambiguous prose with no
+# such bullet stays SKIP. The JSON-first path above (untouched) still classifies honest FINDINGS.
 def _has_explicit_finding(text):
     for raw in text.splitlines():
         s = raw.strip()
         sl = s.lower().strip(_WRAP)
         if sl in ("", "none", "no findings", "(none)", "(no findings)", "n/a"):
             continue
+        # a bullet/numbered list line (a real reviewer enumerates issues this way)
         if re.match(r"^([-*+]\s+|\d+[.)]\s+)\S", s):
+            # …but a bullet that merely RE-STATES "no issues" is not a finding
             if not any(p in sl for p in ("no issue", "no finding", "none", "n/a", "nothing")):
                 return True
     return False
@@ -178,60 +306,138 @@ if clean:
 elif _has_explicit_finding(t):
     verdict = "FINDINGS"
 else:
-    verdict = "SKIP"   # unparseable/ambiguous → cannot-classify, fail-safe SKIP (never false-FAIL)
+    verdict = "SKIP"   # unparseable/ambiguous -> cannot-classify, fail-safe SKIP (never false-FAIL)
 print(json.dumps({"verdict":verdict,"findings":t[:600]}, ensure_ascii=False))'
 }
 
-# --- L1: process/discipline reviewer (domain-agnostic) -------------------------
-# This prompt is the single source of truth for the process review. Edit it HERE to change
-# what L1 grills. It checks honesty-of-record, secrets, and shared-tree hygiene — nothing
-# domain-specific. Domain checks (overfit, correctness for a particular field) live in the
-# optional plugin review-prompt.txt (L2).
-CODE_PROMPT="CRITICAL: reply with ONLY a JSON object — no explanation, no markdown fences, nothing before or after. If this commit does not touch reviewable code, still output {\"verdict\":\"PASS\",\"issues\":[],\"repoke\":\"\"}.
-You are a PROCESS / discipline reviewer. Your job: results are recorded honestly, no secrets land, and the shared working tree is not polluted. Review ONLY this diff.
-Check (any fail -> verdict=FIX or FAIL):
-1. Single source of truth: if this commit produces a new headline result/metric, the project's metric ledger (the agreed RESULTS/metrics file) must be updated in the SAME change; a stated number that contradicts the ledger by a material margin = FAIL.
-2. Shared-tree hygiene: never 'git add -A' / 'git add .' (it sweeps other workers' WIP); stage only your own files with an explicit pathspec.
-3. Run-proof: a 'done / passing / it works' claim needs a real execution artifact (a run id, a log line, a number) — prose alone is not proof.
-4. Landing claims need real deploy evidence (an ARN / URL / order-id); a file merely existing != done.
-Note: a flat or negative result is NOT a defect — recording an honest ALIVE/DEAD verdict is a first-class outcome, not a failure.
+# NOTE (2026-06-13): the ALGO_PROMPT / CODE_PROMPT strings below ARE the single
+# source of truth for the review logic. There are deliberately NO external
+# .claude/agents/*.md files — those were removed as decorative (cc-review never
+# read them). Edit the prompts HERE to change what the reviewers grill.
+ALGO_PROMPT="CRITICAL: 你的回复必须是且只是一个 JSON 对象 —— 不要任何解释、不要 markdown 代码围栏、JSON 前后不要有任何文字。
+你是 apexnova 量化策略的 ADVERSARIAL 算法评审。默认这个 commit 过拟合,直到它证明不是。
+逐条 grill(任一不过 → verdict=GRILL):
+1. 同池 EW 基线:top-N alpha 必须 vs 同一手选池等权,不是 vs 宽基 ETF。
+2. PIT/前视:Skill 118 A-G;手选 universe/mid-cap insider/overnight L/S 是重灾区;OOS 必须与 baseline 字节级一致。
+3. DSR:N>=20 算 Deflated Sharpe;SR lift<0.10 默认噪声。
+4. alpha 假设:有无先写机制假设(文献+反机制)。
+5. LLM-graded:rerun r>0.7 且 |dmu|<0.05。
+6. 成本后仍 +SR。
+【目标自适应的两项(user 2026-06-13「我目标不一定一样」):多窗口分层(5y→10y→20y、5y/10y<0.8)和部署门(SR≥0.9 + corr<0.4 + 三档)NOT 默认硬查 —— 因为 manager 的目标常变(只看5yr / 冲2.0 / explore)。本 commit 所属 worker 的 goal 是:「${GOAL_CTX:-（未提供)}」。规则:DEFAULT = 这两项只在 failed_checks 里以 NOTE 形式提示 caveat,**绝不据此判 GRILL/DEAD**;只有当 goal 明确声明「部署/deploy/ship-candidate/上线/生产」时,才把多窗口分层 + 部署门 当硬门 FAIL。无论目标如何,下面的 #7-#12 永远硬查(它们是方法学诚信,与目标无关)。
+7. 【红旗量级】Sharpe>3 或 CAGR>300% ⇒ 默认有 leak,必须先指出 leak 在哪才接受;单年窗口的超高 Sharpe(如 1.5/1.8)同样要求展示 IS/OOS + 一个熊市切片。一个 passing backtest 是默认嫌疑犯,不是默认真相。
+8. 【look-ahead 具体清单】同一 bar 的止损 tracker、特征里混入未来数据、test-set early-stopping、label leakage;逐个特征追它的时间戳相对决策 bar 在哪。
+9. 【horizon 错配】IV/信号 horizon vs 持仓 horizon 必须一致;overlapping H-bar 收益虚增约 Hx、只能当 label 不能当 PnL。
+10. 【clipped 止损】任何 clip(lower=-X) 的止损结果在 tick-replay 验证前一律无效。
+11. 【walk-forward 稳定性】参数/过滤器声明要 K-fold WF 证据:同参跨 fold 一致=稳,每 fold 不同=过拟合。
+12. 【举证义务】任何"这个数错了"的判定必须附上你找到的 leak/look-ahead,或你重跑的结果——不许空喊。
+13. 【GRILL-BEFORE-IMPLEMENT】若本 commit 新建/改了一个 probe 但 diff 里没有先写机制假设(经济因果 + 反机制),或这个角度本 strategy 的 PERF_CARD/PROGRESS/memory 里已判 DEAD(被当 'untested' 重做)→ GRILL(以 strategy 卡为真相,DR 文档常把死旋钮说成 untested)。证据:指出已存在的 DEAD verdict,或缺失的机制假设。
+14. 【DIVE-DEEP / dose-response】若本 commit 对一个 *参数化* 旋钮下 DEAD/收口结论却只跑了单点(无 ≥3-5 dose 扫点,也无 per-period 5y→10y→20y 或 per-regime 切片)→ GRILL(单点会藏内部最优,这坑过 fleet)。仅适用参数化旋钮的 kill;一次性结构判定不强求 dose。
+15. 【RULE A 完备 / no-rerun-dead】若 commit 是 DR 结论 / id-tree 账本却有 numbered 节点没有自己的 32-hex QC bt-id(且无 ALIVE/DEAD 或 needs-paid-data:<feed>),或 `## Candidates` 树有缺的 sibling/parent,或这一轮只是把已死的 dead-list 换皮重列没提真新机制 → GRILL(每个节点要自己的 QC run;别 cherry-pick top1-2)。
+注意:flat/负 Sharpe != reject(风险防护/分散/regime-conditional 是一等纳入理由)。这些质量门(#13-15)只在 commit 本身就是 probe/DR结论 时适用,纯 infra/doc/fix commit 照常 PASS。
 COMMIT:
 $STAT
-DIFF (may be truncated):
+DIFF(截断):
 ${DIFF_TRUNC}
 $DIFF
-Output JSON: {\"verdict\":\"PASS|FIX|FAIL\",\"issues\":[...],\"repoke\":\"one line to the worker\"}"
+输出 JSON: {\"verdict\":\"PASS|GRILL|DEAD\",\"failed_checks\":[...],\"repoke\":\"给worker一句话\",\"kill_reason\":\"\"}"
 
-# --- L2: optional domain reviewer from the active plugin -----------------------
-# The plugin may ship review-prompt.txt with placeholders {{STAT}} {{DIFF_TRUNC}} {{DIFF}}
-# {{GOAL_CTX}}. If absent, L2 is skipped (verdict SKIP) — core stays domain-agnostic.
-DOMAIN_PROMPT=""
-DOMAIN_PROMPT_FILE="$PLUGIN_DIR/review-prompt.txt"
-if [ -f "$DOMAIN_PROMPT_FILE" ]; then
-    DOMAIN_PROMPT=$(cat "$DOMAIN_PROMPT_FILE")
-    DOMAIN_PROMPT=${DOMAIN_PROMPT//\{\{STAT\}\}/$STAT}
-    DOMAIN_PROMPT=${DOMAIN_PROMPT//\{\{DIFF_TRUNC\}\}/$DIFF_TRUNC}
-    DOMAIN_PROMPT=${DOMAIN_PROMPT//\{\{DIFF\}\}/$DIFF}
-    DOMAIN_PROMPT=${DOMAIN_PROMPT//\{\{GOAL_CTX\}\}/${GOAL_CTX:-(none provided)}}
+CODE_PROMPT="CRITICAL: 你的回复必须是且只是一个 JSON 对象 —— 不要任何解释、不要 markdown 代码围栏、JSON 前后不要有任何文字。若本 commit 不涉及策略代码,也照样输出 {\"verdict\":\"PASS\",\"issues\":[],\"repoke\":\"\",\"perf_card_delta\":\"\"}。
+你是 apexnova 代码/制度评审,保证「数字落卡、不撒谎、不污染共享树」。只看本 diff。
+必查(任一不过 → verdict=FIX 或 FAIL):
+1. PERF_CARD:lean/research/PERF_CARDS.md 是 Sharpe/CAGR/MaxDD 唯一真相源;本 commit 产生新 BT 结果就必须同步更新对应卡(缺卡=FAIL);卡上数字与 commit 差>0.05SR/1pp=FAIL。
+2. 共享树卫生:禁止 git add -A/git add .(会带走别人半成品);只 add 自己文件。
+3. 提交纪律:改完即 commit+push origin/main,不开 feature branch,不开 PR。
+4. run-proof:声称跑通/done 必须有真实执行产物(真 bt-id/数字),不接受纯散文。
+5. landing 类必须有真实部署证据(S3/ARN/order-id),文件存在 != done。
+6. 范式:结论按 ALIVE/DEAD,禁止 ship-ready/locked/gate sign-off 措辞。
+本 commit 触碰 PERF_CARD: ${CARDS:-(无)}
+COMMIT:
+$STAT
+DIFF(截断):
+${DIFF_TRUNC}
+$DIFF
+输出 JSON: {\"verdict\":\"PASS|FIX|FAIL\",\"issues\":[...],\"repoke\":\"给worker一句话\",\"perf_card_delta\":\"\"}"
+
+# ============================ PLAN-STAGE GRILL (--plan) ============================
+# user 2026-06-29: when a worker commits a PLAN (before it builds+backtests), run ONLY a
+# DIRECTION grill (not the results grill). PASS = worth building; FAIL = revise/drop the plan.
+# Reuses the same headless claude -p (_run_reviewer), the same .cc-review/<sha>.json artifact
+# (with a `plan` verdict field), and the same FAIL → repoke-owner path as normal cc-review.
+# Skips all results layers (algo-grill / code-review / btid / secret) — there is no BT yet.
+if [ "$PLAN_MODE" = "1" ]; then
+    echo "[cc-review --plan] grilling DIRECTION of plan commit $SHA (pre-build)..." >&2
+    PLAN_PROMPT="CRITICAL: 你的回复必须是且只是一个 JSON 对象 —— 不要任何解释、不要 markdown 代码围栏、JSON 前后不要有任何文字。
+你是 apexnova 量化研究的 ADVERSARIAL 方向评审。这是一个 worker 在 BUILD+BACKTEST 之前提交的 PLAN(探索方向),你要在他烧 build+BT 的 token 之前判断这个方向值不值得做。默认这个方向是 doomed,直到它证明值得建。
+逐条 grill(任一不过 → verdict=FAIL):
+1. 【DEAD-prescreen】这个角度是不是已有 DEAD verdict 的重跑?plan 必须显示它 grep 过本 strategy 的 PERF_CARD / id-tree ledger / PROGRESS / memory 确认这个机制没被判过 DEAD(DR 文档常把死旋钮说成 'untested',以 strategy 卡为真相)。重跑已死 = FAIL;没做 prescreen = FAIL。
+2. 【alpha 假设 + 反机制】plan 必须写清 WHY 有 edge(经济因果机制)AND 什么会杀掉它(counter-mechanism:为啥可能 priced-in / 冗余 / 被成本吃掉)。缺任何一个 = FAIL。
+3. 【dose-response 设计】对参数化旋钮,plan 必须设计 ≥3-5 个 dose 扫点(不是单点测试),单点会藏内部最优。单点 = FAIL。
+4. 【creativity】这是真新机制,还是 dead-list 的换皮?把已死/相邻角度换皮重列 = FAIL。
+5. 【PIT + 成本后】plan 是否声明了 point-in-time universe 正确 + net-of-cost(成本后仍 +SR)意识?缺失 = FAIL。
+6. 【RULE A】plan 是否承诺给每个 proposed 节点各自一个 QC run(不 cherry-pick top1-2,id-tree 不留 gap)?未承诺 = FAIL。
+注意:这是 DIRECTION grill,不是 results grill —— 不要查 bt-id / Sharpe 数字(还没跑 BT);只查方向本身值不值得建。风险防护/分散/regime-conditional 是一等合法方向,不要因为 flat/负 Sharpe 预期就 FAIL。
+PLAN COMMIT:
+$STAT
+PLAN DIFF(截断):
+${DIFF_TRUNC}
+$DIFF
+输出 JSON: {\"verdict\":\"PASS|FAIL\",\"failed_checks\":[...],\"reason\":\"一句话说明 PASS(值得建)还是 FAIL(改方向/弃掉)\",\"repoke\":\"给worker一句话:改 plan 哪里 / 别 build\"}"
+    PLAN_JSON=$(_run_reviewer plan "$PLAN_PROMPT")
+    # write the artifact (same path as normal cc-review) with a `plan` verdict field.
+    python3 - "$ART" "$SHA" "$PLAN_JSON" <<'PY'
+import json,sys
+art,sha,plan_s=sys.argv[1:4]
+def parse(s):
+    try: return json.loads(s)
+    except Exception: return {"verdict":"ERROR","raw":s[:200]}
+plan=parse(plan_s)
+v=str(plan.get("verdict","")).strip().upper()
+overall="FAIL" if v=="FAIL" else ("ERROR" if v=="ERROR" else "PASS")
+out={"sha":sha,"mode":"plan","overall":overall,"plan":plan}
+open(art,"w").write(json.dumps(out,ensure_ascii=False,indent=2))
+print(f"[cc-review --plan] {sha} OVERALL={overall}  plan={plan.get('verdict')}  reason={plan.get('reason','')}")
+if overall=="FAIL" and plan.get("repoke"): print("REPOKE: "+str(plan.get("repoke")))
+PY
+    PLAN_OVERALL=$(python3 -c "import json;print(json.load(open('$ART'))['overall'])" 2>/dev/null)
+    # FAIL → repoke the owner (same path as normal cc-review): tell them to REVISE the plan / not build.
+    if [ "$PLAN_OVERALL" = "FAIL" ] && [ -n "$REPOKE_WORKER" ]; then
+        REPOKE_MSG=$(python3 -c "
+import json
+d=json.load(open('$ART')); p=d.get('plan',{}) or {}
+print(p.get('repoke') or p.get('reason') or 'plan-grill FAIL — 改方向/别 build,见 .cc-review/${SHA}.json')
+" 2>/dev/null)
+        if tmux has-session -t "$REPOKE_WORKER" 2>/dev/null; then
+            ts "$REPOKE_WORKER" "[manager plan-grill $SHA FAIL — 改 PLAN,先别 build+BT] $REPOKE_MSG" >/dev/null 2>&1 \
+                && echo "[cc-review --plan] re-poked $REPOKE_WORKER: revise plan, do NOT build yet"
+        fi
+    fi
+    [ "$PLAN_OVERALL" = "FAIL" ] && exit 3
+    exit 0
 fi
+# ========================== END PLAN-STAGE GRILL (--plan) ==========================
 
-echo "[cc-review] reviewing $SHA (plugin=$CC_VERIFY_PLUGIN)..." >&2
+echo "[cc-review] reviewing $SHA (touches_strategy=$TOUCHES_STRATEGY)..." >&2
 
+# 4-layer review (2026-06-13): L1 process (ours) + L2 algo-grill (ours) + L3 /code-review (built-in
+# correctness) + L4 /security-review (built-in security). L1 always; L2 only on strategy code; L3/L4
+# only when reviewing HEAD (built-ins review the live diff, not an arbitrary SHA) to keep them meaningful.
 CODE_JSON=$(_run_reviewer code "$CODE_PROMPT")
-if [ -n "$DOMAIN_PROMPT" ]; then
-    ALGO_JSON=$(_run_reviewer algo "$DOMAIN_PROMPT")
+if [ "$TOUCHES_STRATEGY" = "1" ]; then
+    ALGO_JSON=$(_run_reviewer algo "$ALGO_PROMPT")
 else
-    ALGO_JSON='{"verdict":"SKIP","note":"no plugin review-prompt.txt"}'
+    ALGO_JSON='{"verdict":"SKIP","note":"non-strategy commit"}'
 fi
-
-# --- deterministic secret-grep (always, cheap, no LLM) -------------------------
-# Catches hardcoded keys/tokens the no-secrets rule forbids; far more reliable + free than an
-# LLM security pass. Case-SENSITIVE real-secret literals, word-bounded; lines that read from the
-# environment (os.environ / getenv / ${...} / process.env) or are citation URLs are EXCLUDED, so
-# the *_KEY = os.environ idiom and citation links never false-flag.
+# Deterministic secret-grep (always, cheap, no LLM) — the ONLY security check pure quant commits
+# actually need (user 2026-06-13 "quant 探索需要 security review 吗" → mostly no). Catches hardcoded
+# keys/tokens that the no-secrets rule forbids; far more reliable + free than an LLM security pass.
+# FIX 4: the old `grep -qiE` FALSE-FLAGGED docs/DR commits — citation URLs (sk- substrings, utm tokens)
+# and legitimate `os.environ.get("QC_API_TOKEN")` env-reads flipped them to FAIL. Now: CASE-SENSITIVE
+# prefixes (real keys are lowercase sk-/ghp_), word boundaries, and lines that are URLs or read from
+# os.environ/getenv/${...}/process.env are EXCLUDED; the *_KEY = os.environ idiom is whitelisted.
 if SECRET_DIFF="$DIFF_FULL" python3 -c '
 import os,re,sys
 diff=os.environ.get("SECRET_DIFF","")
+# case-SENSITIVE real-secret literals, word-bounded; api_key/password require a quoted/assigned value
 PATS=[
     re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9_-]{19,}"),
     re.compile(r"\bgh[ps]_[A-Za-z0-9]{20}"),
@@ -239,15 +445,22 @@ PATS=[
     re.compile(r"(?i)\bapi[_-]?key[\"\x27 ]*[:=][\"\x27 ]*[A-Za-z0-9]{16}"),
     re.compile(r"\bBot [A-Za-z0-9_.-]{30}"),
     re.compile(r"(?i)\bpassword[\"\x27 ]*[:=][\"\x27 ]*\S"),
+    # FIX 2: the #1 forbidden cred (QC_API_TOKEN) matched NONE of the above and leaked PASS
+    # (86860ea0). Named-credential rules: the env-var name, an assignment ( = / : / quote / space ),
+    # then a real value. The env-READ whitelist (ENVREAD / WHITELIST below) still suppresses
+    # os.environ[...] / os.getenv(...) reads, so only a HARDCODED assignment fires.
+    re.compile(r"(?i)\bQC_API_TOKEN\b[\"\x27 ]*[:=][\"\x27 ]*[A-Za-z0-9]{8,}"),
+    re.compile(r"(?i)\bFMP_API_KEY\b[\"\x27 ]*[:=][\"\x27 ]*[A-Za-z0-9]{8,}"),
+    re.compile(r"(?i)\bQC_USER_ID\b[\"\x27 ]*[:=][\"\x27 ]*[A-Za-z0-9]{8,}"),
     # generic high-entropy: a NAME ending in TOKEN|SECRET|KEY, an assignment, then a long literal.
-    # (covers e.g. MY_API_TOKEN=..., SERVICE_SECRET=..., FOO_KEY=...; add your own named creds here.)
     re.compile(r"(?i)\b[A-Za-z0-9_]*(?:TOKEN|SECRET|KEY)\b[\"\x27 ]*[:=][\"\x27 ]*[0-9A-Za-z]{24,}"),
-    # bare 32-64 hex value when a *TOKEN/SECRET/KEY name precedes it on the SAME line, so a lone
-    # hex id (e.g. a run/artifact id) with no cred name never fires.
+    # bare 32-64 hex value (e.g. QC_API_TOKEN="<64hex>") — ONLY when a *TOKEN/SECRET/KEY name
+    # precedes it on the SAME line, so a lone backtest-id hex (32 hex, no cred name) never fires.
     re.compile(r"(?i)\b[A-Za-z0-9_]*(?:TOKEN|SECRET|KEY)\b[\"\x27 ]*[:=][\"\x27 ]*[0-9a-f]{32,64}\b"),
 ]
+# lines that read from the environment / are citation URLs are NEVER hardcoded secrets
 ENVREAD=re.compile(r"https?://|os\.environ|getenv|\$\{|process\.env")
-WHITELIST=re.compile(r"(?i)[A-Za-z0-9_]*KEY[A-Za-z0-9_]*\s*=\s*os\.environ")
+WHITELIST=re.compile(r"(?i)[A-Za-z0-9_]*KEY[A-Za-z0-9_]*\s*=\s*os\.environ")  # *_KEY = os.environ idiom
 for line in diff.splitlines():
     if ENVREAD.search(line) or WHITELIST.search(line):
         continue
@@ -255,66 +468,248 @@ for line in diff.splitlines():
         sys.exit(0)   # a real hardcoded-secret literal → flag
 sys.exit(1)
 '; then
-    SECRET_JSON='{"verdict":"FAIL","note":"hardcoded secret pattern in diff — read from an env var, never commit"}'
+    SECRET_JSON='{"verdict":"FAIL","note":"hardcoded secret pattern in diff — read from ~/.zshrc env, never commit"}'
 else
     SECRET_JSON='{"verdict":"PASS"}'
 fi
-
-# --- claim verification (the active plugin) ------------------------------------
-# Resolve every result the commit CITES (a backtest id, a CI run id, a benchmark URL, ...)
-# against ground truth, so a worker can't fabricate a metric and pass every other layer.
-# The provider is pluggable; the default (plugins/generic) surfaces citations and returns SKIP.
-VERIFY="$PLUGIN_DIR/verify-claim"
-if [ -x "$VERIFY" ]; then
-    BTID_JSON=$(NO_PROXY="*" perl -e 'alarm 90; exec @ARGV' python3 "$VERIFY" "$SHA" --repo "$REPO" 2>/dev/null)
-    [ -n "$BTID_JSON" ] || BTID_JSON='{"verdict":"SKIP","note":"verify-claim produced no output"}'
+# bt-id verification (meta-grill CRITICAL #1 / top_fix): resolve every 32-hex bt-id added in the diff
+# against the QC read-backtest API; FAIL on 404 (fabricated/typo/stale) or a Sharpe mismatch. This is
+# the ONLY thing that makes the "must-run-real-QC-BT" rule mechanism-enforced — without it a worker can
+# cite a fake bt-id + Sharpe and pass every other layer (prior incident: QQQR cited 0.942 vs real 0.897).
+# grill #4: ALSO run it when an alpha-claim DOC is touched (lean/factors/alpha_research/** or any
+# PERF_CARD) even if no strategy code changed — those are exactly where a fabricated Sharpe + bt-id
+# would otherwise bypass the gate (the dir CLAUDE.md designates for alpha claims was path-excluded).
+TOUCHES_ALPHA_DOC=$(echo "$TOUCHED" | grep -qiE 'lean/factors/alpha_research/|PERF_CARD' && echo 1 || echo 0)
+# FIX 2: ALSO fire path-INDEPENDENTLY — any added perf number / 32-hex bt-id under a touched lean/
+# path (LEAN_BTID), regardless of extension (_results.txt / .sh / STATUS.md / HANDOFF.md).
+if { [ "$TOUCHES_STRATEGY" = "1" ] || [ "$TOUCHES_ALPHA_DOC" = "1" ] || [ "$LEAN_BTID" = "1" ]; } && [ -x "$HOME/.local/bin/cc-verify-btid" ]; then
+    BTID_JSON=$(NO_PROXY="*" perl -e 'alarm 90; exec @ARGV' python3 "$HOME/.local/bin/cc-verify-btid" "$SHA" --repo "$REPO" 2>/dev/null)
+    [ -n "$BTID_JSON" ] || BTID_JSON='{"verdict":"SKIP","note":"cc-verify-btid no output"}'
 else
-    BTID_JSON='{"verdict":"SKIP","note":"no executable verify-claim in '"$CC_VERIFY_PLUGIN"'"}'
+    BTID_JSON='{"verdict":"SKIP","note":"non-strategy or verifier absent"}'
 fi
-
-# --- L3 /code-review + L4 /security-review (built-ins, HEAD only) ---------------
+# NOTE (self-audit R2 FIX 6 DEFERRED): feeding each commit's diff inline so non-HEAD commits also get
+# L3/L4 was prototyped + reverted this round — moderate-risk (LLM-behavior shift + per-commit Opus cost
+# + false-FAIL amplification, untested offline). Kept the SHA==HEAD gate; deferred pending a live test.
 HEAD_SHA=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)
 if [ "$SHA" = "$HEAD_SHA" ]; then
     CR_JSON=$(_run_builtin_review "/code-review low")
-    # /security-review (LLM) only when the commit touches a real attack surface (infra/scripts/deploy);
-    # other commits get the deterministic secret-grep above, not a token-costly LLM pass.
+    # /security-review (LLM) only when the commit touches a real attack surface (infra/bin/deploy);
+    # pure strategy/BT commits get the deterministic secret-grep above, not a token-costly LLM pass.
     if echo "$TOUCHED" | grep -qiE '^(infra/|bin/|src/|services/|.*deploy|.*\.sh$)|Dockerfile'; then
         SEC_JSON=$(_run_builtin_review "/security-review")
     else
-        SEC_JSON='{"verdict":"SKIP","note":"no attack surface touched — secret-grep covers it"}'
+        SEC_JSON='{"verdict":"SKIP","note":"pure quant/strategy commit — secret-grep covers it, LLM security review skipped"}'
     fi
 else
-    CR_JSON='{"verdict":"SKIP","note":"not HEAD — built-in reviewers see the live diff only"}'
-    SEC_JSON='{"verdict":"SKIP","note":"not HEAD — built-in reviewers see the live diff only"}'
+    CR_JSON='{"verdict":"SKIP","note":"not HEAD — built-in reviewers see live diff only"}'
+    SEC_JSON='{"verdict":"SKIP","note":"not HEAD — built-in reviewers see live diff only"}'
 fi
 
 # --- combine verdicts + write artifact -----------------------------------------
-python3 - "$ART" "$SHA" "$CODE_JSON" "$ALGO_JSON" "$CR_JSON" "$SEC_JSON" "$SECRET_JSON" "$BTID_JSON" <<'PY'
+python3 - "$ART" "$SHA" "$CODE_JSON" "$ALGO_JSON" "$CR_JSON" "$SEC_JSON" "$SECRET_JSON" "$BTID_JSON" "$BTID_GATE_DARK" "$BTID_GATE_NOTE" <<'PY'
 import json,sys
-art,sha,code_s,algo_s,cr_s,sec_s,secret_s,btid_s=sys.argv[1:9]
+art,sha,code_s,algo_s,cr_s,sec_s,secret_s,btid_s,gate_dark,gate_note=sys.argv[1:11]
 def parse(s):
     try: return json.loads(s)
     except Exception: return {"verdict":"ERROR","raw":s[:200]}
 code,algo,cr,sec,secret,btid=parse(code_s),parse(algo_s),parse(cr_s),parse(sec_s),parse(secret_s),parse(btid_s)
-# DEAD is a LEGIT domain conclusion (signal/idea exhausted), NOT a defect — it stays visible in
-# the per-layer breakdown but must NOT flip overall=FAIL. FAIL/GRILL/FIX/FINDINGS are real defects.
+# FIX 3: DEAD is a LEGIT algo conclusion (signal exhausted), NOT a defect — it must stay
+# visible in the per-layer breakdown but must NOT flip overall=FAIL (was mis-routing
+# clean DEAD verdicts to the manager as defects). FAIL/GRILL/FIX/FINDINGS remain real defects.
 bad={"FAIL","GRILL","FIX","FINDINGS"}
 overall="PASS"
 if any(r.get("verdict") in bad for r in (code,algo,cr,sec,secret,btid)): overall="FAIL"
 if overall=="PASS" and any(r.get("verdict")=="ERROR" for r in (code,algo,cr,sec)): overall="ERROR"
-out={"sha":sha,"overall":overall,"code":code,"algo":algo,"codereview":cr,"security":sec,"secret":secret,"btid":btid}
+# grill #1: record the btid-gate health so a SKIP-pass that happened while the gate was DARK is
+# auditable (it is NOT a clean pass — the anti-fabrication control was unreachable this run).
+out={"sha":sha,"overall":overall,"code":code,"algo":algo,"codereview":cr,"security":sec,"secret":secret,"btid":btid,
+     "btid_gate":{"dark": gate_dark=="1", "note": (gate_note if gate_dark=="1" else "lit: known-good bt-id self-test resolved on QC")}}
 open(art,"w").write(json.dumps(out,ensure_ascii=False,indent=2))
-print(f"[cc-review] {sha} OVERALL={overall}  process={code.get('verdict')}  domain={algo.get('verdict')}  code-review={cr.get('verdict')}  security={sec.get('verdict')}  secret={secret.get('verdict')}  verify={btid.get('verdict')}")
+print(f"[cc-review] {sha} OVERALL={overall}  process={code.get('verdict')}  algo={algo.get('verdict')}  code-review={cr.get('verdict')}  security={sec.get('verdict')}  secret={secret.get('verdict')}  btid={btid.get('verdict')}{'  [BTID-GATE-DARK]' if gate_dark=='1' else ''}")
 rp=[]
 for r in (code,algo):
     if r.get("repoke"): rp.append(r["repoke"])
 if secret.get("verdict")=="FAIL": rp.append("[secret] "+secret.get("note",""))
-if btid.get("verdict")=="FAIL": rp.append("[verify] "+" | ".join(btid.get("issues",[]))[:300])
+if btid.get("verdict")=="FAIL": rp.append("[btid] "+" | ".join(btid.get("issues",[]))[:300])
 for r,lbl in ((cr,'code-review'),(sec,'security')):
     if r.get("verdict")=="FINDINGS" and r.get("findings"): rp.append(f"[{lbl}] "+r["findings"][:300])
 if rp: print("REPOKE: "+" | ".join(rp))
 PY
 RESULT_OVERALL=$(python3 -c "import json;print(json.load(open('$ART'))['overall'])" 2>/dev/null)
+
+# --- grill #2/#3/#4 + self-audit #15: when does a perf claim with no verifiable bt-id FAIL? ---
+# Coherent gate (replaces the over-firing SKIP+heuristic→FAIL of the prior round):
+#  (#3c) HARD GUARD — if NO lean/ path is touched, never escalate (a bin/*.py or *.md infra/doc
+#        commit can never be a strategy perf-claim FAIL). btid verdict stays SKIP.
+#  (#2)  A bt-id CITED but unresolvable (cc-verify-btid SKIP with skips[]) stays SKIP = "manual
+#        verify owed", NEVER a hard FAIL. We only escalate to FAIL when cc-verify-btid ACTUALLY
+#        attempted resolution and returned verdict==FAIL with non-empty issues[] (real 404 /
+#        Sharpe-mismatch) — that is already a `bad` verdict, so overall is FAIL; we just annotate.
+#  (#4)  FABRICATION — a perf NUMBER stated in added lines with ZERO bt-id cited anywhere
+#        (cc-verify-btid checked==0, "no bt-id cited") → FAIL. This is path-INDEPENDENT: it fires
+#        for lean/factors/alpha_research/*.md and PERF_CARDS too, not just strategy code.
+#  (#15) creds MISSING → btid UNVERIFIABLE: escalate-to-FAIL ONLY when there is also a perf claim
+#        present (else a creds-less infra/doc tick would false-FAIL); plus the once-per-day notify.
+#  (#3b) the perf-claim scan runs on ADDED lines only AND strips code-fence / comment / quoted-example
+#        lines so a Sharpe WORD in prose or in the verifier's OWN source can't trigger a fabrication FAIL.
+#  FIX 2 (path-INDEPENDENT): ALSO run the fabrication-scan when LEAN_BTID=1 — a perf number
+#        or 32-hex bt-id added under a touched lean/ path in ANY extension (_results.txt/.sh/.md),
+#        so a "Sharpe=… BT=…" dump into a non-code file no longer bypasses the fabrication path.
+if [ "$TOUCHES_LEAN" = "1" ] && { [ "$TOUCHES_STRATEGY" = "1" ] || [ "$TOUCHES_ALPHA_DOC" = "1" ] || [ "$LEAN_BTID" = "1" ]; }; then
+    # Does the added diff state a Sharpe/CAGR/MaxDD NUMBER, after stripping non-prose lines?
+    # FIX B: scan the FULL uncapped diff ($DIFF_FULL), not the 600-line-capped $DIFF — a fabricated
+    # perf number past line 600 of a big diff was never seen. This is a zero-token regex pass.
+    # FIX 1 (shell-injection / `sharpe:: command not found`): the program below USED to be a
+    # DOUBLE-quoted `python3 -c "..."` string. A double-quoted bash word is shell-evaluated, so (a) a
+    # backtick / $(...) anywhere in the PROGRAM (the `"sharpe": "0.986"` example in a comment) ran as a
+    # shell command — `sharpe:: command not found` on EVERY perf-word commit — and (b) it was a live
+    # injection vector: any backtick/$(...) reaching this double-quoted context could execute. FIX: use
+    # a SINGLE-quoted `python3 -c '...'` (a single-quoted bash word has ZERO shell expansion — the same
+    # safe channel the LEAN_BTID and secret-grep passes above already use), and pass the diff body via
+    # the DIFF env var (NEVER interpolated). The program now uses only DOUBLE-quote Python string
+    # literals so it never collides with the single-quote shell wrapper, and contains no backtick/$(...).
+    _perf_claim=$(DIFF="$DIFF_FULL" python3 -c '
+import os,re
+infence=False
+kept=[]
+for raw in os.environ.get("DIFF","").splitlines():
+    if not raw.startswith("+") or raw.startswith("+++"):
+        continue
+    body=raw[1:]
+    s=body.strip()
+    # toggle ON/OFF for markdown/code fences (the fence line itself is also skipped)
+    if s.startswith("```") or s.startswith("~~~"):
+        infence=not infence
+        continue
+    if infence:
+        continue
+    # skip comment / code lines: a perf word in code or a comment is NOT a perf CLAIM
+    if s.startswith("#") or s.startswith("//") or s.startswith("*") or s.startswith("%"):
+        continue
+    # skip lines that are clearly source (assignment/regex/print of the perf word -- e.g. this very
+    # files own _PERF / sharpe regex), identified by quotes or code punctuation around the token.
+    # BUT: a committed QC _results.json/config row is ALSO quoted (a sharpe KEY keyed to a number) and
+    # stripping it would let a FABRICATED Sharpe in a data file yield _perf_claim=0 -> PASS bypass.
+    # So do NOT strip a JSON value-pair (a perf-token KEY quoted-and-keyed to a number); keep
+    # stripping genuine source mentions (a quoted perf WORD with no adjacent numeric value). The
+    # key allows QC field forms -- sharpe_ratio / sortino_ratio / compounding_annual_return /
+    # probabilistic_sharpe -- by permitting word chars around the core token inside the quotes.
+    if re.search(r"[\"\x27][\w ]*(sharpe|cagr|sortino|psr|maxdd|max[ _-]?drawdown|drawdown|compounding[_ ]?annual[_ ]?return)[\w ]*[\"\x27]\s*:\s*[\"\x27]?-?[0-9]", body, re.I):
+        kept.append(body)
+        continue
+    if re.search(r"[\"\x27].*(sharpe|cagr|sortino|psr).*[\"\x27]", body, re.I):
+        continue
+    kept.append(body)
+added="\n".join(kept)
+# FIX C: + SR/Calmar/IR/information-ratio abbreviations (number still required -> bare IR will not match)
+print("1" if re.search(r"(?i)(sharpe|cagr|max[ _-]?dd|max[ _-]?drawdown|drawdown|psr|sortino|compounding[_ ]?annual[_ ]?return|sharpe[_ ]?ratio|probabilistic[_ ]?sharpe|sortino[_ ]?ratio|calmar|information[ _-]?ratio|\bSR\b|\bIR\b)[^0-9]{0,12}-?[0-9]", added) else "0")' 2>/dev/null)
+    # Classify the btid verifier's own result from the artifact.
+    # FIX 2: pass TOUCHES_RESEARCH_ONLY in via env so a research-only commit (all files under
+    # lean/research/, none under lean/strategies/) classifies as 'research_exempt' and is NOT
+    # turned into a fabrication FAIL below — cc-review DEFERS to cc-verify-btid's SKIP/exempt verdict.
+    _btid_state=$(RESEARCH_ONLY="$TOUCHES_RESEARCH_ONLY" python3 -c "
+import json,os
+research_only = os.environ.get('RESEARCH_ONLY','0') == '1'
+try:
+    d=json.load(open('$ART')); b=d.get('btid',{}) or {}
+    v=b.get('verdict'); note=(b.get('note') or '').lower()
+    checked=b.get('checked'); skips=b.get('skips') or []; issues=b.get('issues') or []
+    if v=='FAIL' and issues:
+        print('realfail')         # real 404 / Sharpe-mismatch — already a hard FAIL
+    elif v=='SKIP' and (research_only or 'research-only' in note or 'exempt' in note):
+        # FIX 2: cc-verify-btid SKIP+exempt for an offline lean/research/ commit (5e494585), OR
+        # cc-review's own path test says research-only — a QC bt-id is structurally N/A here.
+        print('research_exempt')  # DEFER to cc-verify-btid: never a fabrication FAIL
+    elif v=='SKIP' and ('cred' in note or 'no qc' in note):
+        print('nocreds')          # #15: creds missing
+    elif v=='SKIP' and skips:
+        print('cannotverify')     # #2: bt-id cited but no resolvable pid — stays SKIP, never FAIL
+    elif v=='SKIP':
+        print('nobtid')           # #4: nothing cited at all (checked==0 / 'no bt-id cited')
+    elif v=='PASS':
+        print('pass')
+    else:
+        print(v.lower() if v else 'none')
+except Exception:
+    print('none')" 2>/dev/null)
+    # Decide whether to escalate btid to a hard FAIL.
+    _btid_fail_reason=""
+    if [ "$_btid_state" = "nocreds" ] && [ "$_perf_claim" = "1" ]; then
+        # #15: a perf claim that can't be verified because creds are absent — loud, not silent SKIP.
+        _btid_fail_reason="no QC creds → perf claim UNVERIFIABLE (creds-loss is a hard FAIL on a perf-claim commit, not a silent SKIP)"
+        _msg="btid UNVERIFIED (no creds) on perf-claim commit $SHA — manual verify owed"
+        # FIX 5b: DEDUP — same root cause all day, so escalate ONCE PER DAY via a date-keyed stamp.
+        _btid_stamp="$HOME/.cc-manager/.btid-nocreds.$(date '+%Y-%m-%d').sent"
+        if [ ! -f "$_btid_stamp" ]; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') [cc-review] $_msg" >> "$HOME/.cc-manager/escalations.log"
+            _notify_user "btid-nocreds-$(date '+%Y-%m-%d')" "$_msg"
+            touch "$_btid_stamp"
+        fi
+    elif [ "$_btid_state" = "nobtid" ] && [ "$_perf_claim" = "1" ]; then
+        # #4: a Sharpe/CAGR/MaxDD NUMBER stated with NO bt-id cited anywhere = fabrication path.
+        # grill (2026-06-18, c94d1f7c false-FAIL): a bare PERF_CARD *touch* no longer forces FAIL.
+        # A legitimate NON-PERF card row (this card's own established convention — "Ops reconcile
+        # non-perf", "0 survivors NO perf impact") states no perf number → nothing to fabricate, so
+        # demanding a bt-id is a false positive. The real-number branch above ($_perf_claim=1) still
+        # FAILs a card row that DOES cite a Sharpe/CAGR/MaxDD without a bt-id; a card row citing a
+        # bt-id still gets resolved (realfail on a 404). So no anti-fabrication path is weakened.
+        _btid_fail_reason="states a Sharpe/CAGR/MaxDD perf number with NO bt-id cited at all — unverifiable fabrication path"
+    fi
+    # #2: a 'cannotverify' (cited-but-unresolvable) or 'realfail' state is NOT re-escalated here —
+    #     cannotverify stays SKIP; realfail is already overall=FAIL via the combine step above.
+    # FIX 2: 'research_exempt' is also NOT escalated — it matches neither branch above, so an honest
+    #     offline lean/research/ commit stating a perf number (e.g. polymarket a5433f42) stays SKIP,
+    #     deferring to cc-verify-btid's exempt verdict instead of a false fabrication FAIL.
+    if [ -n "$_btid_fail_reason" ]; then
+        # Rewrite the artifact: btid LAYER verdict→FAIL with the reason. The OVERALL
+        # used for cursor routing must PRESERVE a prior ERROR: cc-verify-btid is a pure
+        # QC HTTP call unaffected by the algo/code reviewer's claude -p ERRORing (5h
+        # limit), so clobbering ERROR→FAIL here would route the commit to the FAIL path
+        # and advance the cursor — defeating cc-watch's ERROR-retry (it leaves the cursor
+        # un-advanced only when overall==ERROR). Keep ERROR if it was already ERROR.
+        REASON="$_btid_fail_reason" python3 -c "
+import json,os
+d=json.load(open('$ART'))
+b=d.get('btid',{}) or {}; b['verdict']='FAIL'
+b.setdefault('issues',[]).append(os.environ['REASON'])
+cur=d.get('overall')
+d['btid']=b; d['overall']='FAIL' if cur!='ERROR' else 'ERROR'
+open('$ART','w').write(json.dumps(d,ensure_ascii=False,indent=2))" 2>/dev/null
+        [ "$RESULT_OVERALL" = "ERROR" ] || RESULT_OVERALL="FAIL"
+        echo "[cc-review] $SHA btid → FAIL: $_btid_fail_reason" >&2
+    fi
+    # FIX 3 (CRITICAL — consume the DARK flag): when the btid boot self-test was DARK (QC unreachable
+    # THIS run) AND there is a perf claim AND the btid layer did NOT actually resolve to PASS, the
+    # perf number is UNVERIFIABLE-because-of-an-outage, not proven clean. The prior code let such a
+    # commit SKIP→PASS (a fabricated Sharpe during a QC outage shipped as PASS). HOLD it as ERROR (NOT
+    # FAIL): cc-watch leaves the cursor un-advanced on overall==ERROR and re-reviews next tick, so when
+    # QC returns the commit gets a REAL verdict. Constraints:
+    #   - DARK only — when the gate is LIT (BTID_GATE_DARK=0) this branch is skipped entirely, so an
+    #     honest cross-account 'cannotverify' SKIP on a normal/LIT run stays SKIP→PASS (round-1 preserved).
+    #   - never downgrade a genuine btid real-FAIL (404 / Sharpe-mismatch = _btid_state realfail) to ERROR;
+    #     keep the hard FAIL. A 'pass' btid is also left untouched.
+    #   - FIX 2: 'research_exempt' is EXCLUDED — an offline lean/research/ commit has no QC bt-id to
+    #     resolve even when QC is up, so a DARK gate does not make it "unverifiable"; holding it as
+    #     ERROR would block an honest research commit every launchd (creds-less) tick. It stays SKIP.
+    #   - preserves round-2's ERROR-preserve idiom (set ERROR; if already ERROR, stays ERROR).
+    if [ "${BTID_GATE_DARK:-1}" = "1" ] && [ "$_perf_claim" = "1" ] \
+        && [ "$_btid_state" != "pass" ] && [ "$_btid_state" != "realfail" ] \
+        && [ "$_btid_state" != "research_exempt" ]; then
+        DARK_NOTE="btid gate DARK (QC unreachable this run) + perf claim + btid unresolved ($_btid_state) — UNVERIFIABLE during outage, HELD as ERROR for re-review when QC returns (not a clean PASS, not a hard FAIL)"
+        DNOTE="$DARK_NOTE" python3 -c "
+import json,os
+d=json.load(open('$ART'))
+b=d.get('btid',{}) or {}
+b.setdefault('issues',[]).append(os.environ['DNOTE'])
+# round-2 ERROR-preserve idiom: a real btid FAIL (realfail) was excluded above, so any FAIL the
+# inference path set here (nocreds/nobtid) is a DARK-outage inference → downgrade to ERROR (hold).
+d['btid']=b; d['overall']='ERROR'
+open('$ART','w').write(json.dumps(d,ensure_ascii=False,indent=2))" 2>/dev/null
+        RESULT_OVERALL="ERROR"
+        echo "[cc-review] $SHA btid gate DARK + perf claim unverified → overall HELD as ERROR (re-review when QC returns)" >&2
+    fi
+fi
 
 # --- optional auto re-poke on FAIL ---------------------------------------------
 if [ "$RESULT_OVERALL" = "FAIL" ] && [ -n "$REPOKE_WORKER" ]; then
@@ -325,7 +720,7 @@ parts=[]
 for k in ('code','algo'):
     r=d.get(k,{})
     if r.get('repoke'): parts.append(f\"[{k}] {r['repoke']}\")
-print('  '.join(parts) or 'review FAIL — see .cc-review/${SHA}.json')
+print('  '.join(parts) or 'review FAIL — 见 .cc-review/${SHA}.json')
 " 2>/dev/null)
     if tmux has-session -t "$REPOKE_WORKER" 2>/dev/null; then
         ts "$REPOKE_WORKER" "[manager cc-review $SHA FAIL] $REPOKE_MSG" >/dev/null 2>&1 \
