@@ -1157,6 +1157,66 @@ DR_CONCLUSION_DOC_REGEX = re.compile(
     r"|全部?\s*DEAD|都\s*DEAD|均\s*DEAD|探索\s*(?:结论|结束|完成|闭环|枯竭)|方向\s*(?:DEAD|枯竭|关闭|结束)"
     r"|关闭\s*(?:该)?(?:方向|lane|探索)|这条?\s*(?:lane|方向)\s*(?:关闭|结束|DEAD)",
     re.IGNORECASE)
+# A DR doc can PROPOSE ranked candidates in a structured "Executive summary — ranked candidates"
+# (or "## N. ... ranked candidates") TABLE yet never build the reconciling `## Candidates` verdict
+# ledger — and if it is framed OPEN (not a round-conclusion) NEITHER path (a) (ledger) nor path (b)
+# (conclusion + no-ledger) fires, so the un-tested candidates go silently un-falsified. TRIGGER-3
+# counts proposed candidates from that CLEAR table ONLY (never loose prose — see RISK 1) and flags
+# a proposal-without-ledger REGARDLESS of open/conclusion framing.
+PROPOSAL_HEADING_REGEX = re.compile(
+    r"^\s{0,3}#{1,6}\s+.*\b(?:ranked\s+candidates?|executive\s+summary)\b",
+    re.IGNORECASE | re.MULTILINE)
+# first header cell of a ranked-candidate table must be a rank/id column
+_RANK_COL_HEADER_REGEX = re.compile(r"#|#?\s*id|rank|no\.?|序号|排名", re.IGNORECASE)
+_TABLE_SEP_ROW_REGEX = re.compile(r"^\s*\|?[\s:\-|]+\|?\s*$")
+
+
+def _count_proposed_ranked_candidates(text):
+    """Count distinct ranked candidates a DR doc PROPOSES, from a CLEAR ranked-candidates /
+    executive-summary markdown TABLE only (never loose prose). Pure, returns 0 on any structural
+    surprise (never raises). Used by TRIGGER-3 of check_dr_candidates_verified to catch a
+    proposal-table-without-`## Candidates`-ledger (the open-framed RULE-A evasion path (b) misses).
+
+    Recognizes: a heading matching PROPOSAL_HEADING_REGEX, then the FIRST contiguous markdown table
+    whose first header cell is a rank/id column and which has >=2 columns; counts data rows whose
+    first cell (stripped of **/`/space) is a bare integer rank. A prose '#1 / #2 …' run-on line has
+    no such heading+table → counts 0 (keeps prose footers out; they are covered by path (b))."""
+    if not text:
+        return 0
+    try:
+        m = PROPOSAL_HEADING_REGEX.search(text)
+        if not m:
+            return 0
+        # collect the first contiguous markdown table after the heading line
+        table = []
+        for ln in text[m.end():].splitlines():
+            if re.match(r"^\s{0,3}#{1,6}\s", ln):  # next heading → stop
+                break
+            if "|" in ln:
+                table.append(ln)
+            elif table:  # blank/non-pipe line after table rows began → table ended
+                break
+        if len(table) < 2:
+            return 0
+
+        def _cells(row):
+            return [c.strip() for c in row.strip().strip("|").split("|")]
+
+        header = _cells(table[0])
+        if len(header) < 2:
+            return 0
+        if not _RANK_COL_HEADER_REGEX.fullmatch(header[0].strip().strip("`*_ ")):
+            return 0
+        count = 0
+        for row in table[1:]:
+            if _TABLE_SEP_ROW_REGEX.match(row):
+                continue
+            cs = _cells(row)
+            if cs and re.fullmatch(r"\d+", cs[0].strip().strip("`*_ ")):
+                count += 1
+        return count
+    except Exception:
+        return 0
 
 
 def _parse_candidates_ledger(text: str):
@@ -1417,6 +1477,7 @@ def check_dr_candidates_verified():
     now = datetime.now()
     flagged = []
     no_ledger_flagged = []  # DR-conclusion docs that emitted NO `## Candidates` ledger (RULE A)
+    proposed_no_ledger_flagged = []  # docs PROPOSING >=3 ranked candidates with NO ledger (TRIGGER-3)
     for w in reg.get("workers", []):
         if w.get("status") != "active":
             continue
@@ -1434,6 +1495,8 @@ def check_dr_candidates_verified():
         ledger = None
         doc_path = None
         no_ledger_doc = None  # a DR-conclusion doc that carries NO parseable ledger
+        proposal_doc = None   # newest CCDR doc PROPOSING >=3 ranked candidates with NO ledger (T-3)
+        proposed_count = 0
         for rel in docs:
             fp = REPO_ROOT / rel
             try:
@@ -1459,12 +1522,44 @@ def check_dr_candidates_verified():
                     and DR_CONCLUSION_DOC_REGEX.search(txt)
                     and CCDR_MARKER_REGEX.search(txt)):
                 no_ledger_doc = rel
+            # TRIGGER-3 tracking: newest CCDR doc PROPOSING >=3 ranked candidates in a structured
+            # table while NO ledger was parseable here (the open-framed gap path (b) misses).
+            if proposal_doc is None and CCDR_MARKER_REGEX.search(txt):
+                pc = _count_proposed_ranked_candidates(txt)
+                if pc >= 3:
+                    proposal_doc, proposed_count = rel, pc
         if ledger is None:
             # No parseable ledger anywhere recent. If the worker committed a DR-CONCLUSION doc
             # (DR was run + a verdict was drawn) but emitted NO `## Candidates` ledger, that is the
             # cherry-pick-by-omission evasion — flag it (RULE A requires the auditable ledger).
-            # Otherwise (no DR-conclusion doc) stay silent: the worker may simply not have run DR.
+            # Otherwise (no DR-conclusion doc) try TRIGGER-3 (proposal-table-without-ledger,
+            # open OR closed framing) before staying silent.
             if no_ledger_doc is None:
+                # --- TRIGGER-3: a CCDR doc proposing >=3 ranked candidates with NO ledger ---
+                # Catches the open-framed gap (proposal table + ledger=None + 'frontier NOT closed')
+                # that path (b) misses for lack of closure language. Gated on a CLEAR ranked-
+                # candidates/exec-summary table (>=3 numbered rows) so loose-prose lists, stubs, and
+                # non-DR cards never trip it (distinct |proposed cooldown key).
+                if proposal_doc is not None and proposed_count >= 3:
+                    key = f"{name}|{proposal_doc}|proposed"
+                    last = stamps.get(key)
+                    if last:
+                        try:
+                            if (now - datetime.fromisoformat(last)).total_seconds() / 60 < COOLDOWN_MIN:
+                                continue
+                        except (ValueError, TypeError):
+                            pass
+                    proposed_no_ledger_flagged.append((name, proposal_doc, proposed_count))
+                    stamps[key] = now.isoformat()
+                    try:
+                        subprocess.run([str(TS), name,
+                            f"[manager RULE A] {proposal_doc} 提了 {proposed_count} 个 ranked candidates"
+                            f"(Executive summary/ranked-candidates 表)但没有 reconciling `## Candidates` ledger — "
+                            f"每个 proposed candidate 都要进 ledger 且有 32-hex bt-id + ALIVE/DEAD 或 needs-paid-data:<feed>,"
+                            f"不管 doc 是 open 还是 concluded。只测 top 1-2 就收 = cherry-pick by omission(skill_177)。"],
+                            check=False, capture_output=True, timeout=10)
+                    except Exception:
+                        pass
                 continue
             key = f"{name}|{no_ledger_doc}|noledger"
             last = stamps.get(key)
@@ -1519,7 +1614,7 @@ def check_dr_candidates_verified():
                 check=False, capture_output=True, timeout=10)
         except Exception:
             pass
-    if flagged or no_ledger_flagged:
+    if flagged or no_ledger_flagged or proposed_no_ledger_flagged:
         _save_stamp_map(DR_CANDIDATES_SEEN_FILE, stamps)
     if flagged:
         print(f"dr-candidates: {len(flagged)} research worker(s) ran DR but left the numbered tree open (RULE A) — repoked:")
@@ -1530,7 +1625,11 @@ def check_dr_candidates_verified():
         print(f"dr-candidates: {len(no_ledger_flagged)} DR-conclusion doc(s) with NO `## Candidates` ledger (cherry-pick-by-omission) — repoked:")
         for name, doc in no_ledger_flagged:
             print(f"  [dr-candidates] {name}: {doc} — DR concluded but emitted no ledger → repoked (RULE A: every candidate must land in `## Candidates`).")
-    if not flagged and not no_ledger_flagged:
+    if proposed_no_ledger_flagged:
+        print(f"dr-candidates: {len(proposed_no_ledger_flagged)} DR doc(s) proposing ranked candidates with NO `## Candidates` ledger (open-framed RULE-A gap, TRIGGER-3) — repoked:")
+        for name, doc, pc in proposed_no_ledger_flagged:
+            print(f"  [dr-candidates] {name}: {doc} — proposed {pc} ranked candidates, no reconciling ledger → repoked (every proposed candidate must land in `## Candidates`).")
+    if not flagged and not no_ledger_flagged and not proposed_no_ledger_flagged:
         print("dr-candidates: no un-verified DR candidate ledgers (RULE A satisfied / no ledger)")
 
 
