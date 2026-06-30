@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# cc-watch-gate — cheap pre-check for the 30-min cc-watch cron: should it spawn the full
+# (~30k-token) cc-watch subagent THIS tick, or is the fleet idle enough to skip?
+#
+# WHY (user 2026-06-30): the cron unconditionally spawned a ~30k-token general-purpose subagent
+# every 30 min even when the fleet was 100% idle with 0 new commits — the ~30k is the SUBAGENT's
+# own cost, independent of whether cc-watch finds anything to do. On an all-idle fleet that is
+# ~48 fires/day x 30k = ~1.4M tok/day burned to repeatedly confirm "nothing to do" (the documented
+# idle-spin). cc-watch SHOULD run full when a worker is active / there is work to review, and cost
+# ~nothing when the fleet is idle. This gate is the cheap inline check (1 git call + a few
+# capture-panes, run in the manager's own turn) that decides.
+#
+# Prints exactly one line:
+#   SPAWN <reason>   -> there IS something to supervise; the cron must spawn the full cc-watch subagent
+#   SKIP <reason>    -> fleet idle + nothing pending; the cron skips the subagent (relay one line)
+# Always exit 0 (fail-OPEN to SPAWN on any ambiguity so supervision is never silently dropped).
+set -uo pipefail
+
+REPO="${APEXNOVA_REPO:-/workspace/apexnova}"
+WATCH="$HOME/.cc-manager/watch.list"
+CURSOR="$HOME/.cc-manager/.last_reviewed_sha"
+
+# (1) NEW COMMIT since last review → must run cc-review.
+HEAD=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo "")
+CUR=$(cat "$CURSOR" 2>/dev/null || echo "")
+if [ -z "$HEAD" ]; then echo "SPAWN git-head-unreadable (fail-open)"; exit 0; fi
+if [ "$HEAD" != "$CUR" ]; then echo "SPAWN new-commit ($CUR -> $HEAD)"; exit 0; fi
+
+# (2) UNCOMMITTED CHANGES in the shared tree → freeze gate must run.
+if [ -n "$(git -C "$REPO" status --porcelain 2>/dev/null | head -1)" ]; then
+    echo "SPAWN uncommitted-changes (freeze-gate owed)"; exit 0
+fi
+
+# (3) AN ACTIVELY-RUNNING WORKER → keepalive / runaway-watchdog must run. A worker mid-turn shows
+# 'esc to interrupt' in its pane footer; an idle worker sits at the '❯' prompt with no such marker.
+if [ -f "$WATCH" ]; then
+    while IFS= read -r s; do
+        s="${s%%#*}"; s="$(printf '%s' "$s" | tr -d '[:space:]')"
+        [ -z "$s" ] && continue
+        if tmux capture-pane -t "$s" -p 2>/dev/null | tail -5 | grep -q "esc to interrupt"; then
+            echo "SPAWN active-worker ($s)"; exit 0
+        fi
+    done < "$WATCH"
+fi
+
+# Nothing pending: HEAD == cursor, clean tree, every watched pane idle.
+echo "SKIP idle (HEAD==cursor; clean tree; all watched panes idle)"; exit 0
