@@ -1,47 +1,38 @@
 #!/usr/bin/env bash
-# cc-watch-gate — cheap pre-check for the 30-min cc-watch cron: should it spawn the full
-# (~30k-token) cc-watch subagent THIS tick, or is the fleet idle enough to skip?
+# cc-watch-gate — the 30-min cc-watch cron must run ONLY when a worker GENUINELY has an unfinished
+# goal (user 2026-06-30: "除非真的有员工有 goal 没完成 不然不要 30min 的 cron").
 #
-# WHY (user 2026-06-30): the cron unconditionally spawned a ~30k-token general-purpose subagent
-# every 30 min even when the fleet was 100% idle with 0 new commits — the ~30k is the SUBAGENT's
-# own cost, independent of whether cc-watch finds anything to do. On an all-idle fleet that is
-# ~48 fires/day x 30k = ~1.4M tok/day burned to repeatedly confirm "nothing to do" (the documented
-# idle-spin). cc-watch SHOULD run full when a worker is active / there is work to review, and cost
-# ~nothing when the fleet is idle. This gate is the cheap inline check (1 git call + a few
-# capture-panes, run in the manager's own turn) that decides.
+# WHY GOAL-BASED (not signal-based): each cron subagent spawn costs ~30k tokens regardless of work
+# found. An earlier version gated on transient signals (new commit since cursor / uncommitted changes
+# / a pane showing 'esc to interrupt') — but ANY of those can persist with NO active goal and SPAWN
+# every tick forever: a single stray uncommitted scratch file, a stuck review cursor (cc-review can't
+# advance), or a wedged pane → ~48 x 30k = ~1.4M tok/day LEAK. So the gate keys on the ONE durable
+# signal of real outstanding work: does any active, non-parked worker still carry a non-empty
+# current_goal in workers.json? A done / idle / parked / standing-by worker has current_goal=="" (the
+# deliberate-idle convention honored fleet-wide). No unfinished-goal worker ⇒ no active work ⇒ the
+# cron should not run at all (delete it; review any one-off commit manually).
 #
 # Prints exactly one line:
-#   SPAWN <reason>   -> there IS something to supervise; the cron must spawn the full cc-watch subagent
-#   SKIP <reason>    -> fleet idle + nothing pending; the cron skips the subagent (relay one line)
-# Always exit 0 (fail-OPEN to SPAWN on any ambiguity so supervision is never silently dropped).
+#   SPAWN <reason>  -> >=1 worker has an unfinished goal; the cron spawns the full cc-watch subagent
+#   SKIP <reason>   -> fleet has no unfinished-goal worker; skip the subagent (and the cron should be deleted)
+# Fails OPEN to SPAWN on any read/parse error so supervision is never silently dropped.
 set -uo pipefail
-
-REPO="${APEXNOVA_REPO:-/workspace/apexnova}"
-WATCH="$HOME/.cc-manager/watch.list"
-CURSOR="$HOME/.cc-manager/.last_reviewed_sha"
-
-# (1) NEW COMMIT since last review → must run cc-review.
-HEAD=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo "")
-CUR=$(cat "$CURSOR" 2>/dev/null || echo "")
-if [ -z "$HEAD" ]; then echo "SPAWN git-head-unreadable (fail-open)"; exit 0; fi
-if [ "$HEAD" != "$CUR" ]; then echo "SPAWN new-commit ($CUR -> $HEAD)"; exit 0; fi
-
-# (2) UNCOMMITTED CHANGES in the shared tree → freeze gate must run.
-if [ -n "$(git -C "$REPO" status --porcelain 2>/dev/null | head -1)" ]; then
-    echo "SPAWN uncommitted-changes (freeze-gate owed)"; exit 0
-fi
-
-# (3) AN ACTIVELY-RUNNING WORKER → keepalive / runaway-watchdog must run. A worker mid-turn shows
-# 'esc to interrupt' in its pane footer; an idle worker sits at the '❯' prompt with no such marker.
-if [ -f "$WATCH" ]; then
-    while IFS= read -r s; do
-        s="${s%%#*}"; s="$(printf '%s' "$s" | tr -d '[:space:]')"
-        [ -z "$s" ] && continue
-        if tmux capture-pane -t "$s" -p 2>/dev/null | tail -5 | grep -q "esc to interrupt"; then
-            echo "SPAWN active-worker ($s)"; exit 0
-        fi
-    done < "$WATCH"
-fi
-
-# Nothing pending: HEAD == cursor, clean tree, every watched pane idle.
-echo "SKIP idle (HEAD==cursor; clean tree; all watched panes idle)"; exit 0
+WORKERS="$HOME/.cc-manager/workers.json"
+[ -f "$WORKERS" ] || { echo "SPAWN workers.json-missing (fail-open)"; exit 0; }
+python3 - "$WORKERS" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception as e:
+    print(f"SPAWN workers.json-parse-error ({e}) (fail-open)"); sys.exit(0)
+unfinished = [w.get("name", "?") for w in d.get("workers", [])
+              if w.get("status") == "active"
+              and not w.get("parked")
+              and w.get("name") != "manager"
+              and (w.get("current_goal") or "").strip()]
+if unfinished:
+    head = ", ".join(unfinished[:6]) + (" …" if len(unfinished) > 6 else "")
+    print(f"SPAWN unfinished-goal worker(s): {head}")
+else:
+    print("SKIP no unfinished-goal worker (fleet idle/done — the cron should be deleted)")
+PY
