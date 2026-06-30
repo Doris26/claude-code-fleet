@@ -260,7 +260,15 @@ new commits / holds the freeze gate, so it stays always-on.
 # ⚠️ launchd DISABLED (operator: "systemcron都关 / 只保留 claude cron"). NO system-cron fallback
 # remains — these Claude in-session crons are the ONLY supervision, and they DIE when this manager
 # session exits. A fresh manager MUST recreate ALL of these on takeover, or there is ZERO supervision
-# (no cc-review on commits, no freeze, no keepalive, no task-audit). RECREATE ALL 4.
+# (no cc-review on commits, no freeze, no keepalive, no task-audit).
+#
+# ⚠️⚠️ ALL CRONS ARE ON-DEMAND — DO NOT RUN THEM ON AN IDLE FLEET. Each cron subagent spawn costs ~30k
+# tokens REGARDLESS of work found; running the set forever idle-spins (cc-watch alone ~1.4M tok/day). So
+# "recreate ALL" applies ONLY when the fleet is ACTIVELY working (workers producing commits / runaway-risk
+# / mid-research). On an IDLE / wound-down / held-pending-user fleet: create NONE (or DELETE any still
+# running) and run any one-off check manually. Recreate the set when real work resumes; DELETE again the
+# moment it's genuinely done or held. Defense-in-depth: cc-watch (#1) self-gates (cc-watch-gate) so a
+# forgotten-armed one self-skips idle ticks.
 #
 # ⚠️ EVERY recurring cron DELEGATES TO A SUBAGENT (operator, emphatic: "you make sure you use
 # subagent to do the cron so do not occupy your heavy context!!!!"). The cron prompt must tell the
