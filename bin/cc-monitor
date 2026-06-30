@@ -918,8 +918,18 @@ def check_ship_drift():
             out = subprocess.run([str(TP), sess, "60"], capture_output=True, text=True, timeout=15)
             if out.returncode != 0:
                 continue
-            m = SHIP_DRIFT_REGEX.search(out.stdout)
-            if m:
+            # Grill 2026-06-30: iterate ALL ship-keyword matches in the pane, not just
+            # the FIRST (.search). The two suppression guards below (negation-ctx +
+            # goal-aware) each fire PER-MATCH; with first-match-only, a benign/negated
+            # early hit — e.g. the worker echoing a prior manager GRILL ('NO ship gate
+            # framing', which itself contains explore-not-ship + 不 ship) near the top of
+            # the 60-line pane — would satisfy a guard, `continue`, and SILENTLY skip the
+            # whole session, masking a GENUINE ship overclaim ('champion-lock final',
+            # 'promote-to-live') appearing LOWER in the same pane. Scan every match and
+            # flag the first that survives BOTH guards.
+            goal_txt = goals.get(sess, "")
+            goal_auth = bool(goal_txt and GOAL_ESCALATE_AUTH_REGEX.search(goal_txt))
+            for m in SHIP_DRIFT_REGEX.finditer(out.stdout):
                 # Skip echo false-positive: keyword in a STOP/exclusion/negation/removal context
                 # (my own anti-ship nudge, OR a worker REPORTING it stripped ship-framing — not drift).
                 ctx = out.stdout[max(0, m.start()-60):m.end()+60]
@@ -941,11 +951,10 @@ def check_ship_drift():
                 # authorization, so the existing ctx-negation guard alone misses it once
                 # the goal text scrolls off the pane. A true ship OVERCLAIM (champion-lock,
                 # deployed-to-live, approval-obtained) is NEVER goal-authorized → still fires.
-                goal_txt = goals.get(sess, "")
-                if (goal_txt and GOAL_ESCALATE_AUTH_REGEX.search(goal_txt)
-                        and not SHIP_OVERCLAIM_REGEX.search(m.group(0))):
+                if goal_auth and not SHIP_OVERCLAIM_REGEX.search(m.group(0)):
                     continue
                 findings.append((sess, m.group(0)))
+                break  # one finding per session is enough — GRILL fires once
         except Exception:
             continue
     if findings:
