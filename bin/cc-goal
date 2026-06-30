@@ -79,7 +79,21 @@ PY
 if [ "$1" = "--nudge" ]; then
     shift
     MSG="$*"
-    "$TS" "$NAME" "$MSG"            # plain tactical nudge, no prefix
+    # NO-UNBOUNDED-LOOPS advisory: the primary /loop issuance is the manager hand-typing a /loop
+    # here — the one path with no terminal check. When MSG contains '/loop', grep for at least one
+    # checkable STOP token (metric-hit | certified-terminal | deadline/round-cap). If NONE, emit ONE
+    # non-blocking stderr reminder and STILL send (advisory only; CC_LOOP_FORCE=1 silences). Fires
+    # ONLY on a literal '/loop' → cannot nag plain nudges. `|| true` guards every grep for set -e.
+    # No runtime/round-count detector is added (serial bounded loops are allowed; round-count
+    # false-positives the long-but-bounded loop).
+    if [ -z "${CC_LOOP_FORCE:-}" ] && printf '%s' "$MSG" | grep -q '/loop'; then
+        _has_terminal=0
+        printf '%s' "$MSG" | grep -qiE 'Sharpe|CAGR|Calmar|达成|才停|>=|≥' && _has_terminal=1 || true
+        printf '%s' "$MSG" | grep -qiE 'certified|consecutive DEAD|穷尽|证死|cc-task done|frontier exhausted|exhausted|terminal|终局' && _has_terminal=1 || true
+        printf '%s' "$MSG" | grep -qiE 'deadline|round-cap|rounds?|轮|<=|≤|round.?cap' && _has_terminal=1 || true
+        [ "$_has_terminal" = 0 ] && echo "⚠ cc-goal: this /loop names no terminal (metric-hit | certified-terminal | deadline/round-cap) — per NO-UNBOUNDED-LOOPS every /loop MUST carry a checkable stop; set CC_LOOP_FORCE=1 to silence" >&2
+    fi
+    "$TS" "$NAME" "$MSG"            # plain tactical nudge, no prefix (advisory above never blocks)
     echo "nudge sent -> $NAME: ${MSG:0:60}" >&2
 else
     MSG="$*"
