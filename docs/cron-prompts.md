@@ -281,7 +281,14 @@ new commits / holds the freeze gate, so it stays always-on.
 #    pending a USER decision. Idle/standby/held fleet = NO cc-watch (run cc-review manually on any one-off
 #    important commit meanwhile). At takeover, do NOT blindly recreate this if the fleet is idle — only run
 #    it around genuinely-active work. DELEGATED to a subagent (template below = create when active).
-CronCreate(cron="4,34 * * * *",  durable=True, prompt="[cc-watch backbone — every 30min · launchd OFF · USE A SUBAGENT (keep manager context light)] Do NOT run cc-watch in your own context. SPAWN a subagent (Agent tool, general-purpose) with task: 'Run: bash <CC_HOME>/bin/cc-watch 2>&1 | tail -20. This does cc-review on new commits + freeze-gate + keepalive + cc-monitor + task-audit. Report ONE line: commits reviewed / freeze state / anything that needs the manager.' Relay ONLY the subagent's one line.")
+#    ⚠ GATED + ALL-CRONS-ON-DEMAND: the recurring cc crons are NOT free — each subagent spawn costs
+#    ~30k tokens regardless of work found, so an idle fleet idle-spins them (cc-watch alone ~1.4M tok/day).
+#    TWO rules: (a) on an idle / wound-down / held-pending-user fleet, DELETE every cc cron (run any one-off
+#    check manually); recreate ONLY when a worker is actively producing commits/runaway-risk. (b) even when
+#    armed, cc-watch SELF-SKIPS idle ticks via `cc-watch-gate`: the cron runs the gate FIRST in the
+#    manager's own cheap turn and spawns the ~30k subagent ONLY on SPAWN (new commit | uncommitted | a
+#    worker mid-turn 'esc to interrupt'); SKIP relays one line, no subagent. Gate fails OPEN to SPAWN.
+CronCreate(cron="4,34 * * * *",  durable=True, prompt="[cc-watch backbone — every 30min · launchd OFF · GATED · USE A SUBAGENT (keep manager context light)] FIRST gate cheaply in YOUR OWN context (do NOT spawn yet): run `bash <CC_HOME>/bin/cc-watch-gate`. If it prints 'SKIP ...' → relay that one line ('cc-watch SKIP: <reason>') and STOP — do NOT spawn a subagent (idle-spin fix). If it prints 'SPAWN <reason>' → THEN SPAWN a subagent (Agent tool, general-purpose) with task: 'Run: bash <CC_HOME>/bin/cc-watch 2>&1 | tail -20. This does cc-review on new commits + freeze-gate + keepalive + cc-monitor + task-audit. Report ONE line: commits reviewed / freeze state / anything that needs the manager.' Relay ONLY the subagent's one line.")
 # 2. SKILL-CAPTURE — [OPTIONAL companion: needs `auto_skill_capture.py`, a separate tool NOT bundled
 #    with claude-code-fleet]. Mines landed commits into a reusable skills library. DELEGATED to a subagent.
 CronCreate(cron="12 5 * * *",  durable=True, prompt="[skill-capture — DAILY · USE A SUBAGENT (keep manager context light)] Do NOT run it in your own context. SPAWN a subagent (Agent tool, general-purpose) with task: 'Run: python3 ${CC_REPO}/bin/auto_skill_capture.py --hours 24 --commit. Report ONE line: skills captured/updated + commit sha, or none.' Relay ONLY the subagent's one line.")
